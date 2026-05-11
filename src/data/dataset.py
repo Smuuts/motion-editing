@@ -38,8 +38,10 @@ class HumanML3DDataset(Dataset):
         # filter out clips that are too short after loading lengths
         self.ids = self._filter_by_length()
 
-        self.vec_dir  = os.path.join(data_root, "new_joint_vecs")
-        self.text_dir = os.path.join(data_root, "texts")
+        self.vec_dir      = os.path.join(data_root, "new_joint_vecs")
+        self.text_dir     = os.path.join(data_root, "texts")
+        text_emb_dir      = os.path.join(data_root, "text_emb")
+        self.text_emb_dir = text_emb_dir if os.path.isdir(text_emb_dir) else None
 
     def _filter_by_length(self):
         valid = []
@@ -69,13 +71,19 @@ class HumanML3DDataset(Dataset):
         pad[:T] = vecs
         motion = torch.from_numpy(pad)  # (max_frames, 263)
 
-        # text
+        # text — use precomputed CLIP embeddings when available
+        if self.text_emb_dir is not None:
+            emb_path = os.path.join(self.text_emb_dir, f"{clip_id}.npy")
+            emb = np.load(emb_path)                          # (num_ann, 77, dim) float16
+            idx = random.randrange(len(emb))
+            context = torch.from_numpy(emb[idx].astype(np.float32))  # (77, dim)
+            return {"motion": motion, "context": context, "length": T, "id": clip_id}
+
         text_path = os.path.join(self.text_dir, f"{clip_id}.txt")
         with open(text_path) as f:
             lines = [l.strip() for l in f if l.strip()]
         annotations = [l.split("#")[0].strip() for l in lines]
         text = random.choice(annotations)
-
         return {"motion": motion, "text": text, "length": T, "id": clip_id}
 
 

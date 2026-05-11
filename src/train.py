@@ -66,6 +66,8 @@ def parse_args():
     p.add_argument("--log_every",    type=int,   default=100)
     p.add_argument("--no_lr_decay",  action="store_true",
                    help="Keep learning rate constant (no decay)")
+    p.add_argument("--joint_attn",   action="store_true", default=False,
+                   help="Add per-frame spatial self-attention over joints inside each DiT block.")
 
     # resume
     p.add_argument("--resume",       type=str,   default=None,
@@ -134,7 +136,6 @@ def train_one_epoch(
     pbar = tqdm(loader, desc=f"Epoch {epoch}", leave=False)
     for step, batch in enumerate(pbar):
         motion = batch["motion"].to(device)  # (B, F, 263)
-        texts  = batch["text"]               # list of B strings
         B = motion.shape[0]
 
         # ── sample random timesteps ────────────────────────────────────
@@ -143,12 +144,14 @@ def train_one_epoch(
         # ── add noise (forward process) ────────────────────────────────
         x_t, noise = schedule.q_sample(motion, t)  # both (B, F, 263)
 
-        # ── encode text with CFG dropout ───────────────────────────────
-        # Encode all texts, then replace a fraction with model.null_text_emb.
+        # ── get text context (precomputed or live CLIP encode) ─────────
         # null_text_emb (not all-zeros) must receive gradients so guidance
         # scale > 1 works correctly at inference.
-        with torch.no_grad():
-            context = text_encoder.encode(texts)  # (B, 77, context_dim)
+        if "context" in batch:
+            context = batch["context"].to(device)   # (B, 77, context_dim)
+        else:
+            with torch.no_grad():
+                context = text_encoder.encode(batch["text"])  # (B, 77, context_dim)
         if cfg_dropout > 0.0:
             drop_mask = (torch.rand(B, device=device) < cfg_dropout)[:, None, None]
             null_emb  = model.null_text_emb.expand(B, -1, -1)  # has gradient
@@ -223,19 +226,23 @@ def main():
     print(f"Training on {len(train_loader.dataset)} clips")
 
     # ── text encoder ──────────────────────────────────────────────────
-    # context_dim depends on the CLIP variant
     context_dim = 768 if "L/14" in args.clip_version else 512
-    text_encoder = CLIPTextEncoder(args.clip_version, device=device)
+    if train_loader.dataset.text_emb_dir is not None:
+        print("Precomputed text embeddings found — skipping CLIP model load.")
+        text_encoder = None
+    else:
+        text_encoder = CLIPTextEncoder(args.clip_version, device=device)
 
     # ── model ─────────────────────────────────────────────────────────
     model_config = {
-        "input_dim":   263,
-        "latent_dim":  args.latent_dim,
-        "context_dim": context_dim,
-        "num_heads":   args.num_heads,
-        "num_layers":  args.num_layers,
-        "max_frames":  args.max_frames,
-        "dropout":     args.dropout,
+        "input_dim":      263,
+        "latent_dim":     args.latent_dim,
+        "context_dim":    context_dim,
+        "num_heads":      args.num_heads,
+        "num_layers":     args.num_layers,
+        "max_frames":     args.max_frames,
+        "dropout":        args.dropout,
+        "use_joint_attn": args.joint_attn,
     }
     model = build_model(model_config, device=device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
