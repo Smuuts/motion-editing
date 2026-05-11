@@ -59,7 +59,9 @@ def recover_from_ric(data: np.ndarray, joints_num: int = 22) -> np.ndarray:
     z = j_pos[:, :, 2].copy()
     j_pos[:, :, 0] = x * cos_a[:, None] - z * sin_a[:, None]
     j_pos[:, :, 2] = x * sin_a[:, None] + z * cos_a[:, None]
-    j_pos += root_pos[:, None, :]
+    # Only add root XZ — joint Y values are already world-space height
+    j_pos[:, :, 0] += root_x[:, None]
+    j_pos[:, :, 2] += root_z[:, None]
 
     # prepend root so output indices match the kinematic chain
     return np.concatenate([root_pos[:, None, :], j_pos], axis=1)  # (T, 22, 3)
