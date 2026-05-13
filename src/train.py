@@ -20,6 +20,7 @@ from copy import deepcopy
 
 import torch
 import torch.nn as nn
+from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
 from tqdm import tqdm
@@ -64,6 +65,8 @@ def parse_args():
     p.add_argument("--ema_decay",    type=float, default=0.9999)
     p.add_argument("--save_every",   type=int,   default=100)
     p.add_argument("--log_every",    type=int,   default=100)
+    p.add_argument("--val_every",    type=int,   default=1,
+                   help="Compute validation loss every N epochs (0 = disabled).")
     p.add_argument("--no_lr_decay",  action="store_true",
                    help="Keep learning rate constant (no decay)")
     p.add_argument("--joint_attn",   action="store_true", default=False,
@@ -92,14 +95,36 @@ def save_checkpoint(output_dir, epoch, model, ema, optimizer, scheduler, config)
     print(f"  Saved checkpoint: {ckpt_dir}")
 
 
-def save_loss_graph(output_dir, epoch_losses, start_epoch=0):
-    if not epoch_losses:
+def save_series_graph(path, losses, title, ylabel="Average Loss"):
+    if not losses:
+        return
+    epochs = [e for e, _ in losses]
+    values = [v for _, v in losses]
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(epochs, values, marker='o', linestyle='-')
+    ax.set_title(title)
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel(ylabel)
+    ax.grid(True, linestyle='--', alpha=0.4)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def save_loss_graph(output_dir, train_losses, val_losses=None):
+    if not train_losses:
         return
 
-    epochs = list(range(start_epoch, start_epoch + len(epoch_losses)))
+    train_epochs = [e for e, _ in train_losses]
+    train_values = [v for _, v in train_losses]
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(epochs, epoch_losses, marker='o', linestyle='-', color='tab:blue')
-    ax.set_title('Training Loss per Epoch')
+    ax.plot(train_epochs, train_values, marker='o', linestyle='-', color='tab:blue', label='train')
+    if val_losses:
+        val_epochs = [e for e, _ in val_losses]
+        val_values = [v for _, v in val_losses]
+        ax.plot(val_epochs, val_values, marker='s', linestyle='--', color='tab:orange', label='val')
+    ax.legend()
+    ax.set_title('Loss per Epoch')
     ax.set_xlabel('Epoch')
     ax.set_ylabel('Average Loss')
     ax.grid(True, linestyle='--', alpha=0.4)
@@ -127,7 +152,7 @@ def load_checkpoint(ckpt_dir, model, ema, optimizer, scheduler):
 
 
 def train_one_epoch(
-    model, ema, text_encoder, schedule, optimizer,
+    model, ema, text_encoder, schedule, optimizer, scaler,
     loader, device, cfg_dropout, logger, epoch, log_every,
 ):
     model.train()
@@ -166,17 +191,20 @@ def train_one_epoch(
         attn_mask = torch.arange(motion.shape[1], device=device)[None, :] < lengths_tensor[:, None]
 
         # ── predict noise ──────────────────────────────────────────────
-        eps_pred = model(x_t, t, context, mask=attn_mask)  # (B, F, 263)
+        with autocast(device_type=device.type):
+            prediction = model(x_t, t, context, mask=attn_mask)  # (B, F, 263)
 
-        # ── loss: masked MSE — only penalise real frames, not padding ──
-        loss_mask = attn_mask.float().unsqueeze(-1)  # (B, F, 1)
-        loss = ((noise - eps_pred) ** 2 * loss_mask).sum() / (loss_mask.sum() * noise.shape[-1])
+            # ── loss: masked MSE — only penalise real frames, not padding ──
+            loss_mask = attn_mask.float().unsqueeze(-1)  # (B, F, 1)
+            loss = ((noise - prediction) ** 2 * loss_mask).sum() / (loss_mask.sum() * noise.shape[-1])
 
         # ── optimise ───────────────────────────────────────────────────
         optimizer.zero_grad()
-        loss.backward()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
         # EMA must be updated every step, not every epoch.
         # With decay=0.9999, updating once per epoch (100 calls total)
@@ -191,6 +219,41 @@ def train_one_epoch(
                 "train/loss": loss.item(),
                 "train/step": epoch * len(loader) + step,
             })
+
+    return total_loss / len(loader)
+
+
+@torch.no_grad()
+def validate_one_epoch(ema_model, text_encoder, schedule, loader, device, epoch):
+    ema_model.eval()
+    total_loss = 0.0
+
+    pbar = tqdm(loader, desc=f"Val {epoch}", leave=False)
+    for batch in pbar:
+        motion = batch["motion"].to(device)
+        B = motion.shape[0]
+
+        t = torch.randint(0, schedule.T, (B,), device=device)
+        x_t, noise = schedule.q_sample(motion, t)
+
+        if "context" in batch:
+            context = batch["context"].to(device)
+        else:
+            context = text_encoder.encode(batch["text"])
+
+        lengths = batch["length"]
+        if isinstance(lengths, torch.Tensor):
+            lengths_tensor = lengths.detach().clone().to(device)
+        else:
+            lengths_tensor = torch.as_tensor(lengths, device=device)
+        attn_mask = torch.arange(motion.shape[1], device=device)[None, :] < lengths_tensor[:, None]
+
+        with autocast(device_type=device.type):
+            prediction = ema_model(x_t, t, context, mask=attn_mask)
+            loss_mask = attn_mask.float().unsqueeze(-1)
+            loss = ((noise - prediction) ** 2 * loss_mask).sum() / (loss_mask.sum() * noise.shape[-1])
+        total_loss += loss.item()
+        pbar.set_postfix(val_loss=f"{loss.item():.4f}")
 
     return total_loss / len(loader)
 
@@ -225,6 +288,16 @@ def main():
     )
     print(f"Training on {len(train_loader.dataset)} clips")
 
+    val_loader = None
+    if args.val_every > 0:
+        val_loader = build_dataloader(
+            args.data_root, split="val",
+            batch_size=args.batch_size,
+            max_frames=args.max_frames,
+            num_workers=args.num_workers,
+        )
+        print(f"Validation on {len(val_loader.dataset)} clips (every {args.val_every} epochs)")
+
     # ── text encoder ──────────────────────────────────────────────────
     context_dim = 768 if "L/14" in args.clip_version else 512
     if train_loader.dataset.text_emb_dir is not None:
@@ -254,6 +327,9 @@ def main():
     # ── noise schedule ────────────────────────────────────────────────
     schedule = NoiseSchedule(timesteps=args.timesteps, device=device)
 
+    # ── mixed precision ───────────────────────────────────────────────
+    scaler = GradScaler(device=device.type, enabled=device.type == "cuda")
+
     # ── optimizer & scheduler ─────────────────────────────────────────
     optimizer = AdamW(
         model.parameters(),
@@ -279,25 +355,59 @@ def main():
 
     # ── training loop ─────────────────────────────────────────────────
     print(f"\nStarting training from epoch {start_epoch}")
-    epoch_losses = []
+    train_losses = []  # list of (epoch, train_loss)
+    val_losses = []    # list of (epoch, val_loss)
+    train_losses_path = os.path.join(args.output_dir, "train_losses.json")
+    val_losses_path   = os.path.join(args.output_dir, "val_losses.json")
+
+    if args.resume:
+        if os.path.exists(train_losses_path):
+            with open(train_losses_path) as f:
+                train_losses = json.load(f)
+        if os.path.exists(val_losses_path):
+            with open(val_losses_path) as f:
+                val_losses = json.load(f)
+
     for epoch in range(start_epoch, args.epochs):
         avg_loss = train_one_epoch(
-            model, ema, text_encoder, schedule, optimizer,
+            model, ema, text_encoder, schedule, optimizer, scaler,
             train_loader, device, args.cfg_dropout,
             logger, epoch, args.log_every,
         )
         scheduler.step()
 
-        epoch_losses.append(avg_loss)
-        save_loss_graph(args.output_dir, epoch_losses, start_epoch=start_epoch)
+        train_losses.append((epoch, avg_loss))
+        with open(train_losses_path, "w") as f:
+            json.dump(train_losses, f, indent=2)
+        save_series_graph(
+            train_losses_path.replace(".json", ".png"),
+            train_losses, title="Training Loss per Epoch",
+        )
+
+        log_line = f"Epoch {epoch:4d} | loss {avg_loss:.4f} | lr {scheduler.get_last_lr()[0]:.2e}"
+
+        if val_loader is not None and (epoch + 1) % args.val_every == 0:
+            val_loss = validate_one_epoch(
+                ema.ema_model, text_encoder, schedule, val_loader, device, epoch,
+            )
+            val_losses.append((epoch, val_loss))
+            with open(val_losses_path, "w") as f:
+                json.dump(val_losses, f, indent=2)
+            save_series_graph(
+                val_losses_path.replace(".json", ".png"),
+                val_losses, title="Validation Loss per Epoch",
+            )
+            logger.log({"val/epoch_loss": val_loss, "val/epoch": epoch})
+            log_line += f" | val {val_loss:.4f}"
+
+        save_loss_graph(args.output_dir, train_losses, val_losses=val_losses)
 
         logger.log({
             "train/epoch_loss": avg_loss,
             "train/epoch": epoch,
             "train/lr": scheduler.get_last_lr()[0],
         })
-        print(f"Epoch {epoch:4d} | loss {avg_loss:.4f} | "
-              f"lr {scheduler.get_last_lr()[0]:.2e}")
+        print(log_line)
 
         if (epoch + 1) % args.save_every == 0:
             save_checkpoint(
@@ -308,7 +418,7 @@ def main():
     # final checkpoint
     save_checkpoint(args.output_dir, args.epochs - 1,
                     model, ema, optimizer, scheduler, config)
-    save_loss_graph(args.output_dir, epoch_losses, start_epoch=start_epoch)
+    save_loss_graph(args.output_dir, train_losses, val_losses=val_losses)
     print("Training complete.")
 
 

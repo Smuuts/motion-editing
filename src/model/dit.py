@@ -177,7 +177,7 @@ class SelfAttention(nn.Module):
 
         attn = q @ k.transpose(-2, -1) * self.scale
         if mask is not None:
-            attn = attn.masked_fill(~mask[:, None, None, :], float("-1e9"))
+            attn = attn.masked_fill(~mask[:, None, None, :], torch.finfo(attn.dtype).min)
         attn = torch.softmax(attn, dim=-1)
         attn = self.dropout(attn)
 
@@ -486,6 +486,9 @@ class MotionDiT(nn.Module):
             if block.use_joint_attn:
                 nn.init.zeros_(block.adaLN_jf[-1].weight)
                 nn.init.zeros_(block.adaLN_jf[-1].bias)
+                # zero-init the final projection so JF attention starts as identity
+                nn.init.zeros_(block.jf_attn.from_joints.weight)
+                nn.init.zeros_(block.jf_attn.from_joints.bias)
 
     def forward(
         self,
