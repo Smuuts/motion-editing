@@ -8,8 +8,6 @@ Usage:
 """
 
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from mpl_toolkits.mplot3d import Axes3D
@@ -132,3 +130,58 @@ def save_animation(
              savefig_kwargs={"facecolor": "black"})
     plt.close(fig)
     print(f"Saved animation: {save_path}")
+
+
+def show_animation(
+    joints: np.ndarray,
+    title: str = "",
+    fps: int = 20,
+    figsize: tuple = (6, 6),
+):
+    """Display a skeleton animation interactively (blocking)."""
+    T = joints.shape[0]
+
+    fig = plt.figure(figsize=figsize, facecolor="black")
+    ax  = fig.add_subplot(111, projection="3d")
+    fig.patch.set_facecolor("black")
+    ax.set_facecolor("black")
+    for pane in [ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane]:
+        pane.fill = False
+
+    margin = 0.3
+    x_min, x_max = joints[:, :, 0].min() - margin, joints[:, :, 0].max() + margin
+    y_min, y_max = joints[:, :, 2].min() - margin, joints[:, :, 2].max() + margin
+    z_min, z_max = joints[:, :, 1].min() - margin, joints[:, :, 1].max() + margin
+
+    lines = []
+    for chain, color in zip(KINEMATIC_CHAIN, CHAIN_COLORS):
+        line, = ax.plot([], [], [], "-o", color=color, markersize=3, linewidth=2)
+        lines.append((chain, line))
+
+    def init():
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_min, y_max)
+        ax.set_zlim(z_min, z_max)
+        ax.view_init(elev=20, azim=-70)
+        ax.set_xlabel("X", color="gray", fontsize=7)
+        ax.set_ylabel("Z (fwd)", color="gray", fontsize=7)
+        ax.set_zlabel("Y (up)", color="gray", fontsize=7)
+        ax.tick_params(colors="gray", labelsize=6)
+        if title:
+            ax.set_title(title, color="white", fontsize=9, pad=4)
+        return [l for _, l in lines]
+
+    def update(frame):
+        for chain, line in lines:
+            xs = joints[frame, chain, 0]
+            ys = joints[frame, chain, 2]
+            zs = joints[frame, chain, 1]
+            line.set_data(xs, ys)
+            line.set_3d_properties(zs)
+        return [l for _, l in lines]
+
+    ani = animation.FuncAnimation(  # noqa: F841 — must be kept alive for plt.show()
+        fig, update, frames=T,
+        init_func=init, blit=True, interval=1000 // fps,
+    )
+    plt.show()

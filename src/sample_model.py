@@ -23,6 +23,9 @@ src_dir = os.path.dirname(os.path.abspath(__file__))
 if src_dir not in sys.path:
     sys.path.insert(0, src_dir)
 
+import matplotlib
+matplotlib.use("Agg")
+
 from model.dit import build_model
 from model.text_encoder import CLIPTextEncoder
 from model.schedule import NoiseSchedule
@@ -52,16 +55,13 @@ def parse_args():
                    help="CFG scale. Higher = stronger text adherence, less diversity.")
     p.add_argument("--num_steps",      type=int,   default=1000,
                    help="DDPM sampling steps. 200 is faster for development.")
-    p.add_argument("--no_ema",         action="store_true", default=False,
-                   help="Load model.pt instead of ema.pt. Use this for checkpoints "
-                        "saved before the EMA-per-step fix.")
     p.add_argument("--smooth_sigma",   type=float, default=1.5,
                    help="Gaussian smoothing sigma on recovered joint positions "
                         "to reduce temporal jitter (0 = disabled).")
     return p.parse_args()
 
 
-def load_model(ckpt_dir: str, use_ema: bool, device):
+def load_model(ckpt_dir: str, device):
     config_path = os.path.join(ckpt_dir, "config.json")
     with open(config_path) as f:
         config = json.load(f)
@@ -77,14 +77,7 @@ def load_model(ckpt_dir: str, use_ema: bool, device):
         "dropout":     0.0,
     }, device=device)
 
-    ema_path   = os.path.join(ckpt_dir, "ema.pt")
-    model_path = os.path.join(ckpt_dir, "model.pt")
-    if use_ema and os.path.exists(ema_path):
-        weights = ema_path
-        print("NOTE: if this checkpoint was saved before the EMA-per-step fix, "
-              "ema.pt may be near-random. Use --use_ema False to load model.pt instead.")
-    else:
-        weights = model_path
+    weights = os.path.join(ckpt_dir, "ema.pt")
     model.load_state_dict(torch.load(weights, map_location=device, weights_only=True))
     model.eval()
     print(f"Loaded: {weights}")
@@ -101,7 +94,7 @@ def main():
     mean = np.load(os.path.join(args.data_root, "Mean.npy"))  # (263,)
     std  = np.load(os.path.join(args.data_root, "Std.npy"))   # (263,)
 
-    model, config = load_model(args.checkpoint, use_ema=not args.no_ema, device=device)
+    model, config = load_model(args.checkpoint, device=device)
 
     clip_version = config.get("clip_version", "ViT-B/32")
     text_encoder = CLIPTextEncoder(clip_version, device=device)
