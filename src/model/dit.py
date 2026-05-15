@@ -14,7 +14,6 @@ Architecture decisions relevant to LEDITS++ transfer:
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 # ── Sinusoidal timestep embedding ─────────────────────────────────────────────
@@ -187,95 +186,6 @@ class SelfAttention(nn.Module):
         return self.out(out)
 
 
-# ── Joint-frame self-attention ────────────────────────────────────────────────
-
-class JointFrameSelfAttention(nn.Module):
-    """
-    Full (Frame × Joint)² self-attention.
-
-    Each of the F frame tokens is projected into J joint tokens of dimension
-    jd = latent_dim // num_heads.  All F×J tokens then attend to each other in
-    a single pass, so joint j at frame t can directly attend to joint k at
-    frame s without going through multiple blocks.
-
-    Flash attention (F.scaled_dot_product_attention, PyTorch ≥ 2.0) is used to
-    avoid materialising the O((F×J)²) attention matrix — memory stays O(F×J).
-
-    Separable frame + joint positional embeddings are added before attention so
-    the model can distinguish both axes.
-    """
-
-    def __init__(self, dim: int, num_heads: int, num_joints: int,
-                 max_frames: int, dropout: float = 0.0):
-        super().__init__()
-        assert dim % num_heads == 0
-        jd = dim // num_heads           # per-joint token dim
-        assert jd % num_heads == 0, (
-            f"joint_token_dim ({jd} = latent_dim // num_heads) must itself be "
-            f"divisible by num_heads ({num_heads}). "
-            f"Ensure latent_dim is divisible by num_heads²."
-        )
-        self.num_heads  = num_heads
-        self.num_joints = num_joints
-        self.jd         = jd
-        self.head_dim   = jd // num_heads
-        self.dropout_p  = dropout
-
-        self.to_joints   = nn.Linear(dim, num_joints * jd, bias=False)
-        self.from_joints = nn.Linear(num_joints * jd, dim)
-        self.frame_pos   = nn.Embedding(max_frames, jd)
-        self.joint_pos   = nn.Embedding(num_joints, jd)
-        self.qkv         = nn.Linear(jd, jd * 3, bias=False)
-        self.out_proj    = nn.Linear(jd, jd)
-
-    def forward(self, x: torch.Tensor,
-                mask: torch.Tensor | None = None) -> torch.Tensor:
-        """
-        x    : (B, F, dim)
-        mask : (B, F) bool — True for real frames, False for padding
-        """
-        B, T, _ = x.shape   # T = num_frames (avoid shadowing torch.nn.functional F)
-        J, jd   = self.num_joints, self.jd
-
-        # project frame tokens → joint tokens, add positional embeddings
-        h = self.to_joints(x).view(B, T, J, jd)
-        h = h + self.frame_pos.weight[:T, None, :]  # (T, 1, jd)
-        h = h + self.joint_pos.weight[None, :, :]   # (1, J, jd)
-
-        # flatten to sequence of T×J tokens: (B, T*J, jd)
-        h = h.reshape(B, T * J, jd)
-
-        # QKV → (B, heads, T*J, head_dim)
-        qkv = self.qkv(h).reshape(B, T * J, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.unbind(dim=2)
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-
-        # expand padding mask: (B, T) → additive bias (B, 1, 1, T*J)
-        attn_bias   = None
-        token_mask  = None
-        if mask is not None:
-            token_mask = mask[:, :, None].expand(B, T, J).reshape(B, T * J)
-            attn_bias  = torch.zeros(B, 1, 1, T * J, device=x.device, dtype=x.dtype)
-            attn_bias.masked_fill_(~token_mask[:, None, None, :], float("-inf"))
-
-        # flash attention — O(T*J) memory
-        out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_bias,
-            dropout_p=self.dropout_p if self.training else 0.0,
-        )
-
-        # (B, heads, T*J, head_dim) → (B, T*J, jd)
-        out = out.transpose(1, 2).reshape(B, T * J, jd)
-        out = self.out_proj(out)
-
-        if token_mask is not None:
-            out = out.masked_fill(~token_mask[:, :, None], 0.0)
-
-        # unpack and project back: (B, T, dim)
-        return self.from_joints(out.reshape(B, T, J * jd))
-
-
 # ── Feed-forward ───────────────────────────────────────────────────────────────
 
 class FeedForward(nn.Module):
@@ -325,22 +235,11 @@ class DiTBlock(nn.Module):
     """
 
     def __init__(self, dim: int, context_dim: int, num_heads: int,
-                 ff_mult: int = 4, dropout: float = 0.0,
-                 use_joint_attn: bool = False, num_joints: int = 22,
-                 max_frames: int = 196):
+                 ff_mult: int = 4, dropout: float = 0.0):
         super().__init__()
 
-        self.use_joint_attn = use_joint_attn
-
-        # first sublayer: temporal self-attention OR full (Frame×Joint)² attention
-        if use_joint_attn:
-            self.norm_jf  = nn.LayerNorm(dim)
-            self.adaLN_jf = nn.Sequential(nn.SiLU(), nn.Linear(dim, 2 * dim))
-            self.jf_attn  = JointFrameSelfAttention(
-                dim, num_heads, num_joints, max_frames, dropout)
-        else:
-            self.norm1     = nn.LayerNorm(dim)
-            self.self_attn = SelfAttention(dim, num_heads, dropout)
+        self.norm1     = nn.LayerNorm(dim)
+        self.self_attn = SelfAttention(dim, num_heads, dropout)
 
         self.norm2 = nn.LayerNorm(dim)
         self.norm3 = nn.LayerNorm(dim)
@@ -348,12 +247,7 @@ class DiTBlock(nn.Module):
         self.cross_attn = CrossAttention(dim, context_dim, num_heads, dropout)
         self.ff         = FeedForward(dim, ff_mult, dropout)
 
-        # adaLN: scale and shift conditioned on timestep.
-        # When use_joint_attn=True, s1/b1 are unused (adaLN_jf handles sublayer 1).
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(dim, 6 * dim),
-        )
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
 
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor,
                 context: torch.Tensor, store_attn: bool = False,
@@ -369,18 +263,8 @@ class DiTBlock(nn.Module):
         s2, b2 = s2[:, None], b2[:, None]
         s3, b3 = s3[:, None], b3[:, None]
 
-        # 1. temporal self-attention OR joint-frame attention
-        if self.use_joint_attn:
-            sj, bj = self.adaLN_jf(t_emb).chunk(2, dim=-1)
-            x = x + self.jf_attn(
-                self.norm_jf(x) * (1 + sj[:, None]) + bj[:, None],
-                mask=mask,
-            )
-        else:
-            x = x + self.self_attn(
-                self.norm1(x) * (1 + s1) + b1,
-                mask=mask,
-            )
+        # 1. temporal self-attention
+        x = x + self.self_attn(self.norm1(x) * (1 + s1) + b1, mask=mask)
 
         # 2. cross-attention (text → motion)
         x = x + self.cross_attn(
@@ -433,28 +317,20 @@ class MotionDiT(nn.Module):
         max_frames:     int = 196,
         ff_mult:        int = 4,
         dropout:        float = 0.1,
-        use_joint_attn: bool = False,
     ):
         super().__init__()
         self.latent_dim = latent_dim
         self.max_frames = max_frames
-        self.num_joints = 22  # SMPL-H has 22 joints
 
-        # project input features to latent dim and back
-        # input_dim=263 for full HumanML3D feature vectors
-        self.input_dim = input_dim
+        self.input_dim   = input_dim
         self.joint_proj  = nn.Linear(input_dim, latent_dim)
         self.output_proj = nn.Linear(latent_dim, input_dim)
 
-        # positional and timestep embeddings
         self.pos_emb  = FramePositionalEmbedding(max_frames, latent_dim)
         self.time_emb = TimestepEmbedding(latent_dim)
 
-        # transformer blocks
         self.blocks = nn.ModuleList([
-            DiTBlock(latent_dim, context_dim, num_heads, ff_mult, dropout,
-                     use_joint_attn=use_joint_attn, num_joints=self.num_joints,
-                     max_frames=max_frames)
+            DiTBlock(latent_dim, context_dim, num_heads, ff_mult, dropout)
             for _ in range(num_layers)
         ])
 
@@ -483,12 +359,6 @@ class MotionDiT(nn.Module):
         for block in self.blocks:
             nn.init.zeros_(block.adaLN_modulation[-1].weight)
             nn.init.zeros_(block.adaLN_modulation[-1].bias)
-            if block.use_joint_attn:
-                nn.init.zeros_(block.adaLN_jf[-1].weight)
-                nn.init.zeros_(block.adaLN_jf[-1].bias)
-                # zero-init the final projection so JF attention starts as identity
-                nn.init.zeros_(block.jf_attn.from_joints.weight)
-                nn.init.zeros_(block.jf_attn.from_joints.bias)
 
     def forward(
         self,
@@ -543,14 +413,13 @@ class MotionDiT(nn.Module):
 
 def build_model(config: dict, device="cpu") -> MotionDiT:
     model = MotionDiT(
-        input_dim      = config.get("input_dim",      263),
-        latent_dim     = config.get("latent_dim",     512),
-        context_dim    = config.get("context_dim",    512),
-        num_heads      = config.get("num_heads",      8),
-        num_layers     = config.get("num_layers",     8),
-        max_frames     = config.get("max_frames",     196),
-        ff_mult        = config.get("ff_mult",        4),
-        dropout        = config.get("dropout",        0.1),
-        use_joint_attn = config.get("use_joint_attn", False),
+        input_dim  = config.get("input_dim",  263),
+        latent_dim = config.get("latent_dim", 512),
+        context_dim= config.get("context_dim",512),
+        num_heads  = config.get("num_heads",  8),
+        num_layers = config.get("num_layers", 8),
+        max_frames = config.get("max_frames", 196),
+        ff_mult    = config.get("ff_mult",    4),
+        dropout    = config.get("dropout",    0.1),
     )
     return model.to(device)

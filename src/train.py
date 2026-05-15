@@ -25,6 +25,8 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
 from tqdm import tqdm
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from data.dataset import build_dataloader
@@ -69,9 +71,6 @@ def parse_args():
                    help="Compute validation loss every N epochs (0 = disabled).")
     p.add_argument("--no_lr_decay",  action="store_true",
                    help="Keep learning rate constant (no decay)")
-    p.add_argument("--joint_attn",   action="store_true", default=False,
-                   help="Add per-frame spatial self-attention over joints inside each DiT block.")
-
     # resume
     p.add_argument("--resume",       type=str,   default=None,
                    help="Path to a checkpoint directory to resume from.")
@@ -93,22 +92,6 @@ def save_checkpoint(output_dir, epoch, model, ema, optimizer, scheduler, config)
         os.remove(latest)
     os.symlink(ckpt_dir, latest)
     print(f"  Saved checkpoint: {ckpt_dir}")
-
-
-def save_series_graph(path, losses, title, ylabel="Average Loss"):
-    if not losses:
-        return
-    epochs = [e for e, _ in losses]
-    values = [v for _, v in losses]
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(epochs, values, marker='o', linestyle='-')
-    ax.set_title(title)
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel(ylabel)
-    ax.grid(True, linestyle='--', alpha=0.4)
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
 
 
 def save_loss_graph(output_dir, train_losses, val_losses=None):
@@ -226,6 +209,7 @@ def train_one_epoch(
 @torch.no_grad()
 def validate_one_epoch(ema_model, text_encoder, schedule, loader, device, epoch):
     ema_model.eval()
+    torch.manual_seed(0)
     total_loss = 0.0
 
     pbar = tqdm(loader, desc=f"Val {epoch}", leave=False)
@@ -315,7 +299,6 @@ def main():
         "num_layers":     args.num_layers,
         "max_frames":     args.max_frames,
         "dropout":        args.dropout,
-        "use_joint_attn": args.joint_attn,
     }
     model = build_model(model_config, device=device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -357,16 +340,13 @@ def main():
     print(f"\nStarting training from epoch {start_epoch}")
     train_losses = []  # list of (epoch, train_loss)
     val_losses = []    # list of (epoch, val_loss)
-    train_losses_path = os.path.join(args.output_dir, "train_losses.json")
-    val_losses_path   = os.path.join(args.output_dir, "val_losses.json")
+    losses_path = os.path.join(args.output_dir, "losses.json")
 
-    if args.resume:
-        if os.path.exists(train_losses_path):
-            with open(train_losses_path) as f:
-                train_losses = json.load(f)
-        if os.path.exists(val_losses_path):
-            with open(val_losses_path) as f:
-                val_losses = json.load(f)
+    if args.resume and os.path.exists(losses_path):
+        with open(losses_path) as f:
+            saved_losses = json.load(f)
+        train_losses = saved_losses.get("train", [])
+        val_losses   = saved_losses.get("val",   [])
 
     for epoch in range(start_epoch, args.epochs):
         avg_loss = train_one_epoch(
@@ -377,12 +357,6 @@ def main():
         scheduler.step()
 
         train_losses.append((epoch, avg_loss))
-        with open(train_losses_path, "w") as f:
-            json.dump(train_losses, f, indent=2)
-        save_series_graph(
-            train_losses_path.replace(".json", ".png"),
-            train_losses, title="Training Loss per Epoch",
-        )
 
         log_line = f"Epoch {epoch:4d} | loss {avg_loss:.4f} | lr {scheduler.get_last_lr()[0]:.2e}"
 
@@ -391,15 +365,11 @@ def main():
                 ema.ema_model, text_encoder, schedule, val_loader, device, epoch,
             )
             val_losses.append((epoch, val_loss))
-            with open(val_losses_path, "w") as f:
-                json.dump(val_losses, f, indent=2)
-            save_series_graph(
-                val_losses_path.replace(".json", ".png"),
-                val_losses, title="Validation Loss per Epoch",
-            )
             logger.log({"val/epoch_loss": val_loss, "val/epoch": epoch})
             log_line += f" | val {val_loss:.4f}"
 
+        with open(losses_path, "w") as f:
+            json.dump({"train": train_losses, "val": val_losses}, f, indent=2)
         save_loss_graph(args.output_dir, train_losses, val_losses=val_losses)
 
         logger.log({
