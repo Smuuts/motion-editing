@@ -26,43 +26,72 @@ KINEMATIC_CHAIN = [
 CHAIN_COLORS = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6"]
 
 
+def _qinv(q: np.ndarray) -> np.ndarray:
+    """Unit-quaternion inverse (conjugate). q: (..., 4) as [w, x, y, z]."""
+    inv = q.copy()
+    inv[..., 1:] *= -1
+    return inv
+
+
+def _qrot(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Rotate vector(s) v by unit quaternion(s) q.
+    q: (..., 4), v: (..., 3) — shapes must broadcast on all but the last dim.
+    """
+    qvec = q[..., 1:]
+    uv   = np.cross(qvec, v)
+    uuv  = np.cross(qvec, uv)
+    return v + 2 * (q[..., :1] * uv + uuv)
+
+
+def _recover_root_rot_pos(data: np.ndarray):
+    """Recover root Y-axis orientation and world position from velocity features.
+
+    data : (..., T, 263)
+    Returns
+        r_rot_quat : (..., T, 4)  per-frame Y-axis rotation quaternion [w,x,y,z]
+        r_pos      : (..., T, 3)  per-frame world-space root position
+    """
+    rot_vel = data[..., 0]
+    r_rot_ang = np.zeros_like(rot_vel)
+    r_rot_ang[..., 1:] = rot_vel[..., :-1]        # shift by one frame
+    r_rot_ang = np.cumsum(r_rot_ang, axis=-1)      # integrate velocity → angle
+
+    r_rot_quat = np.zeros(data.shape[:-1] + (4,))
+    r_rot_quat[..., 0] = np.cos(r_rot_ang)        # w
+    r_rot_quat[..., 2] = np.sin(r_rot_ang)        # y  (Y-axis rotation)
+
+    r_pos = np.zeros(data.shape[:-1] + (3,))
+    r_pos[..., 1:, [0, 2]] = data[..., :-1, 1:3]  # XZ velocity in root frame (shifted)
+    r_pos = _qrot(_qinv(r_rot_quat), r_pos)        # rotate to world frame
+    r_pos = np.cumsum(r_pos, axis=-2)              # integrate → world XZ position
+    r_pos[..., 1] = data[..., 3]                  # Y height stored directly (not velocity)
+
+    return r_rot_quat, r_pos
+
+
 def recover_from_ric(data: np.ndarray, joints_num: int = 22) -> np.ndarray:
     """
-    Convert (T, 263) raw HumanML3D features → world-space joint positions (T, 22, 3).
+    Convert raw HumanML3D features → world-space joint positions.
     Must be called on RAW (denormalised) features.
+
+    data       : (..., T, 263)
+    Returns    : (..., T, joints_num, 3)
     """
-    T = len(data)
-    rot_vel = data[:, 0]    # angular velocity around Y
-    r_vel   = data[:, 1:3]  # XZ linear velocity in root frame
+    r_rot_quat, r_pos = _recover_root_rot_pos(data)
 
-    # integrate rotation — prepend 0 so angle[0]=0 (no rotation at first frame),
-    # consistent with position integration which also starts at 0.
-    r_rot_ang = np.cumsum(np.concatenate([[0.0], rot_vel[:-1]]))  # (T,)
-    cos_a = np.cos(r_rot_ang)
-    sin_a = np.sin(r_rot_ang)
+    positions = data[..., 4:(joints_num - 1) * 3 + 4]
+    positions = positions.reshape(positions.shape[:-1] + (-1, 3))  # (..., T, J, 3)
 
-    # rotate XZ velocity into world frame, then integrate → root XZ position
-    world_vx = r_vel[:, 0] * cos_a - r_vel[:, 1] * sin_a
-    world_vz = r_vel[:, 0] * sin_a + r_vel[:, 1] * cos_a
-    root_x = np.cumsum(np.concatenate([[0], world_vx[:-1]]))
-    root_z = np.cumsum(np.concatenate([[0], world_vz[:-1]]))
-    root_y = data[:, 3]  # root height stored directly
+    # rotate local joint positions from root-facing frame → world frame
+    # r_rot_quat[..., None, :] → (..., T, 1, 4) broadcasts over joint dim
+    positions = _qrot(_qinv(r_rot_quat)[..., None, :], positions)
 
-    root_pos = np.stack([root_x, root_y, root_z], axis=-1)  # (T, 3)
+    # add root XZ offset; joint Y is already world-space height
+    positions[..., 0] += r_pos[..., 0:1]
+    positions[..., 2] += r_pos[..., 2:3]
 
-    # (joints_num-1)*3 = 63 non-root joint positions at channels 4:67 (root-relative)
-    j_pos = data[:, 4:4 + (joints_num - 1) * 3].reshape(T, joints_num - 1, 3)
-
-    x = j_pos[:, :, 0].copy()
-    z = j_pos[:, :, 2].copy()
-    j_pos[:, :, 0] = x * cos_a[:, None] - z * sin_a[:, None]
-    j_pos[:, :, 2] = x * sin_a[:, None] + z * cos_a[:, None]
-    # Only add root XZ — joint Y values are already world-space height
-    j_pos[:, :, 0] += root_x[:, None]
-    j_pos[:, :, 2] += root_z[:, None]
-
-    # prepend root so output indices match the kinematic chain
-    return np.concatenate([root_pos[:, None, :], j_pos], axis=1)  # (T, 22, 3)
+    # prepend root as joint 0
+    return np.concatenate([r_pos[..., None, :], positions], axis=-2)
 
 
 def save_animation(
