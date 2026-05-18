@@ -35,6 +35,7 @@ from model.text_encoder import CLIPTextEncoder
 from model.schedule import NoiseSchedule
 from utils.ema import EMA
 from utils.logger import Logger
+from utils.skeleton import fk_position_loss
 
 
 def parse_args():
@@ -57,9 +58,16 @@ def parse_args():
     p.add_argument("--cfg_dropout",  type=float, default=0.1,
                    help="Fraction of batch to train unconditionally (CFG).")
 
+    # data
+    p.add_argument("--feature_mode", type=str,   default="smpl",
+                   choices=["humanml3d", "smpl"],
+                   help="'humanml3d' = full 263-dim; 'smpl' = 130-dim (root vel + body pose 6D)")
+    p.add_argument("--fk_loss_weight", type=float, default=0.1,
+                   help="Weight of the FK position loss (SMPL mode only). 0 = disabled.")
+
     # training
     p.add_argument("--epochs",       type=int,   default=1000)
-    p.add_argument("--batch_size",   type=int,   default=128)
+    p.add_argument("--batch_size",   type=int,   default=64)
     p.add_argument("--lr",           type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--max_frames",   type=int,   default=196)
@@ -137,20 +145,21 @@ def load_checkpoint(ckpt_dir, model, ema, optimizer, scheduler):
 def train_one_epoch(
     model, ema, text_encoder, schedule, optimizer, scaler,
     loader, device, cfg_dropout, logger, epoch, log_every,
+    smpl_stats=None, fk_loss_weight=0.0,
 ):
     model.train()
     total_loss = 0.0
 
     pbar = tqdm(loader, desc=f"Epoch {epoch}", leave=False)
     for step, batch in enumerate(pbar):
-        motion = batch["motion"].to(device)  # (B, F, 263)
+        motion = batch["motion"].to(device)
         B = motion.shape[0]
 
         # ── sample random timesteps ────────────────────────────────────
         t = torch.randint(0, schedule.T, (B,), device=device)
 
         # ── add noise (forward process) ────────────────────────────────
-        x_t, noise = schedule.q_sample(motion, t)  # both (B, F, 263)
+        x_t, noise = schedule.q_sample(motion, t)
 
         # ── get text context (precomputed or live CLIP encode) ─────────
         # null_text_emb (not all-zeros) must receive gradients so guidance
@@ -175,11 +184,18 @@ def train_one_epoch(
 
         # ── predict noise ──────────────────────────────────────────────
         with autocast(device_type=device.type):
-            prediction = model(x_t, t, context, mask=attn_mask)  # (B, F, 263)
+            prediction = model(x_t, t, context, mask=attn_mask)
 
             # ── loss: masked MSE — only penalise real frames, not padding ──
             loss_mask = attn_mask.float().unsqueeze(-1)  # (B, F, 1)
             loss = ((noise - prediction) ** 2 * loss_mask).sum() / (loss_mask.sum() * noise.shape[-1])
+
+            # ── FK position loss (SMPL mode only) ─────────────────────
+            if smpl_stats is not None and fk_loss_weight > 0.0:
+                mean_t, std_t = smpl_stats
+                x0_pred = schedule.predict_x0_from_eps(x_t, t, prediction)
+                fk_loss = fk_position_loss(x0_pred, motion, mean_t, std_t, mask=attn_mask)
+                loss = loss + fk_loss_weight * fk_loss
 
         # ── optimise ───────────────────────────────────────────────────
         optimizer.zero_grad()
@@ -207,7 +223,8 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def validate_one_epoch(ema_model, text_encoder, schedule, loader, device, epoch):
+def validate_one_epoch(ema_model, text_encoder, schedule, loader, device, epoch,
+                       smpl_stats=None, fk_loss_weight=0.0):
     ema_model.eval()
     torch.manual_seed(0)
     total_loss = 0.0
@@ -236,6 +253,13 @@ def validate_one_epoch(ema_model, text_encoder, schedule, loader, device, epoch)
             prediction = ema_model(x_t, t, context, mask=attn_mask)
             loss_mask = attn_mask.float().unsqueeze(-1)
             loss = ((noise - prediction) ** 2 * loss_mask).sum() / (loss_mask.sum() * noise.shape[-1])
+
+            if smpl_stats is not None and fk_loss_weight > 0.0:
+                mean_t, std_t = smpl_stats
+                x0_pred = schedule.predict_x0_from_eps(x_t, t, prediction)
+                fk_loss = fk_position_loss(x0_pred, motion, mean_t, std_t, mask=attn_mask)
+                loss = loss + fk_loss_weight * fk_loss
+
         total_loss += loss.item()
         pbar.set_postfix(val_loss=f"{loss.item():.4f}")
 
@@ -269,6 +293,7 @@ def main():
         batch_size=args.batch_size,
         max_frames=args.max_frames,
         num_workers=args.num_workers,
+        feature_mode=args.feature_mode,
     )
     print(f"Training on {len(train_loader.dataset)} clips")
 
@@ -279,8 +304,18 @@ def main():
             batch_size=args.batch_size,
             max_frames=args.max_frames,
             num_workers=args.num_workers,
+            feature_mode=args.feature_mode,
         )
         print(f"Validation on {len(val_loader.dataset)} clips (every {args.val_every} epochs)")
+
+    # ── SMPL FK stats (only needed in smpl mode with fk loss) ────────
+    smpl_stats = None
+    if args.feature_mode == "smpl" and args.fk_loss_weight > 0.0:
+        ds = train_loader.dataset
+        mean_t = torch.from_numpy(ds.mean).float().to(device)
+        std_t  = torch.from_numpy(ds.std).float().to(device)
+        smpl_stats = (mean_t, std_t)
+        print(f"FK position loss enabled (weight={args.fk_loss_weight})")
 
     # ── text encoder ──────────────────────────────────────────────────
     context_dim = 768 if "L/14" in args.clip_version else 512
@@ -291,8 +326,9 @@ def main():
         text_encoder = CLIPTextEncoder(args.clip_version, device=device)
 
     # ── model ─────────────────────────────────────────────────────────
+    input_dim = train_loader.dataset.feature_dim
     model_config = {
-        "input_dim":      263,
+        "input_dim":      input_dim,
         "latent_dim":     args.latent_dim,
         "context_dim":    context_dim,
         "num_heads":      args.num_heads,
@@ -353,6 +389,7 @@ def main():
             model, ema, text_encoder, schedule, optimizer, scaler,
             train_loader, device, args.cfg_dropout,
             logger, epoch, args.log_every,
+            smpl_stats=smpl_stats, fk_loss_weight=args.fk_loss_weight,
         )
         scheduler.step()
 
@@ -363,6 +400,7 @@ def main():
         if val_loader is not None and (epoch + 1) % args.val_every == 0:
             val_loss = validate_one_epoch(
                 ema.ema_model, text_encoder, schedule, val_loader, device, epoch,
+                smpl_stats=smpl_stats, fk_loss_weight=args.fk_loss_weight,
             )
             val_losses.append((epoch, val_loss))
             logger.log({"val/epoch_loss": val_loss, "val/epoch": epoch})

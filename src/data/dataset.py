@@ -4,15 +4,24 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 
+# Channels extracted from the 263-dim HumanML3D vector for SMPL mode (130 dims):
+#   [0:4]    root_rot_vel + root_XZ_vel + root_y  (velocity-based root)
+#   [67:193] body_pose 6D for 21 non-root joints  (rot_data)
+_SMPL_CHANNELS = np.array(list(range(4)) + list(range(67, 193)))
+
 
 class HumanML3DDataset(Dataset):
     """
     Loads HumanML3D motion clips and their text annotations.
 
     Each item returns:
-        motion  : (max_frames, 263) float32 tensor, normalised HumanML3D feature vectors
+        motion  : (max_frames, D) float32 tensor, normalised feature vectors
         text    : one randomly sampled annotation string
         length  : actual number of frames T (before padding)
+
+    feature_mode:
+        "humanml3d" — full 263-dim HumanML3D feature vector
+        "smpl"      — 130-dim subset: root velocity/height + body pose 6D (21 joints)
     """
 
     def __init__(
@@ -21,14 +30,25 @@ class HumanML3DDataset(Dataset):
         split: str = "train",
         max_frames: int = 196,
         min_frames: int = 16,
+        feature_mode: str = "humanml3d",
     ):
+        assert feature_mode in ("humanml3d", "smpl"), f"Unknown feature_mode: {feature_mode}"
         self.data_root = data_root
         self.max_frames = max_frames
         self.min_frames = min_frames
+        self.feature_mode = feature_mode
 
-        # normalisation statistics
-        self.mean = np.load(os.path.join(data_root, "Mean.npy"))  # (263,)
-        self.std  = np.load(os.path.join(data_root, "Std.npy"))   # (263,)
+        # normalisation statistics — slice to the active channels for SMPL mode
+        mean = np.load(os.path.join(data_root, "Mean.npy"))  # (263,)
+        std  = np.load(os.path.join(data_root, "Std.npy"))   # (263,)
+        if feature_mode == "smpl":
+            self.mean = mean[_SMPL_CHANNELS]  # (130,)
+            self.std  = std[_SMPL_CHANNELS]   # (130,)
+            self.feature_dim = len(_SMPL_CHANNELS)
+        else:
+            self.mean = mean
+            self.std  = std
+            self.feature_dim = 263
 
         # clip IDs for this split
         split_file = os.path.join(data_root, f"{split}.txt")
@@ -60,16 +80,17 @@ class HumanML3DDataset(Dataset):
     def __getitem__(self, idx):
         clip_id = self.ids[idx]
 
-        # load 263-dim features and normalise — do NOT reconstruct joints
         vecs = np.load(os.path.join(self.vec_dir, f"{clip_id}.npy"))  # (T, 263)
-        vecs = (vecs - self.mean) / self.std                           # (T, 263)
+        if self.feature_mode == "smpl":
+            vecs = vecs[:, _SMPL_CHANNELS]                            # (T, 130)
+        vecs = (vecs - self.mean) / self.std
 
         T = min(len(vecs), self.max_frames)
         vecs = vecs[:T]
 
-        pad = np.zeros((self.max_frames, 263), dtype=np.float32)
+        pad = np.zeros((self.max_frames, self.feature_dim), dtype=np.float32)
         pad[:T] = vecs
-        motion = torch.from_numpy(pad)  # (max_frames, 263)
+        motion = torch.from_numpy(pad)  # (max_frames, feature_dim)
 
         # text — use precomputed CLIP embeddings when available
         if self.text_emb_dir is not None:
@@ -88,8 +109,10 @@ class HumanML3DDataset(Dataset):
 
 
 def build_dataloader(data_root, split="train", batch_size=64,
-                     max_frames=196, num_workers=4, shuffle=None):
-    dataset = HumanML3DDataset(data_root, split=split, max_frames=max_frames)
+                     max_frames=196, num_workers=4, shuffle=None,
+                     feature_mode="humanml3d"):
+    dataset = HumanML3DDataset(data_root, split=split, max_frames=max_frames,
+                               feature_mode=feature_mode)
     if shuffle is None:
         shuffle = (split == "train")
     return DataLoader(
