@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, LinearLR, SequentialLR
 from tqdm import tqdm
 
 import matplotlib
@@ -68,7 +68,7 @@ def parse_args():
     # training
     p.add_argument("--epochs",       type=int,   default=500)
     p.add_argument("--batch_size",   type=int,   default=128)
-    p.add_argument("--lr",           type=float, default=1e-4)
+    p.add_argument("--lr",           type=float, default=2e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--max_frames",   type=int,   default=196)
     p.add_argument("--num_workers",  type=int,   default=4)
@@ -77,6 +77,8 @@ def parse_args():
     p.add_argument("--log_every",    type=int,   default=100)
     p.add_argument("--val_every",    type=int,   default=1,
                    help="Compute validation loss every N epochs (0 = disabled).")
+    p.add_argument("--warmup_epochs", type=int,   default=5,
+                   help="Number of epochs to linearly warm up the LR from 1%% to target.")
     p.add_argument("--no_lr_decay",  action="store_true",
                    help="Keep learning rate constant (no decay)")
     # resume
@@ -375,9 +377,18 @@ def main():
         betas=(0.9, 0.999),
     )
     if args.no_lr_decay:
-        scheduler = LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
+        main_sched = LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
     else:
-        scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+        main_sched = CosineAnnealingLR(
+            optimizer, T_max=args.epochs - args.warmup_epochs, eta_min=1e-6
+        )
+    if args.warmup_epochs > 0:
+        warmup = LinearLR(optimizer, start_factor=0.01, end_factor=1.0,
+                          total_iters=args.warmup_epochs)
+        scheduler = SequentialLR(optimizer, schedulers=[warmup, main_sched],
+                                 milestones=[args.warmup_epochs])
+    else:
+        scheduler = main_sched
 
     # ── logger ────────────────────────────────────────────────────────
     logger = Logger(args.output_dir)
