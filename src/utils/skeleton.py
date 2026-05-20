@@ -178,3 +178,58 @@ def fk_position_loss(
         return sq_err.sum() / (mask.float().sum() * 22 * 3).clamp(min=1)
 
     return sq_err.mean()
+
+
+def _joint_positions_smpl(x: torch.Tensor) -> torch.Tensor:
+    """x: (B, T, 130) denormalized → (B, T, 22, 3) root-relative world-space positions."""
+    root_quat, root_pos = _recover_root_torch(x)
+    body_pose = x[..., 4:].reshape(*x.shape[:-1], 21, 6)
+    offsets = OFFSETS.to(x.device)
+    joints = _forward_kinematics(root_quat, body_pose, root_pos, offsets)
+    return joints - joints[:, :, 0:1, :]
+
+
+def _joint_positions_humanml3d(x: torch.Tensor) -> torch.Tensor:
+    """x: (B, T, 263) denormalized → (B, T, 22, 3) root-relative local-frame positions."""
+    joints_21 = x[..., 4:67].reshape(*x.shape[:-1], 21, 3)
+    root = torch.zeros(*x.shape[:-1], 1, 3, device=x.device, dtype=x.dtype)
+    return torch.cat([root, joints_21], dim=-2)
+
+
+def compute_mpjpe(
+    x_pred_norm: torch.Tensor,
+    x_gt_norm:   torch.Tensor,
+    mean:        torch.Tensor,
+    std:         torch.Tensor,
+    feature_mode: str,
+    mask:        torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Mean per-joint position error (metres) between predicted and GT clean features.
+
+    Both inputs are clamped to ±5 before denormalisation to match the behaviour
+    of fk_position_loss and avoid blow-up at high noise timesteps.
+
+    SMPL mode:       root-relative world-space positions via FK (22 joints)
+    HumanML3D mode:  root-relative local-frame positions from channels [4:67] (22 joints)
+
+    The two frames are not identical, but both are root-relative and in metres,
+    so the numbers are directly comparable across training modes.
+    """
+    x_pred = x_pred_norm.clamp(-5, 5).float() * std + mean
+    x_gt   = x_gt_norm.clamp(-5, 5).float()   * std + mean
+
+    if feature_mode == "smpl":
+        joints_pred = _joint_positions_smpl(x_pred)
+        joints_gt   = _joint_positions_smpl(x_gt)
+    else:
+        joints_pred = _joint_positions_humanml3d(x_pred)
+        joints_gt   = _joint_positions_humanml3d(x_gt)
+
+    dist = torch.norm(joints_pred - joints_gt, dim=-1)  # (B, T, 22)
+
+    if mask is not None:
+        dist = dist * mask[:, :, None].float()
+        return dist.sum() / (mask.float().sum() * 22).clamp(min=1)
+
+    return dist.mean()

@@ -35,7 +35,7 @@ from model.text_encoder import CLIPTextEncoder
 from model.schedule import NoiseSchedule
 from utils.ema import EMA
 from utils.logger import Logger
-from utils.skeleton import fk_position_loss
+from utils.skeleton import fk_position_loss, compute_mpjpe
 
 
 def parse_args():
@@ -66,8 +66,8 @@ def parse_args():
                    help="Weight of the FK position loss (SMPL mode only). 0 = disabled.")
 
     # training
-    p.add_argument("--epochs",       type=int,   default=1000)
-    p.add_argument("--batch_size",   type=int,   default=64)
+    p.add_argument("--epochs",       type=int,   default=500)
+    p.add_argument("--batch_size",   type=int,   default=128)
     p.add_argument("--lr",           type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--max_frames",   type=int,   default=196)
@@ -100,6 +100,22 @@ def save_checkpoint(output_dir, epoch, model, ema, optimizer, scheduler, config)
         os.remove(latest)
     os.symlink(ckpt_dir, latest)
     print(f"  Saved checkpoint: {ckpt_dir}")
+
+
+def save_mpjpe_graph(output_dir, val_mpjpe_losses):
+    if not val_mpjpe_losses:
+        return
+    epochs = [e for e, _ in val_mpjpe_losses]
+    values = [v for _, v in val_mpjpe_losses]
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(epochs, values, marker='s', linestyle='-', color='tab:green')
+    ax.set_title('Validation MPJPE per Epoch')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('MPJPE (m)')
+    ax.grid(True, linestyle='--', alpha=0.4)
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, 'val_mpjpe.png'), dpi=150)
+    plt.close(fig)
 
 
 def save_loss_graph(output_dir, train_losses, val_losses=None):
@@ -224,10 +240,11 @@ def train_one_epoch(
 
 @torch.no_grad()
 def validate_one_epoch(ema_model, text_encoder, schedule, loader, device, epoch,
-                       smpl_stats=None, fk_loss_weight=0.0):
+                       feature_stats=None, feature_mode="smpl"):
     ema_model.eval()
     torch.manual_seed(0)
     total_loss = 0.0
+    total_mpjpe = 0.0
 
     pbar = tqdm(loader, desc=f"Val {epoch}", leave=False)
     for batch in pbar:
@@ -254,16 +271,15 @@ def validate_one_epoch(ema_model, text_encoder, schedule, loader, device, epoch,
             loss_mask = attn_mask.float().unsqueeze(-1)
             loss = ((noise - prediction) ** 2 * loss_mask).sum() / (loss_mask.sum() * noise.shape[-1])
 
-            if smpl_stats is not None and fk_loss_weight > 0.0:
-                mean_t, std_t = smpl_stats
-                x0_pred = schedule.predict_x0_from_eps(x_t, t, prediction)
-                fk_loss = fk_position_loss(x0_pred, motion, mean_t, std_t, mask=attn_mask)
-                loss = loss + fk_loss_weight * fk_loss
+        x0_pred = schedule.predict_x0_from_eps(x_t, t, prediction)
+        mean_t, std_t = feature_stats
+        mpjpe = compute_mpjpe(x0_pred, motion, mean_t, std_t, feature_mode, mask=attn_mask)
 
         total_loss += loss.item()
-        pbar.set_postfix(val_loss=f"{loss.item():.4f}")
+        total_mpjpe += mpjpe.item()
+        pbar.set_postfix(val_loss=f"{loss.item():.4f}", mpjpe=f"{mpjpe.item():.4f}")
 
-    return total_loss / len(loader)
+    return total_loss / len(loader), total_mpjpe / len(loader)
 
 
 def main():
@@ -308,13 +324,15 @@ def main():
         )
         print(f"Validation on {len(val_loader.dataset)} clips (every {args.val_every} epochs)")
 
-    # ── SMPL FK stats (only needed in smpl mode with fk loss) ────────
+    # ── feature stats (needed for MPJPE and optionally for FK loss) ──
+    ds = train_loader.dataset
+    mean_t = torch.from_numpy(ds.mean).float().to(device)
+    std_t  = torch.from_numpy(ds.std).float().to(device)
+    feature_stats = (mean_t, std_t)
+
     smpl_stats = None
     if args.feature_mode == "smpl" and args.fk_loss_weight > 0.0:
-        ds = train_loader.dataset
-        mean_t = torch.from_numpy(ds.mean).float().to(device)
-        std_t  = torch.from_numpy(ds.std).float().to(device)
-        smpl_stats = (mean_t, std_t)
+        smpl_stats = feature_stats
         print(f"FK position loss enabled (weight={args.fk_loss_weight})")
 
     # ── text encoder ──────────────────────────────────────────────────
@@ -374,15 +392,17 @@ def main():
 
     # ── training loop ─────────────────────────────────────────────────
     print(f"\nStarting training from epoch {start_epoch}")
-    train_losses = []  # list of (epoch, train_loss)
-    val_losses = []    # list of (epoch, val_loss)
+    train_losses     = []
+    val_losses       = []
+    val_mpjpe_losses = []
     losses_path = os.path.join(args.output_dir, "losses.json")
 
     if args.resume and os.path.exists(losses_path):
         with open(losses_path) as f:
             saved_losses = json.load(f)
-        train_losses = saved_losses.get("train", [])
-        val_losses   = saved_losses.get("val",   [])
+        train_losses     = saved_losses.get("train",     [])
+        val_losses       = saved_losses.get("val",       [])
+        val_mpjpe_losses = saved_losses.get("val_mpjpe", [])
 
     for epoch in range(start_epoch, args.epochs):
         avg_loss = train_one_epoch(
@@ -398,17 +418,19 @@ def main():
         log_line = f"Epoch {epoch:4d} | loss {avg_loss:.4f} | lr {scheduler.get_last_lr()[0]:.2e}"
 
         if val_loader is not None and (epoch + 1) % args.val_every == 0:
-            val_loss = validate_one_epoch(
+            val_loss, val_mpjpe = validate_one_epoch(
                 ema.ema_model, text_encoder, schedule, val_loader, device, epoch,
-                smpl_stats=smpl_stats, fk_loss_weight=args.fk_loss_weight,
+                feature_stats=feature_stats, feature_mode=args.feature_mode,
             )
             val_losses.append((epoch, val_loss))
-            logger.log({"val/epoch_loss": val_loss, "val/epoch": epoch})
-            log_line += f" | val {val_loss:.4f}"
+            val_mpjpe_losses.append((epoch, val_mpjpe))
+            logger.log({"val/epoch_loss": val_loss, "val/epoch_mpjpe": val_mpjpe, "val/epoch": epoch})
+            log_line += f" | val {val_loss:.4f} | mpjpe {val_mpjpe:.4f}m"
 
         with open(losses_path, "w") as f:
-            json.dump({"train": train_losses, "val": val_losses}, f, indent=2)
+            json.dump({"train": train_losses, "val": val_losses, "val_mpjpe": val_mpjpe_losses}, f, indent=2)
         save_loss_graph(args.output_dir, train_losses, val_losses=val_losses)
+        save_mpjpe_graph(args.output_dir, val_mpjpe_losses)
 
         logger.log({
             "train/epoch_loss": avg_loss,
@@ -427,6 +449,7 @@ def main():
     save_checkpoint(args.output_dir, args.epochs - 1,
                     model, ema, optimizer, scheduler, config)
     save_loss_graph(args.output_dir, train_losses, val_losses=val_losses)
+    save_mpjpe_graph(args.output_dir, val_mpjpe_losses)
     print("Training complete.")
 
 
