@@ -44,7 +44,7 @@ def parse_args():
 
     # data
     p.add_argument("--feature_mode", type=str,   default="smpl",
-                   choices=["humanml3d", "smpl", "joint"],
+                   choices=["humanml3d", "smpl", "group"],
                    help="'humanml3d' = full 263-dim; 'smpl' = 130-dim (root vel + body pose 6D); "
                         "'joint' = 130-dim split into per-joint tokens (22 tokens × F frames)")
     p.add_argument("--fk_loss_weight", type=float, default=0.1,
@@ -260,7 +260,7 @@ def main():
     feature_stats = (mean_t, std_t)
 
     smpl_stats = None
-    if args.feature_mode in ("smpl", "joint") and args.fk_loss_weight > 0.0:
+    if args.feature_mode in ("smpl", "group") and args.fk_loss_weight > 0.0:
         smpl_stats = feature_stats
         print(f"FK position loss enabled (weight={args.fk_loss_weight})")
 

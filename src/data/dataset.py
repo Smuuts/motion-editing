@@ -32,7 +32,7 @@ class HumanML3DDataset(Dataset):
         min_frames: int = 16,
         feature_mode: str = "humanml3d",
     ):
-        assert feature_mode in ("humanml3d", "smpl", "joint"), f"Unknown feature_mode: {feature_mode}"
+        assert feature_mode in ("humanml3d", "smpl", "group"), f"Unknown feature_mode: {feature_mode}"
         self.data_root = data_root
         self.max_frames = max_frames
         self.min_frames = min_frames
@@ -41,7 +41,7 @@ class HumanML3DDataset(Dataset):
         # normalisation statistics — slice to the active channels for SMPL/joint mode
         mean = np.load(os.path.join(data_root, "Mean.npy"))  # (263,)
         std  = np.load(os.path.join(data_root, "Std.npy"))   # (263,)
-        if feature_mode in ("smpl", "joint"):
+        if feature_mode in ("smpl", "group"):
             self.mean = mean[_SMPL_CHANNELS]  # (130,)
             self.std  = std[_SMPL_CHANNELS]   # (130,)
             self.feature_dim = len(_SMPL_CHANNELS)
@@ -81,7 +81,7 @@ class HumanML3DDataset(Dataset):
         clip_id = self.ids[idx]
 
         vecs = np.load(os.path.join(self.vec_dir, f"{clip_id}.npy"))  # (T, 263)
-        if self.feature_mode in ("smpl", "joint"):
+        if self.feature_mode in ("smpl", "group"):
             vecs = vecs[:, _SMPL_CHANNELS]                            # (T, 130)
         vecs = (vecs - self.mean) / self.std
 
