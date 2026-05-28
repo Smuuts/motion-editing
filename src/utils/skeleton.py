@@ -219,7 +219,7 @@ def compute_mpjpe(
     x_pred = x_pred_norm.clamp(-5, 5).float() * std + mean
     x_gt   = x_gt_norm.clamp(-5, 5).float()   * std + mean
 
-    if feature_mode == "smpl":
+    if feature_mode in ("smpl", "joint"):
         joints_pred = _joint_positions_smpl(x_pred)
         joints_gt   = _joint_positions_smpl(x_gt)
     else:

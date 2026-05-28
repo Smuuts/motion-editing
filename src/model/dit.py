@@ -411,15 +411,165 @@ class MotionDiT(nn.Module):
                 maps.append(block.cross_attn.last_attn_map)
         return maps
 
+# ── Per-joint-per-frame DiT ────────────────────────────────────────────────────
+
+_N_JOINTS  = 22   # 1 root + 21 body joints
+_ROOT_DIM  = 4    # rot_vel + xz_vel (2) + y_height
+_JOINT_DIM = 6    # 6D continuous rotation per body joint
+
+class JointDiT(nn.Module):
+    """
+    Per-joint-per-frame motion diffusion transformer.
+
+    Each (joint, frame) pair becomes a separate token so the model can attend
+    freely across both the temporal and skeletal dimensions.  Input and output
+    shapes are identical to the SMPL-mode MotionDiT — (B, F, 130) — so the
+    diffusion training loop requires no changes.
+
+    Tokenisation per frame:
+      token 0     : root features (4-dim)  projected by root_proj
+      tokens 1-21 : body joint 6D rots (6-dim each) projected by joint_proj
+
+    Each token receives:
+      + frame positional embedding  (which frame)
+      + joint identity embedding    (which joint: 0 = root, 1-21 = body joints)
+
+    Total sequence length fed to the transformer: F × 22.
+    """
+
+    def __init__(
+        self,
+        latent_dim:  int   = 512,
+        context_dim: int   = 512,
+        num_heads:   int   = 8,
+        num_layers:  int   = 8,
+        max_frames:  int   = 196,
+        ff_mult:     int   = 4,
+        dropout:     float = 0.1,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.max_frames = max_frames
+        self.input_dim  = 130  # fixed: 4 root + 21 × 6 body
+
+        self.root_proj      = nn.Linear(_ROOT_DIM,  latent_dim)
+        self.joint_proj     = nn.Linear(_JOINT_DIM, latent_dim)
+        self.root_out_proj  = nn.Linear(latent_dim, _ROOT_DIM)
+        self.joint_out_proj = nn.Linear(latent_dim, _JOINT_DIM)
+
+        self.joint_emb = nn.Embedding(_N_JOINTS, latent_dim)
+        self.pos_emb   = FramePositionalEmbedding(max_frames, latent_dim)
+        self.time_emb  = TimestepEmbedding(latent_dim)
+
+        self.blocks = nn.ModuleList([
+            DiTBlock(latent_dim, context_dim, num_heads, ff_mult, dropout)
+            for _ in range(num_layers)
+        ])
+
+        self.final_norm   = nn.LayerNorm(latent_dim)
+        self.null_text_emb = nn.Parameter(torch.randn(1, 77, context_dim) * 0.02)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+        for block in self.blocks:
+            nn.init.zeros_(block.adaLN_modulation[-1].weight)
+            nn.init.zeros_(block.adaLN_modulation[-1].bias)
+
+    def forward(
+        self,
+        motion:     torch.Tensor,            # (B, F, 130)
+        t:          torch.Tensor,            # (B,)
+        context:    torch.Tensor | None,     # (B, L, context_dim) or None
+        store_attn: bool = False,
+        mask:       torch.Tensor | None = None,  # (B, F) per-frame mask
+    ) -> torch.Tensor:
+        B, F, _ = motion.shape
+        J = _N_JOINTS  # 22
+
+        if context is None:
+            context = self.null_text_emb.expand(B, -1, -1)
+
+        # ── tokenise ──────────────────────────────────────────────────────────
+        root_feats  = motion[..., :_ROOT_DIM]                         # (B, F, 4)
+        joint_feats = motion[..., _ROOT_DIM:].reshape(B, F, 21, 6)   # (B, F, 21, 6)
+
+        root_tokens  = self.root_proj(root_feats)    # (B, F, latent_dim)
+        joint_tokens = self.joint_proj(joint_feats)  # (B, F, 21, latent_dim)
+
+        # stack into (B, F, 22, latent_dim)
+        tokens = torch.cat([root_tokens.unsqueeze(2), joint_tokens], dim=2)
+
+        # ── add joint identity + frame positional embeddings ──────────────────
+        joint_ids  = torch.arange(J, device=motion.device)
+        joint_embs = self.joint_emb(joint_ids)      # (22, latent_dim)
+        frame_embs = self.pos_emb(F, motion.device) # (F,  latent_dim)
+
+        tokens = tokens + joint_embs[None, None, :, :]  # broadcast B, F
+        tokens = tokens + frame_embs[None, :, None, :]  # broadcast B, J
+
+        # ── flatten to sequence ───────────────────────────────────────────────
+        tokens = tokens.reshape(B, F * J, self.latent_dim)  # (B, F*22, latent_dim)
+
+        # expand per-frame mask to cover all joint tokens at each frame
+        if mask is not None:
+            joint_mask = mask[:, :, None].expand(B, F, J).reshape(B, F * J)
+        else:
+            joint_mask = None
+
+        t_emb = self.time_emb(t)  # (B, latent_dim)
+
+        for block in self.blocks:
+            tokens = block(tokens, t_emb, context, store_attn=store_attn, mask=joint_mask)
+
+        tokens = self.final_norm(tokens)
+
+        # ── reconstruct (B, F, 130) ───────────────────────────────────────────
+        tokens = tokens.reshape(B, F, J, self.latent_dim)
+
+        root_pred  = self.root_out_proj(tokens[:, :, 0, :])    # (B, F, 4)
+        joint_pred = self.joint_out_proj(tokens[:, :, 1:, :])  # (B, F, 21, 6)
+        joint_pred = joint_pred.reshape(B, F, 21 * _JOINT_DIM) # (B, F, 126)
+
+        return torch.cat([root_pred, joint_pred], dim=-1)       # (B, F, 130)
+
+    def get_attn_maps(self):
+        maps = []
+        for block in self.blocks:
+            if block.cross_attn.last_attn_map is not None:
+                maps.append(block.cross_attn.last_attn_map)
+        return maps
+
+
 def build_model(config: dict, device="cpu") -> MotionDiT:
-    model = MotionDiT(
-        input_dim  = config.get("input_dim",  263),
-        latent_dim = config.get("latent_dim", 512),
-        context_dim= config.get("context_dim",512),
-        num_heads  = config.get("num_heads",  8),
-        num_layers = config.get("num_layers", 8),
-        max_frames = config.get("max_frames", 196),
-        ff_mult    = config.get("ff_mult",    4),
-        dropout    = config.get("dropout",    0.1),
-    )
+    feature_mode = config.get("feature_mode", "smpl")
+    latent_dim   = config.get("latent_dim",  512)
+    context_dim  = config.get("context_dim", 512)
+    num_heads    = config.get("num_heads",   8)
+    num_layers   = config.get("num_layers",  8)
+    max_frames   = config.get("max_frames",  196)
+    ff_mult      = config.get("ff_mult",     4)
+    dropout      = config.get("dropout",     0.1)
+
+    if feature_mode == "joint":
+        model = JointDiT(
+            latent_dim=latent_dim, context_dim=context_dim,
+            num_heads=num_heads, num_layers=num_layers,
+            max_frames=max_frames, ff_mult=ff_mult, dropout=dropout,
+        )
+    else:
+        model = MotionDiT(
+            input_dim  = config.get("input_dim", 263),
+            latent_dim=latent_dim, context_dim=context_dim,
+            num_heads=num_heads, num_layers=num_layers,
+            max_frames=max_frames, ff_mult=ff_mult, dropout=dropout,
+        )
     return model.to(device)

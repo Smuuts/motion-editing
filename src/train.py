@@ -44,10 +44,11 @@ def parse_args():
 
     # data
     p.add_argument("--feature_mode", type=str,   default="smpl",
-                   choices=["humanml3d", "smpl"],
-                   help="'humanml3d' = full 263-dim; 'smpl' = 130-dim (root vel + body pose 6D)")
+                   choices=["humanml3d", "smpl", "joint"],
+                   help="'humanml3d' = full 263-dim; 'smpl' = 130-dim (root vel + body pose 6D); "
+                        "'joint' = 130-dim split into per-joint tokens (22 tokens × F frames)")
     p.add_argument("--fk_loss_weight", type=float, default=0.1,
-                   help="Weight of the FK position loss (SMPL mode only). 0 = disabled.")
+                   help="Weight of the FK position loss (SMPL/joint mode only). 0 = disabled.")
 
     # training
     p.add_argument("--epochs",       type=int,   default=500)
@@ -259,7 +260,7 @@ def main():
     feature_stats = (mean_t, std_t)
 
     smpl_stats = None
-    if args.feature_mode == "smpl" and args.fk_loss_weight > 0.0:
+    if args.feature_mode in ("smpl", "joint") and args.fk_loss_weight > 0.0:
         smpl_stats = feature_stats
         print(f"FK position loss enabled (weight={args.fk_loss_weight})")
 
@@ -273,13 +274,14 @@ def main():
 
     # model
     model = build_model({
-        "input_dim":   train_loader.dataset.feature_dim,
-        "latent_dim":  args.latent_dim,
-        "context_dim": context_dim,
-        "num_heads":   args.num_heads,
-        "num_layers":  args.num_layers,
-        "max_frames":  args.max_frames,
-        "dropout":     args.dropout,
+        "feature_mode": args.feature_mode,
+        "input_dim":    train_loader.dataset.feature_dim,
+        "latent_dim":   args.latent_dim,
+        "context_dim":  context_dim,
+        "num_heads":    args.num_heads,
+        "num_layers":   args.num_layers,
+        "max_frames":   args.max_frames,
+        "dropout":      args.dropout,
     }, device=device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.1f}M")
 
