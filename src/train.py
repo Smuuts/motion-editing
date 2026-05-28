@@ -1,22 +1,6 @@
-"""
-Training script for MotionDiT.
-
-Usage:
-    python train.py --data_root /path/to/HumanML3D --output_dir ./runs/exp1
-
-Key design decisions:
-    - Epsilon (noise) prediction: required for LEDITS++ inversion
-    - Cosine noise schedule: better motion structure preservation
-    - Classifier-free guidance training: 10% of batches use null text
-    - EMA model: used for inference and evaluation
-    - Checkpoints saved every N epochs with full resume support
-"""
-
 import os
 import argparse
 import json
-import math
-from copy import deepcopy
 
 import torch
 import torch.nn as nn
@@ -33,6 +17,7 @@ from data.dataset import build_dataloader
 from model.dit import build_model
 from model.text_encoder import CLIPTextEncoder
 from model.schedule import NoiseSchedule
+from utils.checkpoint import save_checkpoint, load_checkpoint
 from utils.ema import EMA
 from utils.logger import Logger
 from utils.skeleton import fk_position_loss, compute_mpjpe
@@ -51,7 +36,6 @@ def parse_args():
     p.add_argument("--num_heads",    type=int,   default=8)
     p.add_argument("--dropout",      type=float, default=0.1)
     p.add_argument("--clip_version", type=str,   default="ViT-B/32")
-    # ViT-B/32 -> context_dim=512, ViT-L/14 -> context_dim=768
 
     # diffusion
     p.add_argument("--timesteps",    type=int,   default=1000)
@@ -77,87 +61,57 @@ def parse_args():
     p.add_argument("--log_every",    type=int,   default=100)
     p.add_argument("--val_every",    type=int,   default=1,
                    help="Compute validation loss every N epochs (0 = disabled).")
-    p.add_argument("--warmup_epochs", type=int,   default=5,
+    p.add_argument("--warmup_epochs", type=int,  default=5,
                    help="Number of epochs to linearly warm up the LR from 1%% to target.")
     p.add_argument("--no_lr_decay",  action="store_true",
                    help="Keep learning rate constant (no decay)")
+
     # resume
     p.add_argument("--resume",       type=str,   default=None,
                    help="Path to a checkpoint directory to resume from.")
     return p.parse_args()
 
 
-def save_checkpoint(output_dir, epoch, model, ema, optimizer, scheduler, config):
-    ckpt_dir = os.path.join(output_dir, f"checkpoint_epoch_{epoch:04d}")
-    os.makedirs(ckpt_dir, exist_ok=True)
-    torch.save(model.state_dict(),     os.path.join(ckpt_dir, "model.pt"))
-    torch.save(ema.ema_model.state_dict(), os.path.join(ckpt_dir, "ema.pt"))
-    torch.save(optimizer.state_dict(), os.path.join(ckpt_dir, "optimizer.pt"))
-    torch.save(scheduler.state_dict(), os.path.join(ckpt_dir, "scheduler.pt"))
-    with open(os.path.join(ckpt_dir, "config.json"), "w") as f:
-        json.dump({**config, "epoch": epoch}, f, indent=2)
-    # keep a symlink to the latest checkpoint for easy resuming
-    latest = os.path.join(output_dir, "checkpoint_latest")
-    if os.path.islink(latest):
-        os.remove(latest)
-    os.symlink(ckpt_dir, latest)
-    print(f"  Saved checkpoint: {ckpt_dir}")
+def _save_figure(path, title, ylabel, *series):
+    """series: (epochs, values, plot_kwargs) tuples."""
+    if not series or not series[0][0]:
+        return
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for epochs, values, kwargs in series:
+        ax.plot(epochs, values, **kwargs)
+    if len(series) > 1:
+        ax.legend()
+    ax.set_title(title)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, linestyle="--", alpha=0.4)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def save_loss_graph(output_dir, train_losses, val_losses=None):
+    series = [
+        ([e for e, _ in train_losses], [v for _, v in train_losses],
+         dict(marker="o", linestyle="-", color="tab:blue", label="train")),
+    ]
+    if val_losses:
+        series.append(
+            ([e for e, _ in val_losses], [v for _, v in val_losses],
+             dict(marker="s", linestyle="--", color="tab:orange", label="val"))
+        )
+    _save_figure(os.path.join(output_dir, "training_loss.png"), "Loss per Epoch", "Average Loss", *series)
 
 
 def save_mpjpe_graph(output_dir, val_mpjpe_losses):
     if not val_mpjpe_losses:
         return
-    epochs = [e for e, _ in val_mpjpe_losses]
-    values = [v for _, v in val_mpjpe_losses]
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(epochs, values, marker='s', linestyle='-', color='tab:green')
-    ax.set_title('Validation MPJPE per Epoch')
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('MPJPE (m)')
-    ax.grid(True, linestyle='--', alpha=0.4)
-    fig.tight_layout()
-    fig.savefig(os.path.join(output_dir, 'val_mpjpe.png'), dpi=150)
-    plt.close(fig)
-
-
-def save_loss_graph(output_dir, train_losses, val_losses=None):
-    if not train_losses:
-        return
-
-    train_epochs = [e for e, _ in train_losses]
-    train_values = [v for _, v in train_losses]
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(train_epochs, train_values, marker='o', linestyle='-', color='tab:blue', label='train')
-    if val_losses:
-        val_epochs = [e for e, _ in val_losses]
-        val_values = [v for _, v in val_losses]
-        ax.plot(val_epochs, val_values, marker='s', linestyle='--', color='tab:orange', label='val')
-    ax.legend()
-    ax.set_title('Loss per Epoch')
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('Average Loss')
-    ax.grid(True, linestyle='--', alpha=0.4)
-    fig.tight_layout()
-
-    graph_path = os.path.join(output_dir, 'training_loss.png')
-    fig.savefig(graph_path, dpi=150)
-    plt.close(fig)
-
-
-def load_checkpoint(ckpt_dir, model, ema, optimizer, scheduler):
-    model.load_state_dict(
-        torch.load(os.path.join(ckpt_dir, "model.pt"), weights_only=True))
-    ema.ema_model.load_state_dict(
-        torch.load(os.path.join(ckpt_dir, "ema.pt"), weights_only=True))
-    optimizer.load_state_dict(
-        torch.load(os.path.join(ckpt_dir, "optimizer.pt"), weights_only=True))
-    scheduler.load_state_dict(
-        torch.load(os.path.join(ckpt_dir, "scheduler.pt"), weights_only=True))
-    with open(os.path.join(ckpt_dir, "config.json")) as f:
-        saved = json.load(f)
-    start_epoch = saved["epoch"] + 1
-    print(f"  Resumed from epoch {saved['epoch']}")
-    return start_epoch
+    _save_figure(
+        os.path.join(output_dir, "val_mpjpe.png"),
+        "Validation MPJPE per Epoch", "MPJPE (m)",
+        ([e for e, _ in val_mpjpe_losses], [v for _, v in val_mpjpe_losses],
+         dict(marker="s", linestyle="-", color="tab:green")),
+    )
 
 
 def train_one_epoch(
@@ -173,26 +127,20 @@ def train_one_epoch(
         motion = batch["motion"].to(device)
         B = motion.shape[0]
 
-        # ── sample random timesteps ────────────────────────────────────
         t = torch.randint(0, schedule.T, (B,), device=device)
-
-        # ── add noise (forward process) ────────────────────────────────
         x_t, noise = schedule.q_sample(motion, t)
 
-        # ── get text context (precomputed or live CLIP encode) ─────────
-        # null_text_emb (not all-zeros) must receive gradients so guidance
-        # scale > 1 works correctly at inference.
         if "context" in batch:
-            context = batch["context"].to(device)   # (B, 77, context_dim)
+            context = batch["context"].to(device)
         else:
             with torch.no_grad():
-                context = text_encoder.encode(batch["text"])  # (B, 77, context_dim)
+                context = text_encoder.encode(batch["text"])
         if cfg_dropout > 0.0:
             drop_mask = (torch.rand(B, device=device) < cfg_dropout)[:, None, None]
-            null_emb  = model.null_text_emb.expand(B, -1, -1)  # has gradient
+            # null_text_emb must keep its gradient so CFG scale > 1 works at inference
+            null_emb  = model.null_text_emb.expand(B, -1, -1)
             context   = torch.where(drop_mask, null_emb, context)
 
-        # ── create padding mask for variable-length clips ───────────────
         lengths = batch["length"]
         if isinstance(lengths, torch.Tensor):
             lengths_tensor = lengths.detach().clone().to(device)
@@ -200,42 +148,30 @@ def train_one_epoch(
             lengths_tensor = torch.as_tensor(lengths, device=device)
         attn_mask = torch.arange(motion.shape[1], device=device)[None, :] < lengths_tensor[:, None]
 
-        # ── predict noise ──────────────────────────────────────────────
         with autocast(device_type=device.type):
             prediction = model(x_t, t, context, mask=attn_mask)
-
-            # ── loss: masked MSE — only penalise real frames, not padding ──
-            loss_mask = attn_mask.float().unsqueeze(-1)  # (B, F, 1)
+            loss_mask = attn_mask.float().unsqueeze(-1)
             loss = ((noise - prediction) ** 2 * loss_mask).sum() / (loss_mask.sum() * noise.shape[-1])
 
-            # ── FK position loss (SMPL mode only) ─────────────────────
             if smpl_stats is not None and fk_loss_weight > 0.0:
                 mean_t, std_t = smpl_stats
                 x0_pred = schedule.predict_x0_from_eps(x_t, t, prediction)
                 fk_loss = fk_position_loss(x0_pred, motion, mean_t, std_t, mask=attn_mask)
                 loss = loss + fk_loss_weight * fk_loss
 
-        # ── optimise ───────────────────────────────────────────────────
         optimizer.zero_grad()
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
-
-        # EMA must be updated every step, not every epoch.
-        # With decay=0.9999, updating once per epoch (100 calls total)
-        # leaves the shadow at 0.9999^100 ≈ 0.99× its initial random weights.
-        ema.update_from(model)
+        ema.update_from(model)  # per-step update so decay=0.9999 accumulates correctly
 
         total_loss += loss.item()
         pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         if (step + 1) % log_every == 0:
-            logger.log({
-                "train/loss": loss.item(),
-                "train/step": epoch * len(loader) + step,
-            })
+            logger.log({"train/loss": loss.item(), "train/step": epoch * len(loader) + step})
 
     return total_loss / len(loader)
 
@@ -290,43 +226,33 @@ def main():
     for k, v in vars(args).items():
         print(f"  {k}: {v}")
 
-    # ── config ────────────────────────────────────────────────────────
     config = vars(args)
     if args.config:
         with open(args.config) as f:
-            file_cfg = json.load(f)
-        config.update(file_cfg)
+            config.update(json.load(f))
 
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "config.json"), "w") as f:
         json.dump(config, f, indent=2)
 
-    # ── device ────────────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # ── data ──────────────────────────────────────────────────────────
-    train_loader = build_dataloader(
-        args.data_root, split="train",
+    # data
+    loader_kwargs = dict(
         batch_size=args.batch_size,
         max_frames=args.max_frames,
         num_workers=args.num_workers,
         feature_mode=args.feature_mode,
     )
+    train_loader = build_dataloader(args.data_root, split="train", **loader_kwargs)
     print(f"Training on {len(train_loader.dataset)} clips")
 
     val_loader = None
     if args.val_every > 0:
-        val_loader = build_dataloader(
-            args.data_root, split="val",
-            batch_size=args.batch_size,
-            max_frames=args.max_frames,
-            num_workers=args.num_workers,
-            feature_mode=args.feature_mode,
-        )
+        val_loader = build_dataloader(args.data_root, split="val", **loader_kwargs)
         print(f"Validation on {len(val_loader.dataset)} clips (every {args.val_every} epochs)")
 
-    # ── feature stats (needed for MPJPE and optionally for FK loss) ──
     ds = train_loader.dataset
     mean_t = torch.from_numpy(ds.mean).float().to(device)
     std_t  = torch.from_numpy(ds.std).float().to(device)
@@ -337,7 +263,7 @@ def main():
         smpl_stats = feature_stats
         print(f"FK position loss enabled (weight={args.fk_loss_weight})")
 
-    # ── text encoder ──────────────────────────────────────────────────
+    # text encoder
     context_dim = 768 if "L/14" in args.clip_version else 512
     if train_loader.dataset.text_emb_dir is not None:
         print("Precomputed text embeddings found — skipping CLIP model load.")
@@ -345,76 +271,54 @@ def main():
     else:
         text_encoder = CLIPTextEncoder(args.clip_version, device=device)
 
-    # ── model ─────────────────────────────────────────────────────────
-    input_dim = train_loader.dataset.feature_dim
-    model_config = {
-        "input_dim":      input_dim,
-        "latent_dim":     args.latent_dim,
-        "context_dim":    context_dim,
-        "num_heads":      args.num_heads,
-        "num_layers":     args.num_layers,
-        "max_frames":     args.max_frames,
-        "dropout":        args.dropout,
-    }
-    model = build_model(model_config, device=device)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model parameters: {n_params / 1e6:.1f}M")
+    # model
+    model = build_model({
+        "input_dim":   train_loader.dataset.feature_dim,
+        "latent_dim":  args.latent_dim,
+        "context_dim": context_dim,
+        "num_heads":   args.num_heads,
+        "num_layers":  args.num_layers,
+        "max_frames":  args.max_frames,
+        "dropout":     args.dropout,
+    }, device=device)
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.1f}M")
 
-    # ── EMA ───────────────────────────────────────────────────────────
-    ema = EMA(model, decay=args.ema_decay)
-
-    # ── noise schedule ────────────────────────────────────────────────
+    ema      = EMA(model, decay=args.ema_decay)
     schedule = NoiseSchedule(timesteps=args.timesteps, device=device)
+    scaler   = GradScaler(device=device.type, enabled=device.type == "cuda")
 
-    # ── mixed precision ───────────────────────────────────────────────
-    scaler = GradScaler(device=device.type, enabled=device.type == "cuda")
-
-    # ── optimizer & scheduler ─────────────────────────────────────────
-    optimizer = AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        betas=(0.9, 0.999),
-    )
+    # optimizer & scheduler
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999))
     if args.no_lr_decay:
         main_sched = LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
     else:
-        main_sched = CosineAnnealingLR(
-            optimizer, T_max=args.epochs - args.warmup_epochs, eta_min=1e-6
-        )
+        main_sched = CosineAnnealingLR(optimizer, T_max=args.epochs - args.warmup_epochs, eta_min=1e-6)
     if args.warmup_epochs > 0:
-        warmup = LinearLR(optimizer, start_factor=0.01, end_factor=1.0,
-                          total_iters=args.warmup_epochs)
-        scheduler = SequentialLR(optimizer, schedulers=[warmup, main_sched],
-                                 milestones=[args.warmup_epochs])
+        warmup    = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=args.warmup_epochs)
+        scheduler = SequentialLR(optimizer, schedulers=[warmup, main_sched], milestones=[args.warmup_epochs])
     else:
         scheduler = main_sched
 
-    # ── logger ────────────────────────────────────────────────────────
     logger = Logger(args.output_dir)
 
-    # ── resume ────────────────────────────────────────────────────────
+    # resume
     start_epoch = 0
+    train_losses, val_losses, val_mpjpe_losses = [], [], []
+    losses_path = os.path.join(args.output_dir, "losses.json")
     if args.resume:
         ckpt_dir = args.resume
         if ckpt_dir == "latest":
             ckpt_dir = os.path.join(args.output_dir, "checkpoint_latest")
         start_epoch = load_checkpoint(ckpt_dir, model, ema, optimizer, scheduler)
+        if os.path.exists(losses_path):
+            with open(losses_path) as f:
+                saved = json.load(f)
+            train_losses     = saved.get("train",     [])
+            val_losses       = saved.get("val",       [])
+            val_mpjpe_losses = saved.get("val_mpjpe", [])
 
-    # ── training loop ─────────────────────────────────────────────────
+    # training loop
     print(f"\nStarting training from epoch {start_epoch}")
-    train_losses     = []
-    val_losses       = []
-    val_mpjpe_losses = []
-    losses_path = os.path.join(args.output_dir, "losses.json")
-
-    if args.resume and os.path.exists(losses_path):
-        with open(losses_path) as f:
-            saved_losses = json.load(f)
-        train_losses     = saved_losses.get("train",     [])
-        val_losses       = saved_losses.get("val",       [])
-        val_mpjpe_losses = saved_losses.get("val_mpjpe", [])
-
     for epoch in range(start_epoch, args.epochs):
         avg_loss = train_one_epoch(
             model, ema, text_encoder, schedule, optimizer, scaler,
@@ -423,16 +327,20 @@ def main():
             smpl_stats=smpl_stats, fk_loss_weight=args.fk_loss_weight,
         )
         scheduler.step()
-
         train_losses.append((epoch, avg_loss))
 
         log_line = f"Epoch {epoch:4d} | loss {avg_loss:.4f} | lr {scheduler.get_last_lr()[0]:.2e}"
 
         if val_loader is not None and (epoch + 1) % args.val_every == 0:
+            rng_cpu = torch.get_rng_state()
+            rng_gpu = torch.cuda.get_rng_state(device) if device.type == "cuda" else None
             val_loss, val_mpjpe = validate_one_epoch(
                 ema.ema_model, text_encoder, schedule, val_loader, device, epoch,
                 feature_stats=feature_stats, feature_mode=args.feature_mode,
             )
+            torch.set_rng_state(rng_cpu)
+            if rng_gpu is not None:
+                torch.cuda.set_rng_state(rng_gpu, device)
             val_losses.append((epoch, val_loss))
             val_mpjpe_losses.append((epoch, val_mpjpe))
             logger.log({"val/epoch_loss": val_loss, "val/epoch_mpjpe": val_mpjpe, "val/epoch": epoch})
@@ -442,23 +350,13 @@ def main():
             json.dump({"train": train_losses, "val": val_losses, "val_mpjpe": val_mpjpe_losses}, f, indent=2)
         save_loss_graph(args.output_dir, train_losses, val_losses=val_losses)
         save_mpjpe_graph(args.output_dir, val_mpjpe_losses)
-
-        logger.log({
-            "train/epoch_loss": avg_loss,
-            "train/epoch": epoch,
-            "train/lr": scheduler.get_last_lr()[0],
-        })
+        logger.log({"train/epoch_loss": avg_loss, "train/epoch": epoch, "train/lr": scheduler.get_last_lr()[0]})
         print(log_line)
 
         if (epoch + 1) % args.save_every == 0:
-            save_checkpoint(
-                args.output_dir, epoch, model, ema,
-                optimizer, scheduler, config,
-            )
+            save_checkpoint(args.output_dir, epoch, model, ema, optimizer, scheduler, config)
 
-    # final checkpoint
-    save_checkpoint(args.output_dir, args.epochs - 1,
-                    model, ema, optimizer, scheduler, config)
+    save_checkpoint(args.output_dir, args.epochs - 1, model, ema, optimizer, scheduler, config)
     save_loss_graph(args.output_dir, train_losses, val_losses=val_losses)
     save_mpjpe_graph(args.output_dir, val_mpjpe_losses)
     print("Training complete.")
