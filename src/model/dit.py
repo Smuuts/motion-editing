@@ -56,10 +56,16 @@ class CrossAttention(nn.Module):
         self.out = nn.Linear(dim, dim)
         self.dropout = nn.Dropout(dropout)
 
-        self.last_attn_map = None  # (B, heads, N_motion, L_text) — set when store_attn=True
+        # Shape when stored: (B, heads, N_motion, L_text).
+        # N_motion = F for MotionDiT, F*G for GroupDiT (G=7 body-part groups).
+        # For Stage 2 mask M1: accumulate these across ALL inversion timesteps and layers,
+        # then average over heads, timesteps, and layers before thresholding.
+        self.last_attn_map = None
 
     def forward(self, x: torch.Tensor, context: torch.Tensor,
                 store_attn: bool = False) -> torch.Tensor:
+        # store_attn=True is passed during Stage 1 inversion and Stage 3 denoising
+        # to collect A^{t,l} maps. Must be False during training to avoid memory growth.
         B, N, _ = x.shape
         _, L, _ = context.shape
 
@@ -131,20 +137,22 @@ class DiTBlock(nn.Module):
         self.cross_attn = CrossAttention(dim, context_dim, num_heads, dropout)
         self.norm3      = nn.LayerNorm(dim)
         self.ff         = FeedForward(dim, ff_mult, dropout)
-        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 9 * dim))
 
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor,
                 context: torch.Tensor, store_attn: bool = False,
                 mask: torch.Tensor | None = None):
         mods = self.adaLN_modulation(t_emb)
-        s1, b1, s2, b2, s3, b3 = mods.chunk(6, dim=-1)
-        s1, b1 = s1[:, None], b1[:, None]
-        s2, b2 = s2[:, None], b2[:, None]
-        s3, b3 = s3[:, None], b3[:, None]
+        s1, b1, g1, s2, b2, g2, s3, b3, g3 = mods.chunk(9, dim=-1)
+        s1, b1, g1 = s1[:, None], b1[:, None], g1[:, None]
+        s2, b2, g2 = s2[:, None], b2[:, None], g2[:, None]
+        s3, b3, g3 = s3[:, None], b3[:, None], g3[:, None]
 
-        x = x + self.self_attn(self.norm1(x) * (1 + s1) + b1, mask=mask)
-        x = x + self.cross_attn(self.norm2(x) * (1 + s2) + b2, context, store_attn=store_attn)
-        x = x + self.ff(self.norm3(x) * (1 + s3) + b3)
+        # adaLN-zero: gate (g) is zero-initialised so each block is an identity
+        # map at the start of training (DiT §3.2).
+        x = x + g1 * self.self_attn(self.norm1(x) * (1 + s1) + b1, mask=mask)
+        x = x + g2 * self.cross_attn(self.norm2(x) * (1 + s2) + b2, context, store_attn=store_attn)
+        x = x + g3 * self.ff(self.norm3(x) * (1 + s3) + b3)
         return x
 
 
@@ -166,7 +174,13 @@ class _MotionDiTBase(nn.Module):
             nn.init.zeros_(block.adaLN_modulation[-1].bias)
 
     def get_attn_maps(self) -> list[torch.Tensor]:
-        """Returns cross-attention maps (B, heads, tokens, L_text) from all layers."""
+        """Returns cross-attention maps (B, heads, tokens, L_text) from all layers.
+
+        For LEDITS++ Stage 2: call this after every inversion timestep and stack
+        the results as (num_steps, num_layers, B, heads, tokens, L_text).
+        Average over steps, layers, heads, then threshold at λ-th percentile to get M1.
+        For GroupDiT, tokens=F*G; reshape to (F, G) to get the spatiotemporal map.
+        """
         return [b.cross_attn.last_attn_map for b in self.blocks
                 if b.cross_attn.last_attn_map is not None]
 
@@ -174,6 +188,12 @@ class _MotionDiTBase(nn.Module):
 class MotionDiT(_MotionDiTBase):
     """
     Frame-level motion DiT. Each frame is a single token; input/output (B, F, input_dim).
+
+    LEDITS++ note: cross-attention maps are (B, heads, F, L_text) — one row per frame.
+    M1 averaging over edit-token columns produces a per-frame relevance vector of length F,
+    which directly gives the temporal dimension of the spatiotemporal mask.
+    No body-part spatial resolution: all joints in a frame are masked together.
+    Use GroupDiT if joint-group resolution in the mask is needed.
     """
 
     def __init__(
@@ -203,7 +223,9 @@ class MotionDiT(_MotionDiTBase):
         ])
         self.final_norm = nn.LayerNorm(latent_dim)
 
-        # null_text_emb: sequence length 77 to match CLIP, avoiding key distribution mismatch
+        # null_text_emb: sequence length 77 to match CLIP, avoiding key distribution mismatch.
+        # For LEDITS++ inversion (Stage 1): pass context=None so the model uses this —
+        # inversion is unconditional and requires no source text description of the motion.
         self.null_text_emb = nn.Parameter(torch.randn(1, 77, context_dim) * 0.02)
         self._init_weights()
 
@@ -243,6 +265,11 @@ _BODY_PART_GROUPS = [
 ]
 _N_GROUPS = 1 + len(_BODY_PART_GROUPS)  # 7: root + 6 body-part groups
 
+# Public: ordered group names matching the G-dimension of GroupDiT token sequences.
+# Token g in frame f is at position f*G + g; GROUP_NAMES[g] is its name.
+# Used by masking.py, analyse_attention.py, and the LLM fallback mask.
+GROUP_NAMES: list[str] = ["root"] + [name for name, _ in _BODY_PART_GROUPS]
+
 # Inverse permutation: maps the group-concatenated joint order back to the
 # canonical 21-joint order so output can be scattered back correctly.
 # Group concat order: left_leg[0,3,6,9] right_leg[1,4,7,10] spine[2,5,8]
@@ -263,6 +290,13 @@ class GroupDiT(_MotionDiTBase):
     A group identity embedding and a frame positional embedding are added.
 
     Input/output shape: (B, F, 130) — identical to SMPL-mode MotionDiT.
+
+    LEDITS++ note: cross-attention maps are (B, heads, F*G, L_text) where G=7.
+    Reshape to (B, heads, F, G, L_text), then average over heads and edit-token
+    columns to get the (F, G) spatiotemporal map for mask M1.
+    Each (frame, group) cell answers: "is this body-part group at this frame
+    semantically relevant to the edit instruction?"
+    This is the primary architecture advantage over MotionDiT for LEDITS++.
     """
 
     def __init__(
@@ -333,6 +367,9 @@ class GroupDiT(_MotionDiTBase):
         tokens = tokens + self.pos_emb(F, motion.device)[None, :, None]
 
         # ── transformer blocks ────────────────────────────────────────────────
+        # Flatten to (B, F*G, latent_dim) for the transformer.
+        # For LEDITS++ Stage 2: after collecting last_attn_map (B, heads, F*G, L_text),
+        # reshape to (B, heads, F, G, L_text) to recover body-part × frame structure.
         tokens = tokens.reshape(B, F * G, self.latent_dim)
 
         if mask is not None:

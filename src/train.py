@@ -138,7 +138,9 @@ def train_one_epoch(
                 context = text_encoder.encode(batch["text"])
         if cfg_dropout > 0.0:
             drop_mask = (torch.rand(B, device=device) < cfg_dropout)[:, None, None]
-            # null_text_emb must keep its gradient so CFG scale > 1 works at inference
+            # null_text_emb must keep its gradient so CFG scale > 1 works at inference.
+            # CFG dropout also trains the unconditional branch used by LEDITS++ Stage 1
+            # inversion (context=None) and the ε_θ(x_t, ∅) term in Stage 3 Eq. 1.
             null_emb  = model.null_text_emb.expand(B, -1, -1)
             context   = torch.where(drop_mask, null_emb, context)
 
@@ -210,7 +212,13 @@ def validate_one_epoch(ema_model, text_encoder, schedule, loader, device, epoch,
             loss_mask = attn_mask.float().unsqueeze(-1)
             loss = ((noise - prediction) ** 2 * loss_mask).sum() / (loss_mask.sum() * noise.shape[-1])
 
-        x0_pred = schedule.predict_x0_from_eps(x_t, t, prediction)
+        # MPJPE: one-step x0 reconstruction is only meaningful at low noise.
+        # Re-run at t ~ U[0, T/20] so alpha_bar > 0.98 (signal fraction > 99%).
+        t_low = torch.randint(0, max(1, schedule.T // 20), (B,), device=device)
+        x_t_low, _ = schedule.q_sample(motion, t_low)
+        with autocast(device_type=device.type):
+            pred_low = ema_model(x_t_low, t_low, context, mask=attn_mask)
+        x0_pred = schedule.predict_x0_from_eps(x_t_low, t_low, pred_low)
         mean_t, std_t = feature_stats
         mpjpe = compute_mpjpe(x0_pred, motion, mean_t, std_t, feature_mode, mask=attn_mask)
 
@@ -285,6 +293,8 @@ def main():
     }, device=device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.1f}M")
 
+    # LEDITS++ uses the EMA model for all inference passes (inversion + editing).
+    # Load from checkpoint_latest/ema.pt, not model.pt.
     ema      = EMA(model, decay=args.ema_decay)
     schedule = NoiseSchedule(timesteps=args.timesteps, device=device)
     scaler   = GradScaler(device=device.type, enabled=device.type == "cuda")

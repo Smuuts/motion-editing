@@ -6,7 +6,10 @@ Used to compute an auxiliary FK position loss during SMPL-mode training.
 import torch
 import torch.nn.functional as F
 
-# Parent joint index for each of the 22 joints (-1 = root)
+# Parent joint index for each of the 22 joints (-1 = root).
+# Used for FK and for the explicit LLM-derived fallback mask: given joint group names
+# from an LLM (e.g., "right_arm"), map them to joint indices via _BODY_PART_GROUPS in
+# dit.py, then use PARENTS to optionally expand the mask to include connecting joints.
 PARENTS = [-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19]
 
 # Bone offsets (child position - parent position) derived from the mean of
@@ -56,7 +59,7 @@ def _cont6d_to_rotmat(x: torch.Tensor) -> torch.Tensor:
     b1 = F.normalize(a1, dim=-1)
     b2 = F.normalize(a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1, dim=-1)
     b3 = torch.cross(b1, b2, dim=-1)
-    return torch.stack([b1, b2, b3], dim=-1)   # (..., 3, 3) columns = [b1|b2|b3]
+    return torch.stack([b1, b2, b3], dim=-1)   # (..., 3, 3) columns = [b1|b2|b3] = R
 
 
 def _recover_root_torch(data: torch.Tensor):
@@ -181,12 +184,24 @@ def fk_position_loss(
 
 
 def _joint_positions_smpl(x: torch.Tensor) -> torch.Tensor:
-    """x: (B, T, 130) denormalized → (B, T, 22, 3) root-relative world-space positions."""
+    """x: (B, T, 130) denormalized → (B, T, 22, 3) ROOT-RELATIVE world-space positions.
+    Root is subtracted so joint 0 (pelvis) is always at origin — correct for MPJPE.
+    For visualisation use recover_world_positions_smpl instead."""
     root_quat, root_pos = _recover_root_torch(x)
     body_pose = x[..., 4:].reshape(*x.shape[:-1], 21, 6)
     offsets = OFFSETS.to(x.device)
     joints = _forward_kinematics(root_quat, body_pose, root_pos, offsets)
     return joints - joints[:, :, 0:1, :]
+
+
+def recover_world_positions_smpl(x: torch.Tensor) -> torch.Tensor:
+    """x: (B, T, 130) denormalized → (B, T, 22, 3) WORLD-SPACE positions (root NOT subtracted).
+    Use this for visualisation so global translation (walking forward etc.) is preserved.
+    This matches recover_from_ric behaviour for HumanML3D mode."""
+    root_quat, root_pos = _recover_root_torch(x)
+    body_pose = x[..., 4:].reshape(*x.shape[:-1], 21, 6)
+    offsets = OFFSETS.to(x.device)
+    return _forward_kinematics(root_quat, body_pose, root_pos, offsets)
 
 
 def _joint_positions_humanml3d(x: torch.Tensor) -> torch.Tensor:
@@ -215,6 +230,10 @@ def compute_mpjpe(
 
     The two frames are not identical, but both are root-relative and in metres,
     so the numbers are directly comparable across training modes.
+
+    LEDITS++ evaluation: the proposal measures MPJPE on UNEDITED joints only
+    (source preservation). Compute this by restricting the joint set to those
+    NOT in the edited body-part group, i.e., joints whose mask column was all-zero.
     """
     x_pred = x_pred_norm.clamp(-5, 5).float() * std + mean
     x_gt   = x_gt_norm.clamp(-5, 5).float()   * std + mean

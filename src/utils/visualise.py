@@ -106,8 +106,20 @@ def save_animation(
 
     joints    : (T, 22, 3) numpy array, world-space metres (SMPL axes: X=right, Y=up, Z=fwd)
     save_path : output path (.mp4 requires ffmpeg, .gif uses pillow)
+
+    The viewport follows the root joint (joint 0 = pelvis) with a fixed half-width
+    of 1.0 m, so a walking character stays centred rather than appearing as a tiny
+    dot in a large axis when the trajectory is long.
     """
     T = joints.shape[0]
+
+    # Centre each frame on its pelvis position so the viewport follows the character.
+    # SMPL Y=up → matplotlib Z=vertical; SMPL Z=fwd → matplotlib Y=depth
+    hw = 1.0   # half-width of the viewport in metres (body ~0.5 m wide, arms ~0.8 m)
+
+    # Height range is global (person shouldn't jump off screen), lateral follows root.
+    z_min = joints[:, :, 1].min() - 0.2   # SMPL Y (height)
+    z_max = joints[:, :, 1].max() + 0.2
 
     fig = plt.figure(figsize=figsize, facecolor="black")
     ax  = fig.add_subplot(111, projection="3d")
@@ -116,20 +128,12 @@ def save_animation(
     for pane in [ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane]:
         pane.fill = False
 
-    # SMPL Y=up → matplotlib Z=vertical; SMPL Z=fwd → matplotlib Y=depth
-    margin = 0.3
-    x_min, x_max = joints[:, :, 0].min() - margin, joints[:, :, 0].max() + margin
-    y_min, y_max = joints[:, :, 2].min() - margin, joints[:, :, 2].max() + margin  # SMPL Z
-    z_min, z_max = joints[:, :, 1].min() - margin, joints[:, :, 1].max() + margin  # SMPL Y
-
     lines = []
     for chain, color in zip(KINEMATIC_CHAIN, CHAIN_COLORS):
         line, = ax.plot([], [], [], "-o", color=color, markersize=3, linewidth=2)
         lines.append((chain, line))
 
     def init():
-        ax.set_xlim(x_min, x_max)
-        ax.set_ylim(y_min, y_max)
         ax.set_zlim(z_min, z_max)
         ax.view_init(elev=20, azim=-70)
         ax.set_xlabel("X", color="gray", fontsize=7)
@@ -141,6 +145,13 @@ def save_animation(
         return [l for _, l in lines]
 
     def update(frame):
+        # Recentre viewport on current pelvis XZ position.
+        cx = joints[frame, 0, 0]   # pelvis X (SMPL X → mpl X)
+        cy = joints[frame, 0, 2]   # pelvis Z (SMPL Z → mpl Y)
+        ax.set_xlim(cx - hw, cx + hw)
+        ax.set_ylim(cy - hw, cy + hw)
+        ax.set_zlim(z_min, z_max)
+
         for chain, line in lines:
             xs = joints[frame, chain, 0]
             ys = joints[frame, chain, 2]   # SMPL Z → mpl Y
@@ -149,9 +160,10 @@ def save_animation(
             line.set_3d_properties(zs)
         return [l for _, l in lines]
 
+    # blit=False required because axis limits change every frame
     ani = animation.FuncAnimation(
         fig, update, frames=T,
-        init_func=init, blit=True, interval=1000 // fps,
+        init_func=init, blit=False, interval=1000 // fps,
     )
 
     writer = "ffmpeg" if save_path.endswith(".mp4") else "pillow"
@@ -167,8 +179,11 @@ def show_animation(
     fps: int = 20,
     figsize: tuple = (6, 6),
 ):
-    """Display a skeleton animation interactively (blocking)."""
-    T = joints.shape[0]
+    """Display a skeleton animation interactively (blocking). Viewport follows root."""
+    T   = joints.shape[0]
+    hw  = 1.0
+    z_min = joints[:, :, 1].min() - 0.2
+    z_max = joints[:, :, 1].max() + 0.2
 
     fig = plt.figure(figsize=figsize, facecolor="black")
     ax  = fig.add_subplot(111, projection="3d")
@@ -177,19 +192,12 @@ def show_animation(
     for pane in [ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane]:
         pane.fill = False
 
-    margin = 0.3
-    x_min, x_max = joints[:, :, 0].min() - margin, joints[:, :, 0].max() + margin
-    y_min, y_max = joints[:, :, 2].min() - margin, joints[:, :, 2].max() + margin
-    z_min, z_max = joints[:, :, 1].min() - margin, joints[:, :, 1].max() + margin
-
     lines = []
     for chain, color in zip(KINEMATIC_CHAIN, CHAIN_COLORS):
         line, = ax.plot([], [], [], "-o", color=color, markersize=3, linewidth=2)
         lines.append((chain, line))
 
     def init():
-        ax.set_xlim(x_min, x_max)
-        ax.set_ylim(y_min, y_max)
         ax.set_zlim(z_min, z_max)
         ax.view_init(elev=20, azim=-70)
         ax.set_xlabel("X", color="gray", fontsize=7)
@@ -201,6 +209,11 @@ def show_animation(
         return [l for _, l in lines]
 
     def update(frame):
+        cx = joints[frame, 0, 0]
+        cy = joints[frame, 0, 2]
+        ax.set_xlim(cx - hw, cx + hw)
+        ax.set_ylim(cy - hw, cy + hw)
+        ax.set_zlim(z_min, z_max)
         for chain, line in lines:
             xs = joints[frame, chain, 0]
             ys = joints[frame, chain, 2]
@@ -211,6 +224,6 @@ def show_animation(
 
     ani = animation.FuncAnimation(  # noqa: F841 — must be kept alive for plt.show()
         fig, update, frames=T,
-        init_func=init, blit=True, interval=1000 // fps,
+        init_func=init, blit=False, interval=1000 // fps,
     )
     plt.show()

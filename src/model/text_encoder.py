@@ -59,6 +59,10 @@ class CLIPTextEncoder(nn.Module):
             mask = torch.rand(len(texts), device=self.device) < dropout_prob
             context[mask] = 0.0
 
+        # LEDITS++ Stage 2 mask M1: to average attention only over edit-instruction
+        # tokens (not BOS, EOS, or padding), call self.tokenize() on the edit text
+        # and find the non-zero token IDs; their positions in [0, 77) are the indices
+        # to select from the L_text dimension of the stored cross-attention maps.
         return context
 
     def null_embedding(self, batch_size: int) -> torch.Tensor:

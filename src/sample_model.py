@@ -31,6 +31,8 @@ from model.text_encoder import CLIPTextEncoder
 from model.schedule import NoiseSchedule
 from model.sampler import DDPMSampler
 from utils.visualise import recover_from_ric, save_animation
+from utils.skeleton import recover_world_positions_smpl
+from data.dataset import _SMPL_CHANNELS
 
 
 DEFAULT_PROMPTS = [
@@ -66,15 +68,18 @@ def load_model(ckpt_dir: str, device):
     with open(config_path) as f:
         config = json.load(f)
 
+    feature_mode = config.get("feature_mode", "humanml3d")
+    input_dim = len(_SMPL_CHANNELS) if feature_mode in ("smpl", "group") else 263
     context_dim = 768 if "L/14" in config.get("clip_version", "ViT-B/32") else 512
     model = build_model({
-        "input_dim":   263,
-        "latent_dim":  config.get("latent_dim",  512),
-        "context_dim": context_dim,
-        "num_heads":   config.get("num_heads",   8),
-        "num_layers":  config.get("num_layers",  8),
-        "max_frames":  config.get("max_frames",  196),
-        "dropout":     0.0,
+        "feature_mode": feature_mode,
+        "input_dim":    input_dim,
+        "latent_dim":   config.get("latent_dim",  512),
+        "context_dim":  context_dim,
+        "num_heads":    config.get("num_heads",   8),
+        "num_layers":   config.get("num_layers",  8),
+        "max_frames":   config.get("max_frames",  196),
+        "dropout":      0.0,
     }, device=device)
 
     weights = os.path.join(ckpt_dir, "ema.pt")
@@ -91,10 +96,13 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
+    model, config = load_model(args.checkpoint, device=device)
+
     mean = np.load(os.path.join(args.data_root, "Mean.npy"))  # (263,)
     std  = np.load(os.path.join(args.data_root, "Std.npy"))   # (263,)
-
-    model, config = load_model(args.checkpoint, device=device)
+    if config.get("feature_mode", "humanml3d") in ("smpl", "group"):
+        mean = mean[_SMPL_CHANNELS]
+        std  = std[_SMPL_CHANNELS]
 
     clip_version = config.get("clip_version", "ViT-B/32")
     text_encoder = CLIPTextEncoder(clip_version, device=device)
@@ -111,18 +119,27 @@ def main():
         with torch.no_grad():
             context = text_encoder.encode([prompt])  # (1, 77, context_dim)
 
+        feature_mode = config.get("feature_mode", "humanml3d")
+
         motion_norm = sampler.sample(
             context,
             length=args.length,
             guidance_scale=args.guidance_scale,
             num_steps=args.num_steps,
-        ).cpu().numpy()  # (length, 263), normalised
+        ).cpu().numpy()  # (length, D) normalised; D=130 for smpl/group, 263 for humanml3d
 
-        # denormalise → raw HumanML3D feature space
-        motion_raw = motion_norm * std + mean  # (length, 263)
+        motion_raw = motion_norm * std + mean  # (length, D) denormalised
 
-        # recover world-space joint positions
-        joints = recover_from_ric(motion_raw, joints_num=22)  # (length, 22, 3)
+        # recover world-space joint positions — method depends on feature encoding:
+        #   humanml3d: channels [4:67] are local Cartesian positions → recover_from_ric
+        #   smpl/group: channels [4:130] are 6D rotations → FK pipeline
+        # Both paths return world-space positions (root NOT subtracted) so global
+        # translation (e.g. walking forward) is visible in the animation.
+        if feature_mode in ("smpl", "group"):
+            motion_t = torch.from_numpy(motion_raw.astype(np.float32)).unsqueeze(0)
+            joints = recover_world_positions_smpl(motion_t)[0].numpy()  # (length, 22, 3)
+        else:
+            joints = recover_from_ric(motion_raw, joints_num=22)  # (length, 22, 3)
 
         # optional temporal smoothing to reduce frame-to-frame jitter
         if args.smooth_sigma > 0:

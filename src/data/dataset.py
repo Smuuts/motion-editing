@@ -83,6 +83,10 @@ class HumanML3DDataset(Dataset):
         vecs = np.load(os.path.join(self.vec_dir, f"{clip_id}.npy"))  # (T, 263)
         if self.feature_mode in ("smpl", "group"):
             vecs = vecs[:, _SMPL_CHANNELS]                            # (T, 130)
+        # LEDITS++ inversion operates in this normalised space — the model was trained
+        # on normalised features, so x0 passed to invert() must also be normalised.
+        # Keep the raw (pre-normalisation) version if you need FK evaluation later:
+        #   raw = vecs.copy(); vecs = (vecs - self.mean) / self.std
         vecs = (vecs - self.mean) / self.std
 
         T = min(len(vecs), self.max_frames)
@@ -91,6 +95,9 @@ class HumanML3DDataset(Dataset):
         pad = np.zeros((self.max_frames, self.feature_dim), dtype=np.float32)
         pad[:T] = vecs
         motion = torch.from_numpy(pad)  # (max_frames, feature_dim)
+        # LEDITS++ editing note: `length` (= T) marks the valid frame range.
+        # Mask columns in M beyond index T are always zero — those padding frames
+        # must never be edited and must be excluded from mask thresholding percentiles.
 
         # text — use precomputed CLIP embeddings when available
         if self.text_emb_dir is not None:

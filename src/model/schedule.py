@@ -54,6 +54,13 @@ class NoiseSchedule:
         x0   : (B, T, D)
         t    : (B,) integer timesteps
         Returns x_t of the same shape as x0.
+
+        LEDITS++ Stage 1: edit-friendly inversion runs the forward process in
+        reverse (t=0 → t=N), stepping x_t → x_{t+1} at each inversion step.
+        The inversion recurrence (Huberman-Spiegelglas et al. 2024, Eq. 5) uses
+        alphas_cumprod and sqrt_one_minus_alphas_cumprod from this schedule.
+        The resulting (x_1, ..., x_N) sequence provides the noisy starting
+        points for hard frame inpainting in Stage 3.
         """
         if noise is None:
             noise = torch.randn_like(x0)
@@ -68,13 +75,25 @@ class NoiseSchedule:
         return sqrt_acp * x0 + sqrt_omacp * noise, noise
 
     def predict_x0_from_eps(self, x_t, t, eps):
-        """Recover x0 prediction from predicted noise eps."""
+        """Recover x0 prediction from predicted noise eps.
+
+        LEDITS++ Stage 2 mask M2: the guidance vector ψ = ε_θ(x_t, c_edit) − ε_θ(x_t, ∅)
+        is NOT directly this function, but predict_x0_from_eps applied to each gives the
+        corresponding x0 predictions. The element-wise magnitude |ψ| thresholded at the
+        λ-th percentile produces the noise-estimate mask M2 over (J × F) space.
+        """
         sqrt_acp   = self.sqrt_alphas_cumprod[t][:, None, None]
         sqrt_omacp = self.sqrt_one_minus_alphas_cumprod[t][:, None, None]
         return (x_t - sqrt_omacp * eps) / sqrt_acp
 
     def p_sample(self, x_t, t, eps_pred):
-        """Reverse DDPM step: compute x_{t-1} from x_t and predicted noise."""
+        """Reverse DDPM step: compute x_{t-1} from x_t and predicted noise.
+
+        LEDITS++ Stage 3: after computing the masked eps_hat (Eq. 1 in the proposal),
+        this function performs the reverse step. After each call, frames whose mask
+        column is all-zero must be overwritten with q_sample(x0_source, t-1) — the
+        source motion noised to t-1 — to guarantee zero drift on unedited frames.
+        """
         beta_t       = self.betas[t][:, None, None]
         alpha_t      = self.alphas[t][:, None, None]
         acp_t        = self.alphas_cumprod[t][:, None, None]
