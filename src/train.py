@@ -212,15 +212,34 @@ def validate_one_epoch(ema_model, text_encoder, schedule, loader, device, epoch,
             loss_mask = attn_mask.float().unsqueeze(-1)
             loss = ((noise - prediction) ** 2 * loss_mask).sum() / (loss_mask.sum() * noise.shape[-1])
 
-        # MPJPE: one-step x0 reconstruction is only meaningful at low noise.
-        # Re-run at t ~ U[0, T/20] so alpha_bar > 0.98 (signal fraction > 99%).
-        t_low = torch.randint(0, max(1, schedule.T // 20), (B,), device=device)
-        x_t_low, _ = schedule.q_sample(motion, t_low)
-        with autocast(device_type=device.type):
-            pred_low = ema_model(x_t_low, t_low, context, mask=attn_mask)
-        x0_pred = schedule.predict_x0_from_eps(x_t_low, t_low, pred_low)
+        # MPJPE: 10-step deterministic DDIM rollout from T//2.
+        # At T//2 the cosine schedule gives alpha_bar ≈ 0.5 (50% signal)
+        _n_steps = 10
+        _t_start = schedule.T // 2
+        _stride  = _t_start // _n_steps
+        _steps   = list(range(_t_start, 0, -_stride))
+
+        _tb_start = torch.full((B,), _t_start, device=device, dtype=torch.long)
+        x_roll = schedule.q_sample(motion, _tb_start)[0]
+
+        for _t in _steps:
+            _t_prev = max(0, _t - _stride)
+            _tb = torch.full((B,), _t, device=device, dtype=torch.long)
+            with autocast(device_type=device.type):
+                _eps = ema_model(x_roll, _tb, context, mask=attn_mask)
+            _eps = _eps.float()
+            _sqrt_acp   = schedule.sqrt_alphas_cumprod[_t]
+            _sqrt_omacp = schedule.sqrt_one_minus_alphas_cumprod[_t]
+            _x0 = ((x_roll.float() - _sqrt_omacp * _eps) / _sqrt_acp).clamp(-5, 5)
+            if _t_prev > 0:
+                _sqrt_acp_p   = schedule.sqrt_alphas_cumprod[_t_prev]
+                _sqrt_omacp_p = schedule.sqrt_one_minus_alphas_cumprod[_t_prev]
+                x_roll = _sqrt_acp_p * _x0 + _sqrt_omacp_p * _eps
+            else:
+                x_roll = _x0
+
         mean_t, std_t = feature_stats
-        mpjpe = compute_mpjpe(x0_pred, motion, mean_t, std_t, feature_mode, mask=attn_mask)
+        mpjpe = compute_mpjpe(x_roll, motion, mean_t, std_t, feature_mode, mask=attn_mask)
 
         total_loss += loss.item()
         total_mpjpe += mpjpe.item()
