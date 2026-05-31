@@ -48,6 +48,9 @@ class NoiseSchedule:
         )
         self.sqrt_recip_alphas = (1.0 / alphas).sqrt()
 
+        # SNR(t) = ᾱ_t / (1 − ᾱ_t). Clamped denominator avoids ÷0 at t=0.
+        self.snr = alphas_cumprod / (1.0 - alphas_cumprod).clamp(min=1e-8)
+
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise=None):
         """
         Forward process: add noise to x0 at timestep t.

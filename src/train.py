@@ -20,7 +20,7 @@ from model.schedule import NoiseSchedule
 from utils.checkpoint import save_checkpoint, load_checkpoint
 from utils.ema import EMA
 from utils.logger import Logger
-from utils.skeleton import fk_position_loss, compute_mpjpe
+from utils.skeleton import fk_position_loss
 
 
 def parse_args():
@@ -43,12 +43,13 @@ def parse_args():
                    help="Fraction of batch to train unconditionally (CFG).")
 
     # data
-    p.add_argument("--feature_mode", type=str,   default="smpl",
-                   choices=["humanml3d", "smpl", "group"],
-                   help="'humanml3d' = full 263-dim; 'smpl' = 130-dim (root vel + body pose 6D); "
-                        "'joint' = 130-dim split into per-joint tokens (22 tokens × F frames)")
+    p.add_argument("--feature_mode", type=str,   default="humanml3d",
+                   choices=["humanml3d", "group"],
+                   help="'humanml3d' = full 263-dim; 'group' = 130-dim split into per-body-part group tokens")
     p.add_argument("--fk_loss_weight", type=float, default=0.1,
                    help="Weight of the FK position loss (SMPL/joint mode only). 0 = disabled.")
+    p.add_argument("--snr_gamma",     type=float, default=5.0,
+                   help="Min-SNR weighting gamma (Hang et al. 2023). 0 = disabled.")
 
     # training
     p.add_argument("--epochs",       type=int,   default=500)
@@ -104,21 +105,11 @@ def save_loss_graph(output_dir, train_losses, val_losses=None):
     _save_figure(os.path.join(output_dir, "training_loss.png"), "Loss per Epoch", "Average Loss", *series)
 
 
-def save_mpjpe_graph(output_dir, val_mpjpe_losses):
-    if not val_mpjpe_losses:
-        return
-    _save_figure(
-        os.path.join(output_dir, "val_mpjpe.png"),
-        "Validation MPJPE per Epoch", "MPJPE (m)",
-        ([e for e, _ in val_mpjpe_losses], [v for _, v in val_mpjpe_losses],
-         dict(marker="s", linestyle="-", color="tab:green")),
-    )
-
 
 def train_one_epoch(
     model, ema, text_encoder, schedule, optimizer, scaler,
     loader, device, cfg_dropout, logger, epoch, log_every,
-    smpl_stats=None, fk_loss_weight=0.0,
+    fk_stats=None, fk_loss_weight=0.0, snr_gamma=5.0,
 ):
     model.train()
     total_loss = 0.0
@@ -153,11 +144,22 @@ def train_one_epoch(
 
         with autocast(device_type=device.type):
             prediction = model(x_t, t, context, mask=attn_mask)
-            loss_mask = attn_mask.float().unsqueeze(-1)
-            loss = ((noise - prediction) ** 2 * loss_mask).sum() / (loss_mask.sum() * noise.shape[-1])
+            loss_mask = attn_mask.float().unsqueeze(-1)           # (B, T, 1)
+            per_elem  = (noise - prediction) ** 2 * loss_mask    # (B, T, D)
 
-        if smpl_stats is not None and fk_loss_weight > 0.0:
-            mean_t, std_t = smpl_stats
+            if snr_gamma > 0.0:
+                # Per-sample mean MSE over valid (T, D) elements.
+                valid_elems = (attn_mask.float().sum(dim=1) * noise.shape[-1]).clamp(min=1)
+                per_sample  = per_elem.sum(dim=(1, 2)) / valid_elems        # (B,)
+                # Min-SNR weight: min(SNR(t), γ) / SNR(t)
+                snr_t      = schedule.snr[t]                                # (B,)
+                snr_weight = snr_t.clamp(max=snr_gamma) / snr_t            # (B,)
+                loss = (per_sample * snr_weight).mean()
+            else:
+                loss = per_elem.sum() / (loss_mask.sum() * noise.shape[-1]).clamp(min=1)
+
+        if fk_stats is not None and fk_loss_weight > 0.0:
+            mean_t, std_t = fk_stats
             x0_pred = schedule.predict_x0_from_eps(x_t, t, prediction.float())
             fk_loss = fk_position_loss(x0_pred, motion.float(), mean_t, std_t, mask=attn_mask)
             if torch.isfinite(fk_loss):
@@ -185,12 +187,10 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def validate_one_epoch(ema_model, text_encoder, schedule, loader, device, epoch,
-                       feature_stats=None, feature_mode="smpl"):
+def validate_one_epoch(ema_model, text_encoder, schedule, loader, device, epoch):
     ema_model.eval()
     torch.manual_seed(0)
     total_loss = 0.0
-    total_mpjpe = 0.0
 
     pbar = tqdm(loader, desc=f"Val {epoch}", leave=False)
     for batch in pbar:
@@ -217,40 +217,10 @@ def validate_one_epoch(ema_model, text_encoder, schedule, loader, device, epoch,
             loss_mask = attn_mask.float().unsqueeze(-1)
             loss = ((noise - prediction) ** 2 * loss_mask).sum() / (loss_mask.sum() * noise.shape[-1])
 
-        # MPJPE: 10-step deterministic DDIM rollout from T//2.
-        # At T//2 the cosine schedule gives alpha_bar ≈ 0.5 (50% signal)
-        _n_steps = 10
-        _t_start = schedule.T // 2
-        _stride  = _t_start // _n_steps
-        _steps   = list(range(_t_start, 0, -_stride))
-
-        _tb_start = torch.full((B,), _t_start, device=device, dtype=torch.long)
-        x_roll = schedule.q_sample(motion, _tb_start)[0]
-
-        for _t in _steps:
-            _t_prev = max(0, _t - _stride)
-            _tb = torch.full((B,), _t, device=device, dtype=torch.long)
-            with autocast(device_type=device.type):
-                _eps = ema_model(x_roll, _tb, context, mask=attn_mask)
-            _eps = _eps.float()
-            _sqrt_acp   = schedule.sqrt_alphas_cumprod[_t]
-            _sqrt_omacp = schedule.sqrt_one_minus_alphas_cumprod[_t]
-            _x0 = ((x_roll.float() - _sqrt_omacp * _eps) / _sqrt_acp).clamp(-5, 5)
-            if _t_prev > 0:
-                _sqrt_acp_p   = schedule.sqrt_alphas_cumprod[_t_prev]
-                _sqrt_omacp_p = schedule.sqrt_one_minus_alphas_cumprod[_t_prev]
-                x_roll = _sqrt_acp_p * _x0 + _sqrt_omacp_p * _eps
-            else:
-                x_roll = _x0
-
-        mean_t, std_t = feature_stats
-        mpjpe = compute_mpjpe(x_roll, motion, mean_t, std_t, feature_mode, mask=attn_mask)
-
         total_loss += loss.item()
-        total_mpjpe += mpjpe.item()
-        pbar.set_postfix(val_loss=f"{loss.item():.4f}", mpjpe=f"{mpjpe.item():.4f}")
+        pbar.set_postfix(val_loss=f"{loss.item():.4f}")
 
-    return total_loss / len(loader), total_mpjpe / len(loader)
+    return total_loss / len(loader)
 
 
 def main():
@@ -291,9 +261,9 @@ def main():
     std_t  = torch.from_numpy(ds.std).float().to(device)
     feature_stats = (mean_t, std_t)
 
-    smpl_stats = None
-    if args.feature_mode in ("smpl", "group") and args.fk_loss_weight > 0.0:
-        smpl_stats = feature_stats
+    fk_stats = None
+    if args.feature_mode == "group" and args.fk_loss_weight > 0.0:
+        fk_stats = feature_stats
         print(f"FK position loss enabled (weight={args.fk_loss_weight})")
 
     # text encoder
@@ -339,7 +309,7 @@ def main():
 
     # resume
     start_epoch = 0
-    train_losses, val_losses, val_mpjpe_losses = [], [], []
+    train_losses, val_losses = [], []
     losses_path = os.path.join(args.output_dir, "losses.json")
     if args.resume:
         ckpt_dir = args.resume
@@ -349,9 +319,8 @@ def main():
         if os.path.exists(losses_path):
             with open(losses_path) as f:
                 saved = json.load(f)
-            train_losses     = saved.get("train",     [])
-            val_losses       = saved.get("val",       [])
-            val_mpjpe_losses = saved.get("val_mpjpe", [])
+            train_losses = saved.get("train", [])
+            val_losses   = saved.get("val",   [])
 
     # training loop
     print(f"\nStarting training from epoch {start_epoch}")
@@ -360,7 +329,8 @@ def main():
             model, ema, text_encoder, schedule, optimizer, scaler,
             train_loader, device, args.cfg_dropout,
             logger, epoch, args.log_every,
-            smpl_stats=smpl_stats, fk_loss_weight=args.fk_loss_weight,
+            fk_stats=fk_stats, fk_loss_weight=args.fk_loss_weight,
+            snr_gamma=args.snr_gamma,
         )
         scheduler.step()
         train_losses.append((epoch, avg_loss))
@@ -370,22 +340,19 @@ def main():
         if val_loader is not None and (epoch + 1) % args.val_every == 0:
             rng_cpu = torch.get_rng_state()
             rng_gpu = torch.cuda.get_rng_state(device) if device.type == "cuda" else None
-            val_loss, val_mpjpe = validate_one_epoch(
+            val_loss = validate_one_epoch(
                 ema.ema_model, text_encoder, schedule, val_loader, device, epoch,
-                feature_stats=feature_stats, feature_mode=args.feature_mode,
             )
             torch.set_rng_state(rng_cpu)
             if rng_gpu is not None:
                 torch.cuda.set_rng_state(rng_gpu, device)
             val_losses.append((epoch, val_loss))
-            val_mpjpe_losses.append((epoch, val_mpjpe))
-            logger.log({"val/epoch_loss": val_loss, "val/epoch_mpjpe": val_mpjpe, "val/epoch": epoch})
-            log_line += f" | val {val_loss:.4f} | mpjpe {val_mpjpe:.4f}m"
+            logger.log({"val/epoch_loss": val_loss, "val/epoch": epoch})
+            log_line += f" | val {val_loss:.4f}"
 
         with open(losses_path, "w") as f:
-            json.dump({"train": train_losses, "val": val_losses, "val_mpjpe": val_mpjpe_losses}, f, indent=2)
+            json.dump({"train": train_losses, "val": val_losses}, f, indent=2)
         save_loss_graph(args.output_dir, train_losses, val_losses=val_losses)
-        save_mpjpe_graph(args.output_dir, val_mpjpe_losses)
         logger.log({"train/epoch_loss": avg_loss, "train/epoch": epoch, "train/lr": scheduler.get_last_lr()[0]})
         print(log_line)
 
@@ -394,7 +361,6 @@ def main():
 
     save_checkpoint(args.output_dir, args.epochs - 1, model, ema, optimizer, scheduler, config)
     save_loss_graph(args.output_dir, train_losses, val_losses=val_losses)
-    save_mpjpe_graph(args.output_dir, val_mpjpe_losses)
     print("Training complete.")
 
 

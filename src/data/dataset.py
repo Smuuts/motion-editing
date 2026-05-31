@@ -21,7 +21,7 @@ class HumanML3DDataset(Dataset):
 
     feature_mode:
         "humanml3d" — full 263-dim HumanML3D feature vector
-        "smpl"      — 130-dim subset: root velocity/height + body pose 6D (21 joints)
+        "group"     — 130-dim subset: root velocity/height + body pose 6D (21 joints)
     """
 
     def __init__(
@@ -32,7 +32,7 @@ class HumanML3DDataset(Dataset):
         min_frames: int = 16,
         feature_mode: str = "humanml3d",
     ):
-        assert feature_mode in ("humanml3d", "smpl", "group"), f"Unknown feature_mode: {feature_mode}"
+        assert feature_mode in ("humanml3d", "group"), f"Unknown feature_mode: {feature_mode}"
         self.data_root = data_root
         self.max_frames = max_frames
         self.min_frames = min_frames
@@ -41,7 +41,7 @@ class HumanML3DDataset(Dataset):
         # normalisation statistics — slice to the active channels for SMPL/joint mode
         mean = np.load(os.path.join(data_root, "Mean.npy"))  # (263,)
         std  = np.load(os.path.join(data_root, "Std.npy"))   # (263,)
-        if feature_mode in ("smpl", "group"):
+        if feature_mode == "group":
             self.mean = mean[_SMPL_CHANNELS]  # (130,)
             self.std  = std[_SMPL_CHANNELS]   # (130,)
             self.feature_dim = len(_SMPL_CHANNELS)
@@ -81,7 +81,7 @@ class HumanML3DDataset(Dataset):
         clip_id = self.ids[idx]
 
         vecs = np.load(os.path.join(self.vec_dir, f"{clip_id}.npy"))  # (T, 263)
-        if self.feature_mode in ("smpl", "group"):
+        if self.feature_mode == "group":
             vecs = vecs[:, _SMPL_CHANNELS]                            # (T, 130)
         # LEDITS++ inversion operates in this normalised space — the model was trained
         # on normalised features, so x0 passed to invert() must also be normalised.

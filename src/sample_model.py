@@ -1,20 +1,23 @@
 """
 Evaluation script: generate animations from text prompts using a trained MotionDiT.
 
-Usage:
-    python evaluate.py \
-        --checkpoint ./runs/exp1/checkpoint_latest \
-        --data_root  ./data/HumanML3D \
-        --prompts    "a person walks forward" "a person raises their right arm"
+Modes
+-----
+Prompt mode (default):
+    python sample_model.py --checkpoint ... --data_root ...
+    --prompts "a person walks forward" "a person raises their right arm"
 
-    # faster sampling during development
-    python evaluate.py --checkpoint ... --data_root ... --num_steps 200
+Validation-set mode  (--num_samples N):
+    python sample_model.py --checkpoint ... --data_root ... --num_samples 8
+    Samples N clips from the validation split, generates a matching motion for
+    each text annotation, and saves a side-by-side MP4 with per-frame MPJPE.
 """
 
 import os
 import sys
 import argparse
 import json
+import random
 import numpy as np
 import torch
 from scipy.ndimage import gaussian_filter1d
@@ -30,7 +33,7 @@ from model.dit import build_model
 from model.text_encoder import CLIPTextEncoder
 from model.schedule import NoiseSchedule
 from model.sampler import DDPMSampler
-from utils.visualise import recover_from_ric, save_animation
+from utils.visualise import recover_from_ric, save_animation, save_comparison_animation
 from utils.skeleton import recover_world_positions_smpl
 from data.dataset import _SMPL_CHANNELS
 
@@ -42,35 +45,49 @@ DEFAULT_PROMPTS = [
 ]
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Argument parsing
+# ──────────────────────────────────────────────────────────────────────────────
+
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--checkpoint",     required=True,
-                   help="Path to checkpoint directory (contains model.pt / ema.pt). "
-                        "Pass the checkpoint_latest symlink for the most recent save.")
+    p.add_argument("--checkpoint",     required=True)
     p.add_argument("--data_root",      required=True,
-                   help="HumanML3D root (needs Mean.npy and Std.npy).")
+                   help="HumanML3D root (needs Mean.npy, Std.npy, val.txt, …).")
     p.add_argument("--output_dir",     default="./eval_results")
-    p.add_argument("--prompts",        nargs="+", default=DEFAULT_PROMPTS)
-    p.add_argument("--length",         type=int,   default=120,
-                   help="Frames to generate. At 20 fps: 120 = 6 s, 196 = ~10 s.")
-    p.add_argument("--guidance_scale", type=float, default=4.0,
-                   help="CFG scale. Higher = stronger text adherence, less diversity.")
-    p.add_argument("--num_steps",      type=int,   default=1000,
-                   help="DDPM sampling steps. 200 is faster for development.")
-    p.add_argument("--smooth_sigma",   type=float, default=1.5,
-                   help="Gaussian smoothing sigma on recovered joint positions "
-                        "to reduce temporal jitter (0 = disabled).")
+
+    # Prompt mode
+    p.add_argument("--prompts",        nargs="+", default=DEFAULT_PROMPTS,
+                   help="Text prompts (used when --num_samples is 0).")
+
+    # Validation-set comparison mode
+    p.add_argument("--num_samples",    type=int, default=3,
+                   help="Sample this many clips from --split and render "
+                        "side-by-side comparison videos with MPJPE overlay. "
+                        "Set to 0 to use --prompts mode instead.")
+    p.add_argument("--split",          default="val",
+                   help="Dataset split to draw clips from (default: val).")
+    p.add_argument("--seed",           type=int, default=42)
+
+    # Generation hyper-parameters
+    p.add_argument("--length",         type=int,   default=120)
+    p.add_argument("--guidance_scale", type=float, default=4.0)
+    p.add_argument("--num_steps",      type=int,   default=1000)
+    p.add_argument("--smooth_sigma",   type=float, default=1.5)
     return p.parse_args()
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Model loading
+# ──────────────────────────────────────────────────────────────────────────────
+
 def load_model(ckpt_dir: str, device):
-    config_path = os.path.join(ckpt_dir, "config.json")
-    with open(config_path) as f:
+    with open(os.path.join(ckpt_dir, "config.json")) as f:
         config = json.load(f)
 
     feature_mode = config.get("feature_mode", "humanml3d")
-    input_dim = len(_SMPL_CHANNELS) if feature_mode in ("smpl", "group") else 263
-    context_dim = 768 if "L/14" in config.get("clip_version", "ViT-B/32") else 512
+    input_dim    = len(_SMPL_CHANNELS) if feature_mode == "group" else 263
+    context_dim  = 768 if "L/14" in config.get("clip_version", "ViT-B/32") else 512
     model = build_model({
         "feature_mode": feature_mode,
         "input_dim":    input_dim,
@@ -89,6 +106,85 @@ def load_model(ckpt_dir: str, device):
     return model, config
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Joint recovery helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def recover_joints(raw_features: np.ndarray, feature_mode: str) -> np.ndarray:
+    """Raw (denormalised) features → world-space joint positions (T, 22, 3)."""
+    if feature_mode == "group":
+        t = torch.from_numpy(raw_features.astype(np.float32)).unsqueeze(0)
+        return recover_world_positions_smpl(t)[0].numpy()
+    return recover_from_ric(raw_features, joints_num=22)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MPJPE (root-relative, per frame)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def compute_mpjpe(joints_gen: np.ndarray, joints_gt: np.ndarray):
+    """
+    Root-relative MPJPE over the overlapping frame range.
+
+    Returns
+        per_frame  : (T_common,) MPJPE in metres for each frame
+        total      : scalar mean MPJPE
+        T_common   : number of frames compared
+    """
+    T_common = min(len(joints_gen), len(joints_gt))
+    gen = joints_gen[:T_common] - joints_gen[:T_common, 0:1, :]  # root-relative
+    gt  = joints_gt[:T_common]  - joints_gt[:T_common,  0:1, :]
+    per_frame = np.sqrt(((gen - gt) ** 2).sum(axis=-1)).mean(axis=-1)  # (T_common,)
+    return per_frame, float(per_frame.mean()), T_common
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Validation-set sampling
+# ──────────────────────────────────────────────────────────────────────────────
+
+def load_val_samples(data_root, split, num_samples, feature_mode, max_frames=196, seed=42):
+    """
+    Return a list of dicts with keys: clip_id, text, raw_feat, length.
+    raw_feat is the (T, D) denormalised feature vector (D=130 or 263).
+    """
+    rng = np.random.default_rng(seed)
+
+    split_file = os.path.join(data_root, f"{split}.txt")
+    with open(split_file) as f:
+        all_ids = [l.strip() for l in f if l.strip()]
+
+    vec_dir  = os.path.join(data_root, "new_joint_vecs")
+    text_dir = os.path.join(data_root, "texts")
+
+    valid_ids = [
+        cid for cid in all_ids
+        if os.path.exists(os.path.join(vec_dir, f"{cid}.npy"))
+        and np.load(os.path.join(vec_dir, f"{cid}.npy"), mmap_mode="r").shape[0] >= 16
+    ]
+
+    chosen = rng.choice(valid_ids, size=min(num_samples, len(valid_ids)),
+                        replace=False).tolist()
+
+    samples = []
+    for cid in chosen:
+        raw = np.load(os.path.join(vec_dir, f"{cid}.npy"))        # (T, 263) raw
+        T   = min(len(raw), max_frames)
+        raw = raw[:T]
+        raw_feat = raw[:, _SMPL_CHANNELS] if feature_mode == "group" else raw
+
+        with open(os.path.join(text_dir, f"{cid}.txt")) as f:
+            lines = [l.strip() for l in f if l.strip()]
+        text = lines[0].split("#")[0].strip() if lines else cid
+
+        samples.append({"clip_id": cid, "text": text, "raw_feat": raw_feat, "length": T})
+
+    return samples
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────────
+
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -97,56 +193,83 @@ def main():
     print(f"Device: {device}")
 
     model, config = load_model(args.checkpoint, device=device)
+    feature_mode  = config.get("feature_mode", "humanml3d")
 
-    mean = np.load(os.path.join(args.data_root, "Mean.npy"))  # (263,)
-    std  = np.load(os.path.join(args.data_root, "Std.npy"))   # (263,)
-    if config.get("feature_mode", "humanml3d") in ("smpl", "group"):
+    mean = np.load(os.path.join(args.data_root, "Mean.npy"))
+    std  = np.load(os.path.join(args.data_root, "Std.npy"))
+    if feature_mode == "group":
         mean = mean[_SMPL_CHANNELS]
         std  = std[_SMPL_CHANNELS]
 
-    clip_version = config.get("clip_version", "ViT-B/32")
-    text_encoder = CLIPTextEncoder(clip_version, device=device)
+    clip_version  = config.get("clip_version", "ViT-B/32")
+    text_encoder  = CLIPTextEncoder(clip_version, device=device)
+    schedule      = NoiseSchedule(timesteps=config.get("timesteps", 1000), device=device)
+    sampler       = DDPMSampler(model, schedule, device)
 
-    schedule = NoiseSchedule(timesteps=config.get("timesteps", 1000), device=device)
-    sampler  = DDPMSampler(model, schedule, device)
+    # ── choose mode ────────────────────────────────────────────────────────────
+    if args.num_samples > 0:
+        samples = load_val_samples(
+            args.data_root, args.split, args.num_samples,
+            feature_mode, seed=args.seed,
+        )
+        print(f"\nValidation-set mode: {len(samples)} clips from '{args.split}' split\n")
+    else:
+        samples = None
+        print(f"\nPrompt mode: {len(args.prompts)} prompts\n")
 
-    print(f"\nGenerating {len(args.prompts)} clips "
-          f"({args.length} frames, {args.length / 20:.1f} s at 20 fps)\n")
+    # ── generation loop ────────────────────────────────────────────────────────
+    items = samples if samples is not None else [
+        {"clip_id": None, "text": p, "raw_feat": None, "length": None}
+        for p in args.prompts
+    ]
 
-    for i, prompt in enumerate(args.prompts):
-        print(f"[{i+1}/{len(args.prompts)}] '{prompt}'")
+    for i, item in enumerate(items):
+        prompt   = item["text"]
+        clip_id  = item["clip_id"] or f"prompt_{i:03d}"
+        raw_feat = item["raw_feat"]   # None in prompt mode
+
+        print(f"[{i+1}/{len(items)}] '{prompt}'")
 
         with torch.no_grad():
-            context = text_encoder.encode([prompt])  # (1, 77, context_dim)
-
-        feature_mode = config.get("feature_mode", "humanml3d")
+            context = text_encoder.encode([prompt])
 
         motion_norm = sampler.sample(
             context,
             length=args.length,
             guidance_scale=args.guidance_scale,
             num_steps=args.num_steps,
-        ).cpu().numpy()  # (length, D) normalised; D=130 for smpl/group, 263 for humanml3d
+        ).cpu().numpy()                                       # (length, D) normalised
 
-        motion_raw = motion_norm * std + mean  # (length, D) denormalised
+        motion_raw = motion_norm * std + mean                 # (length, D) denormalised
+        joints_gen = recover_joints(motion_raw, feature_mode) # (length, 22, 3)
 
-        # recover world-space joint positions — method depends on feature encoding:
-        #   humanml3d: channels [4:67] are local Cartesian positions → recover_from_ric
-        #   smpl/group: channels [4:130] are 6D rotations → FK pipeline
-        # Both paths return world-space positions (root NOT subtracted) so global
-        # translation (e.g. walking forward) is visible in the animation.
-        if feature_mode in ("smpl", "group"):
-            motion_t = torch.from_numpy(motion_raw.astype(np.float32)).unsqueeze(0)
-            joints = recover_world_positions_smpl(motion_t)[0].numpy()  # (length, 22, 3)
-        else:
-            joints = recover_from_ric(motion_raw, joints_num=22)  # (length, 22, 3)
-
-        # optional temporal smoothing to reduce frame-to-frame jitter
         if args.smooth_sigma > 0:
-            joints = gaussian_filter1d(joints, sigma=args.smooth_sigma, axis=0)
+            joints_gen = gaussian_filter1d(joints_gen, sigma=args.smooth_sigma, axis=0)
 
-        out_path = os.path.join(args.output_dir, f"{i:03d}_{prompt[:40].replace(' ', '_')}.mp4")
-        save_animation(joints, out_path, title=prompt)
+        slug = prompt[:40].replace(" ", "_")
+
+        if raw_feat is not None:
+            # ── comparison mode ──────────────────────────────────────────────
+            joints_gt = recover_joints(raw_feat, feature_mode)    # (T_gt, 22, 3)
+
+            if args.smooth_sigma > 0:
+                joints_gt = gaussian_filter1d(joints_gt, sigma=args.smooth_sigma, axis=0)
+
+            per_frame, total_mpjpe, T_common = compute_mpjpe(joints_gen, joints_gt)
+            print(f"   MPJPE: {total_mpjpe*1000:.1f} mm  (over {T_common} frames)")
+
+            out_path = os.path.join(args.output_dir, f"{i:03d}_{clip_id}_{slug}.mp4")
+            save_comparison_animation(
+                joints_gen, joints_gt,
+                per_frame, total_mpjpe,
+                out_path,
+                title=prompt,
+                clip_id=clip_id,
+            )
+        else:
+            # ── prompt-only mode ─────────────────────────────────────────────
+            out_path = os.path.join(args.output_dir, f"{i:03d}_{slug}.mp4")
+            save_animation(joints_gen, out_path, title=prompt)
 
     print(f"\nDone. Results saved to: {args.output_dir}/")
 

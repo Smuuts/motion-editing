@@ -12,31 +12,34 @@ import torch.nn.functional as F
 # dit.py, then use PARENTS to optionally expand the mask to include connecting joints.
 PARENTS = [-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19]
 
-# Bone offsets (child position - parent position) derived from the mean of
-# first frames across 200 HumanML3D training clips, in metres.
+# Canonical bone offsets: unit direction (from HumanML3D t2m_raw_offsets in paramUtil.py)
+# scaled by bone length derived from A-pose world-space positions.
+# The FK convention (matching HumanML3D's forward_kinematics_cont6d) rotates these
+# by the CHILD joint's accumulated global rotation, not the parent's, so each
+# direction is expressed in the canonical frame before any body rotation is applied.
 OFFSETS = torch.tensor([
-    [ 0.0000,  0.0000,  0.0000],   #  0  pelvis (root)
-    [ 0.0597, -0.0803, -0.0097],   #  1  L_Hip
-    [-0.0620, -0.0878, -0.0066],   #  2  R_Hip
-    [ 0.0015,  0.1234, -0.0276],   #  3  Spine1
-    [ 0.0619, -0.3574,  0.0104],   #  4  L_Knee
-    [-0.0606, -0.3543,  0.0038],   #  5  R_Knee
-    [ 0.0056,  0.1342,  0.0243],   #  6  Spine2
-    [-0.0155, -0.4107, -0.0587],   #  7  L_Ankle
-    [ 0.0162, -0.4036, -0.0665],   #  8  R_Ankle
-    [-0.0014,  0.0502,  0.0141],   #  9  Spine3
-    [ 0.0505, -0.0534,  0.0946],   # 10  L_Foot
-    [-0.0465, -0.0557,  0.0983],   # 11  R_Foot
-    [-0.0091,  0.2114, -0.0089],   # 12  Neck
-    [ 0.0710,  0.1131, -0.0067],   # 13  L_Collar
-    [-0.0797,  0.1137, -0.0145],   # 14  R_Collar
-    [ 0.0061,  0.0753,  0.0492],   # 15  Head
-    [ 0.1255, -0.0057, -0.0093],   # 16  L_Shoulder
-    [-0.1163, -0.0036, -0.0046],   # 17  R_Shoulder
-    [ 0.0557, -0.2216, -0.0255],   # 18  L_Elbow
-    [-0.0622, -0.2197, -0.0248],   # 19  R_Elbow
-    [ 0.0247, -0.1697,  0.0793],   # 20  L_Wrist
-    [-0.0432, -0.1675,  0.0713],   # 21  R_Wrist
+    [ 0.00000,  0.00000,  0.00000],   #  0  pelvis (root)
+    [ 0.10053,  0.00000,  0.00000],   #  1  L_Hip       (+X = left)
+    [-0.10769,  0.00000,  0.00000],   #  2  R_Hip       (-X = right)
+    [ 0.00000,  0.12646,  0.00000],   #  3  Spine1      (+Y = up)
+    [ 0.00000, -0.36287,  0.00000],   #  4  L_Knee      (-Y = down)
+    [ 0.00000, -0.35947,  0.00000],   #  5  R_Knee      (-Y = down)
+    [ 0.00000,  0.13650,  0.00000],   #  6  Spine2      (+Y = up)
+    [ 0.00000, -0.41517,  0.00000],   #  7  L_Ankle     (-Y = down)
+    [ 0.00000, -0.40937,  0.00000],   #  8  R_Ankle     (-Y = down)
+    [ 0.00000,  0.05216,  0.00000],   #  9  Spine3      (+Y = up)
+    [ 0.00000,  0.00000,  0.11980],   # 10  L_Foot      (+Z = fwd)
+    [ 0.00000,  0.00000,  0.12218],   # 11  R_Foot      (+Z = fwd)
+    [ 0.00000,  0.21178,  0.00000],   # 12  Neck        (+Y = up)
+    [ 0.13371,  0.00000,  0.00000],   # 13  L_Collar    (+X = left)
+    [-0.13961,  0.00000,  0.00000],   # 14  R_Collar    (-X = right)
+    [ 0.00000,  0.00000,  0.09016],   # 15  Head        (+Z = fwd)
+    [ 0.00000, -0.12597,  0.00000],   # 16  L_Shoulder  (-Y = down in A-pose)
+    [ 0.00000, -0.11645,  0.00000],   # 17  R_Shoulder  (-Y = down in A-pose)
+    [ 0.00000, -0.22991,  0.00000],   # 18  L_Elbow     (-Y = down)
+    [ 0.00000, -0.22968,  0.00000],   # 19  R_Elbow     (-Y = down)
+    [ 0.00000, -0.18893,  0.00000],   # 20  L_Wrist     (-Y = down)
+    [ 0.00000, -0.18710,  0.00000],   # 21  R_Wrist     (-Y = down)
 ], dtype=torch.float32)
 
 
@@ -139,9 +142,11 @@ def _forward_kinematics(
 
     for i in range(1, 22):
         p = PARENTS[i]
-        # (B, T, 3, 3) @ (3,) → (B, T, 3)
-        positions[i]   = positions[p] + torch.einsum('...ij,j->...i', global_rots[p], offsets[i])
+        # Accumulate rotation first (matching HumanML3D's FK convention), then rotate
+        # the canonical offset by the CHILD's global rotation to get world displacement.
         global_rots[i] = global_rots[p] @ all_rotmats[:, :, i]
+        # (B, T, 3, 3) @ (3,) → (B, T, 3)
+        positions[i]   = positions[p] + torch.einsum('...ij,j->...i', global_rots[i], offsets[i])
 
     return torch.stack(positions, dim=2)                       # (B, T, 22, 3)
 
@@ -238,7 +243,7 @@ def compute_mpjpe(
     x_pred = x_pred_norm.clamp(-5, 5).float() * std + mean
     x_gt   = x_gt_norm.clamp(-5, 5).float()   * std + mean
 
-    if feature_mode in ("smpl", "group"):
+    if feature_mode == "group":
         joints_pred = _joint_positions_smpl(x_pred)
         joints_gt   = _joint_positions_smpl(x_gt)
     else:

@@ -173,6 +173,111 @@ def save_animation(
     print(f"Saved animation: {save_path}")
 
 
+def save_comparison_animation(
+    joints_gen: np.ndarray,
+    joints_gt: np.ndarray,
+    mpjpe_per_frame: np.ndarray,
+    total_mpjpe: float,
+    save_path: str,
+    title: str = "",
+    clip_id: str = "",
+    fps: int = 20,
+    figsize: tuple = (12, 6),
+):
+    """
+    Side-by-side animation: generated (left) vs ground truth (right).
+
+    joints_gen, joints_gt  : (T, 22, 3) world-space positions.
+    mpjpe_per_frame        : (T_common,) root-relative MPJPE in metres.
+    total_mpjpe            : mean MPJPE over T_common frames.
+    """
+    T_common = len(mpjpe_per_frame)
+    T_gen    = len(joints_gen)
+    T_gt     = len(joints_gt)
+    T        = max(T_gen, T_gt)
+    hw       = 1.0
+
+    z_min = min(joints_gen[:, :, 1].min(), joints_gt[:, :, 1].min()) - 0.2
+    z_max = max(joints_gen[:, :, 1].max(), joints_gt[:, :, 1].max()) + 0.2
+
+    fig = plt.figure(figsize=figsize, facecolor="black")
+    fig.patch.set_facecolor("black")
+    ax_gen = fig.add_subplot(121, projection="3d")
+    ax_gt  = fig.add_subplot(122, projection="3d")
+
+    for ax in (ax_gen, ax_gt):
+        ax.set_facecolor("black")
+        for pane in [ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane]:
+            pane.fill = False
+        ax.tick_params(colors="gray", labelsize=6)
+
+    if title:
+        short = title[:72] + "…" if len(title) > 72 else title
+        fig.suptitle(short, color="white", fontsize=8, y=0.99)
+
+    ax_gen.set_title("Generated", color="white", fontsize=9, pad=4)
+    ax_gt.set_title(f"Ground Truth  [{clip_id}]", color="white", fontsize=9, pad=4)
+
+    mpjpe_txt = fig.text(
+        0.5, 0.01,
+        f"Avg MPJPE: {total_mpjpe * 1000:.1f} mm",
+        ha="center", color="cyan", fontsize=9,
+    )
+
+    lines_gen, lines_gt = [], []
+    for chain, color in zip(KINEMATIC_CHAIN, CHAIN_COLORS):
+        lg, = ax_gen.plot([], [], [], "-o", color=color, markersize=3, linewidth=2)
+        lr, = ax_gt.plot([], [], [], "-o", color=color, markersize=3, linewidth=2)
+        lines_gen.append((chain, lg))
+        lines_gt.append((chain, lr))
+
+    def _init():
+        for ax in (ax_gen, ax_gt):
+            ax.set_zlim(z_min, z_max)
+            ax.view_init(elev=20, azim=-70)
+            ax.set_xlabel("X",      color="gray", fontsize=7)
+            ax.set_ylabel("Z (fwd)", color="gray", fontsize=7)
+            ax.set_zlabel("Y (up)", color="gray", fontsize=7)
+        return [l for _, l in lines_gen] + [l for _, l in lines_gt] + [mpjpe_txt]
+
+    def _update(frame):
+        if frame < T_gen:
+            cx, cy = joints_gen[frame, 0, 0], joints_gen[frame, 0, 2]
+            ax_gen.set_xlim(cx - hw, cx + hw)
+            ax_gen.set_ylim(cy - hw, cy + hw)
+            ax_gen.set_zlim(z_min, z_max)
+            for chain, line in lines_gen:
+                line.set_data(joints_gen[frame, chain, 0], joints_gen[frame, chain, 2])
+                line.set_3d_properties(joints_gen[frame, chain, 1])
+
+        if frame < T_gt:
+            cx, cy = joints_gt[frame, 0, 0], joints_gt[frame, 0, 2]
+            ax_gt.set_xlim(cx - hw, cx + hw)
+            ax_gt.set_ylim(cy - hw, cy + hw)
+            ax_gt.set_zlim(z_min, z_max)
+            for chain, line in lines_gt:
+                line.set_data(joints_gt[frame, chain, 0], joints_gt[frame, chain, 2])
+                line.set_3d_properties(joints_gt[frame, chain, 1])
+
+        if frame < T_common:
+            mpjpe_txt.set_text(
+                f"Frame {frame:3d}: {mpjpe_per_frame[frame] * 1000:.1f} mm  |  "
+                f"Avg: {total_mpjpe * 1000:.1f} mm"
+            )
+
+        return [l for _, l in lines_gen] + [l for _, l in lines_gt] + [mpjpe_txt]
+
+    ani = animation.FuncAnimation(
+        fig, _update, frames=T,
+        init_func=_init, blit=False, interval=1000 // fps,
+    )
+    writer = "ffmpeg" if save_path.endswith(".mp4") else "pillow"
+    ani.save(save_path, writer=writer, fps=fps, dpi=100,
+             savefig_kwargs={"facecolor": "black"})
+    plt.close(fig)
+    print(f"Saved comparison: {save_path}")
+
+
 def show_animation(
     joints: np.ndarray,
     title: str = "",
