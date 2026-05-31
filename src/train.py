@@ -26,7 +26,7 @@ from utils.skeleton import fk_position_loss, compute_mpjpe
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data_root",    required=True, default="./data/HumanML3D")
-    p.add_argument("--output_dir",   default="./runs/exp1")
+    p.add_argument("--output_dir",   default="./runs/exp_1")
     p.add_argument("--config",       default=None,
                    help="Path to a JSON config file. CLI args override it.")
 
@@ -156,11 +156,16 @@ def train_one_epoch(
             loss_mask = attn_mask.float().unsqueeze(-1)
             loss = ((noise - prediction) ** 2 * loss_mask).sum() / (loss_mask.sum() * noise.shape[-1])
 
-            if smpl_stats is not None and fk_loss_weight > 0.0:
-                mean_t, std_t = smpl_stats
-                x0_pred = schedule.predict_x0_from_eps(x_t, t, prediction)
-                fk_loss = fk_position_loss(x0_pred, motion, mean_t, std_t, mask=attn_mask)
+        if smpl_stats is not None and fk_loss_weight > 0.0:
+            mean_t, std_t = smpl_stats
+            x0_pred = schedule.predict_x0_from_eps(x_t, t, prediction.float())
+            fk_loss = fk_position_loss(x0_pred, motion.float(), mean_t, std_t, mask=attn_mask)
+            if torch.isfinite(fk_loss):
                 loss = loss + fk_loss_weight * fk_loss
+
+        if not torch.isfinite(loss):
+            optimizer.zero_grad()
+            continue
 
         optimizer.zero_grad()
         scaler.scale(loss).backward()

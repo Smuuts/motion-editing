@@ -56,8 +56,8 @@ def _cont6d_to_rotmat(x: torch.Tensor) -> torch.Tensor:
     """
     a1 = x[..., :3]
     a2 = x[..., 3:6]
-    b1 = F.normalize(a1, dim=-1)
-    b2 = F.normalize(a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1, dim=-1)
+    b1 = F.normalize(a1.float(), dim=-1, eps=1e-6)
+    b2 = F.normalize((a2.float() - (b1 * a2.float()).sum(dim=-1, keepdim=True) * b1), dim=-1, eps=1e-6)
     b3 = torch.cross(b1, b2, dim=-1)
     return torch.stack([b1, b2, b3], dim=-1)   # (..., 3, 3) columns = [b1|b2|b3] = R
 
