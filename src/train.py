@@ -20,7 +20,7 @@ from model.schedule import NoiseSchedule
 from utils.checkpoint import save_checkpoint, load_checkpoint
 from utils.ema import EMA
 from utils.logger import Logger
-from utils.skeleton import fk_position_loss
+from utils.skeleton import fk_position_loss, hml3d_geometric_losses
 
 
 def parse_args():
@@ -47,7 +47,13 @@ def parse_args():
                    choices=["humanml3d", "group"],
                    help="'humanml3d' = full 263-dim; 'group' = 130-dim split into per-body-part group tokens")
     p.add_argument("--fk_loss_weight", type=float, default=0.1,
-                   help="Weight of the FK position loss (SMPL/joint mode only). 0 = disabled.")
+                   help="Weight of the FK position loss (group mode only). 0 = disabled.")
+    p.add_argument("--hml3d_pos_weight",  type=float, default=0.1,
+                   help="Weight for MDM L_pos joint position loss (humanml3d mode only). 0 = disabled.")
+    p.add_argument("--hml3d_vel_weight",  type=float, default=0.1,
+                   help="Weight for MDM L_vel velocity consistency loss (humanml3d mode only). 0 = disabled.")
+    p.add_argument("--hml3d_foot_weight", type=float, default=0.01,
+                   help="Weight for MDM L_foot contact loss (humanml3d mode only). 0 = disabled.")
     p.add_argument("--snr_gamma",     type=float, default=5.0,
                    help="Min-SNR weighting gamma (Hang et al. 2023). 0 = disabled.")
 
@@ -110,9 +116,11 @@ def train_one_epoch(
     model, ema, text_encoder, schedule, optimizer, scaler,
     loader, device, cfg_dropout, logger, epoch, log_every,
     fk_stats=None, fk_loss_weight=0.0, snr_gamma=5.0,
+    hml3d_stats=None, hml3d_pos_weight=0.0, hml3d_vel_weight=0.0, hml3d_foot_weight=0.0,
 ):
     model.train()
     total_loss = 0.0
+    total_geo  = {"pos": 0.0, "vel": 0.0, "foot": 0.0}
 
     pbar = tqdm(loader, desc=f"Epoch {epoch}", leave=False)
     for step, batch in enumerate(pbar):
@@ -158,12 +166,32 @@ def train_one_epoch(
             else:
                 loss = per_elem.sum() / (loss_mask.sum() * noise.shape[-1]).clamp(min=1)
 
-        if fk_stats is not None and fk_loss_weight > 0.0:
-            mean_t, std_t = fk_stats
+        geo_log = {}
+        needs_x0 = (fk_stats is not None and fk_loss_weight > 0.0) or hml3d_stats is not None
+        if needs_x0:
             x0_pred = schedule.predict_x0_from_eps(x_t, t, prediction.float())
-            fk_loss = fk_position_loss(x0_pred, motion.float(), mean_t, std_t, mask=attn_mask)
-            if torch.isfinite(fk_loss):
-                loss = loss + fk_loss_weight * fk_loss
+
+            if fk_stats is not None and fk_loss_weight > 0.0:
+                mean_f, std_f = fk_stats
+                fk_loss = fk_position_loss(x0_pred, motion.float(), mean_f, std_f, mask=attn_mask)
+                if torch.isfinite(fk_loss):
+                    loss = loss + fk_loss_weight * fk_loss
+
+            if hml3d_stats is not None:
+                mean_h, std_h = hml3d_stats
+                geo = hml3d_geometric_losses(x0_pred, motion.float(), mean_h, std_h, mask=attn_mask)
+                if hml3d_pos_weight  > 0.0 and torch.isfinite(geo["pos"]):
+                    loss = loss + hml3d_pos_weight  * geo["pos"]
+                    geo_log["train/geo_pos"]  = geo["pos"].item()
+                    total_geo["pos"]  += geo["pos"].item()
+                if hml3d_vel_weight  > 0.0 and torch.isfinite(geo["vel"]):
+                    loss = loss + hml3d_vel_weight  * geo["vel"]
+                    geo_log["train/geo_vel"]  = geo["vel"].item()
+                    total_geo["vel"]  += geo["vel"].item()
+                if hml3d_foot_weight > 0.0 and torch.isfinite(geo["foot"]):
+                    loss = loss + hml3d_foot_weight * geo["foot"]
+                    geo_log["train/geo_foot"] = geo["foot"].item()
+                    total_geo["foot"] += geo["foot"].item()
 
         if not torch.isfinite(loss):
             optimizer.zero_grad()
@@ -181,13 +209,24 @@ def train_one_epoch(
         pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         if (step + 1) % log_every == 0:
-            logger.log({"train/loss": loss.item(), "train/step": epoch * len(loader) + step})
+            logger.log({"train/loss": loss.item(), "train/step": epoch * len(loader) + step, **geo_log})
 
-    return total_loss / len(loader)
+    n = len(loader)
+    geo_epoch = {}
+    if hml3d_stats is not None:
+        geo_epoch = {
+            "train/geo_pos_epoch":  total_geo["pos"]  / n,
+            "train/geo_vel_epoch":  total_geo["vel"]  / n,
+            "train/geo_foot_epoch": total_geo["foot"] / n,
+        }
+    return total_loss / n, geo_epoch
 
 
 @torch.no_grad()
-def validate_one_epoch(ema_model, text_encoder, schedule, loader, device, epoch):
+def validate_one_epoch(
+    ema_model, text_encoder, schedule, loader, device, epoch,
+    hml3d_stats=None, hml3d_pos_weight=0.0, hml3d_vel_weight=0.0, hml3d_foot_weight=0.0,
+):
     ema_model.eval()
     torch.manual_seed(0)
     total_loss = 0.0
@@ -216,6 +255,17 @@ def validate_one_epoch(ema_model, text_encoder, schedule, loader, device, epoch)
             prediction = ema_model(x_t, t, context, mask=attn_mask)
             loss_mask = attn_mask.float().unsqueeze(-1)
             loss = ((noise - prediction) ** 2 * loss_mask).sum() / (loss_mask.sum() * noise.shape[-1])
+
+        if hml3d_stats is not None:
+            x0_pred = schedule.predict_x0_from_eps(x_t, t, prediction.float())
+            mean_h, std_h = hml3d_stats
+            geo = hml3d_geometric_losses(x0_pred, motion.float(), mean_h, std_h, mask=attn_mask)
+            if hml3d_pos_weight  > 0.0 and torch.isfinite(geo["pos"]):
+                loss = loss + hml3d_pos_weight  * geo["pos"]
+            if hml3d_vel_weight  > 0.0 and torch.isfinite(geo["vel"]):
+                loss = loss + hml3d_vel_weight  * geo["vel"]
+            if hml3d_foot_weight > 0.0 and torch.isfinite(geo["foot"]):
+                loss = loss + hml3d_foot_weight * geo["foot"]
 
         total_loss += loss.item()
         pbar.set_postfix(val_loss=f"{loss.item():.4f}")
@@ -265,6 +315,12 @@ def main():
     if args.feature_mode == "group" and args.fk_loss_weight > 0.0:
         fk_stats = feature_stats
         print(f"FK position loss enabled (weight={args.fk_loss_weight})")
+
+    hml3d_geo_stats = None
+    if args.feature_mode == "humanml3d" and any([args.hml3d_pos_weight, args.hml3d_vel_weight, args.hml3d_foot_weight]):
+        hml3d_geo_stats = feature_stats
+        parts = [f"pos={args.hml3d_pos_weight}", f"vel={args.hml3d_vel_weight}", f"foot={args.hml3d_foot_weight}"]
+        print(f"HumanML3D geometric losses enabled ({', '.join(p for p in parts if not p.endswith('=0.0'))})")
 
     # text encoder
     context_dim = 768 if "L/14" in args.clip_version else 512
@@ -325,23 +381,33 @@ def main():
     # training loop
     print(f"\nStarting training from epoch {start_epoch}")
     for epoch in range(start_epoch, args.epochs):
-        avg_loss = train_one_epoch(
+        avg_loss, geo_epoch = train_one_epoch(
             model, ema, text_encoder, schedule, optimizer, scaler,
             train_loader, device, args.cfg_dropout,
             logger, epoch, args.log_every,
             fk_stats=fk_stats, fk_loss_weight=args.fk_loss_weight,
             snr_gamma=args.snr_gamma,
+            hml3d_stats=hml3d_geo_stats,
+            hml3d_pos_weight=args.hml3d_pos_weight,
+            hml3d_vel_weight=args.hml3d_vel_weight,
+            hml3d_foot_weight=args.hml3d_foot_weight,
         )
         scheduler.step()
         train_losses.append((epoch, avg_loss))
 
         log_line = f"Epoch {epoch:4d} | loss {avg_loss:.4f} | lr {scheduler.get_last_lr()[0]:.2e}"
+        if geo_epoch:
+            log_line += f" | pos {geo_epoch['train/geo_pos_epoch']:.4f} | vel {geo_epoch['train/geo_vel_epoch']:.4f} | foot {geo_epoch['train/geo_foot_epoch']:.4f}"
 
         if val_loader is not None and (epoch + 1) % args.val_every == 0:
             rng_cpu = torch.get_rng_state()
             rng_gpu = torch.cuda.get_rng_state(device) if device.type == "cuda" else None
             val_loss = validate_one_epoch(
                 ema.ema_model, text_encoder, schedule, val_loader, device, epoch,
+                hml3d_stats=hml3d_geo_stats,
+                hml3d_pos_weight=args.hml3d_pos_weight,
+                hml3d_vel_weight=args.hml3d_vel_weight,
+                hml3d_foot_weight=args.hml3d_foot_weight,
             )
             torch.set_rng_state(rng_cpu)
             if rng_gpu is not None:
@@ -353,7 +419,7 @@ def main():
         with open(losses_path, "w") as f:
             json.dump({"train": train_losses, "val": val_losses}, f, indent=2)
         save_loss_graph(args.output_dir, train_losses, val_losses=val_losses)
-        logger.log({"train/epoch_loss": avg_loss, "train/epoch": epoch, "train/lr": scheduler.get_last_lr()[0]})
+        logger.log({"train/epoch_loss": avg_loss, "train/epoch": epoch, "train/lr": scheduler.get_last_lr()[0], **geo_epoch})
         print(log_line)
 
         if (epoch + 1) % args.save_every == 0:

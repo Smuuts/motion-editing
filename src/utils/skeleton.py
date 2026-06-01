@@ -1,6 +1,6 @@
 """
-Differentiable forward kinematics for the 22-joint HumanML3D/SMPL skeleton.
-Used to compute an auxiliary FK position loss during SMPL-mode training.
+Differentiable forward kinematics for the 22-joint HumanML3D/SMPL skeleton,
+and MDM-style geometric losses for both HumanML3D and SMPL feature modes.
 """
 
 import torch
@@ -186,6 +186,81 @@ def fk_position_loss(
         return sq_err.sum() / (mask.float().sum() * 22 * 3).clamp(min=1)
 
     return sq_err.mean()
+
+
+# HumanML3D 263-dim channel layout:
+#   [0]      root angular velocity
+#   [1:3]    root XZ linear velocity
+#   [3]      root height Y
+#   [4:67]   21 joint positions (root-relative, local frame), 21×3
+#   [67:193] 21 joint rotations 6D, 21×6
+#   [193:259] 22 joint velocity vectors, 22×3
+#   [259:263] foot contact binary labels: L_Ankle, R_Ankle, L_Foot, R_Foot
+#
+# Foot joint indices in the 21-joint position array (0-indexed, i.e. joint_id - 1):
+_HML3D_FOOT_JOINTS = [6, 7, 9, 10]  # L_Ankle=7, R_Ankle=8, L_Foot=10, R_Foot=11
+
+
+def hml3d_geometric_losses(
+    x_pred_norm: torch.Tensor,          # (B, T, 263) predicted clean features, normalised
+    x_gt_norm:   torch.Tensor,          # (B, T, 263) ground-truth clean features, normalised
+    mean:        torch.Tensor,          # (263,)
+    std:         torch.Tensor,          # (263,)
+    mask:        torch.Tensor | None = None,  # (B, T) True = real frame
+) -> dict[str, torch.Tensor]:
+    """
+    MDM-style geometric losses (Eqs. 3-5) for HumanML3D (263-dim) features.
+
+    L_pos  — MSE on the 21 local joint positions directly stored in the features.
+    L_vel  — MSE on frame-to-frame position differences (penalises jitter).
+    L_foot — penalises predicted foot velocity on frames where the GT says foot
+             is in contact with the ground (mitigates foot sliding).
+
+    Returns a dict {\"pos\": ..., \"vel\": ..., \"foot\": ...} of scalar tensors.
+    x_pred_norm is clamped to ±5 before denormalisation to avoid gradient blow-up
+    at high noise timesteps.
+    """
+    x_pred = x_pred_norm.clamp(-5, 5) * std + mean
+    x_gt   = x_gt_norm              * std + mean
+
+    # Joint positions: channels [4:67], 21 joints × 3, root-relative local frame
+    pos_pred = x_pred[..., 4:67].reshape(*x_pred.shape[:-1], 21, 3)  # (B, T, 21, 3)
+    pos_gt   = x_gt[...,   4:67].reshape(*x_gt.shape[:-1],   21, 3)
+
+    # L_pos: per-joint position MSE
+    sq_err = (pos_pred - pos_gt) ** 2
+    if mask is not None:
+        sq_err = sq_err * mask[:, :, None, None].float()
+        l_pos  = sq_err.sum() / (mask.float().sum() * 21 * 3).clamp(min=1)
+    else:
+        l_pos = sq_err.mean()
+
+    # L_vel: frame-to-frame position-difference MSE (MDM Eq. 5)
+    vel_pred   = pos_pred[:, 1:] - pos_pred[:, :-1]   # (B, T-1, 21, 3)
+    vel_gt     = pos_gt[:,   1:] - pos_gt[:,   :-1]
+    vel_sq_err = (vel_pred - vel_gt) ** 2
+    if mask is not None:
+        vel_mask   = (mask[:, :-1] & mask[:, 1:]).float()  # both frames must be real
+        vel_sq_err = vel_sq_err * vel_mask[:, :, None, None]
+        l_vel      = vel_sq_err.sum() / (vel_mask.sum() * 21 * 3).clamp(min=1)
+    else:
+        l_vel = vel_sq_err.mean()
+
+    # L_foot: penalise foot velocity when GT contact label is active (MDM Eq. 4)
+    # Contact channels [259:263]: L_Ankle, R_Ankle, L_Foot, R_Foot (binary in GT)
+    foot_contact  = (x_gt[..., 259:263] >= 0.5).float()          # (B, T, 4)
+    foot_pos_pred = pos_pred[:, :, _HML3D_FOOT_JOINTS, :]         # (B, T, 4, 3)
+    foot_vel_pred = foot_pos_pred[:, 1:] - foot_pos_pred[:, :-1]  # (B, T-1, 4, 3)
+    f_i           = foot_contact[:, :-1, :, None]                  # (B, T-1, 4, 1)
+    foot_sq_err   = (foot_vel_pred * f_i) ** 2
+    if mask is not None:
+        vel_mask    = (mask[:, :-1] & mask[:, 1:]).float()
+        foot_sq_err = foot_sq_err * vel_mask[:, :, None, None]
+        l_foot      = foot_sq_err.sum() / (vel_mask.sum() * 4 * 3).clamp(min=1)
+    else:
+        l_foot = foot_sq_err.mean()
+
+    return {"pos": l_pos, "vel": l_vel, "foot": l_foot}
 
 
 def _joint_positions_smpl(x: torch.Tensor) -> torch.Tensor:
