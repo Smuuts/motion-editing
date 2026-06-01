@@ -3,8 +3,8 @@ Evaluation script: generate animations from text prompts using a trained MotionD
 
 Modes
 -----
-Prompt mode (default):
-    python sample_model.py --checkpoint ... --data_root ...
+Prompt mode (requires --num_samples 0):
+    python sample_model.py --checkpoint ... --data_root ... --num_samples 0
     --prompts "a person walks forward" "a person raises their right arm"
 
 Validation-set mode  (--num_samples N):
@@ -38,13 +38,6 @@ from utils.skeleton import recover_world_positions_smpl
 from data.dataset import _SMPL_CHANNELS
 
 
-DEFAULT_PROMPTS = [
-    "a person walks forward",
-    "a person raises their right arm slowly",
-    "a person waves their hand",
-]
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Argument parsing
 # ──────────────────────────────────────────────────────────────────────────────
@@ -57,7 +50,7 @@ def parse_args():
     p.add_argument("--output_dir",     default="./eval_results")
 
     # Prompt mode
-    p.add_argument("--prompts",        nargs="+", default=DEFAULT_PROMPTS,
+    p.add_argument("--prompts",        nargs="+", default=None,
                    help="Text prompts (used when --num_samples is 0).")
 
     # Validation-set comparison mode
@@ -70,18 +63,20 @@ def parse_args():
     p.add_argument("--seed",           type=int, default=42)
 
     # Generation hyper-parameters
-    p.add_argument("--length",         type=int,   default=120)
+    p.add_argument("--length",         type=int,   default=196)
     p.add_argument("--guidance_scale", type=float, default=4.0)
     p.add_argument("--num_steps",      type=int,   default=1000)
     p.add_argument("--smooth_sigma",   type=float, default=1.5)
-    return p.parse_args()
+    p.add_argument("--no_ema",         action="store_true",
+                   help="Load model.pt instead of ema.pt.")
+    return p, p.parse_args()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Model loading
 # ──────────────────────────────────────────────────────────────────────────────
 
-def load_model(ckpt_dir: str, device):
+def load_model(ckpt_dir: str, device, use_ema: bool = True):
     with open(os.path.join(ckpt_dir, "config.json")) as f:
         config = json.load(f)
 
@@ -99,7 +94,7 @@ def load_model(ckpt_dir: str, device):
         "dropout":      0.0,
     }, device=device)
 
-    weights = os.path.join(ckpt_dir, "ema.pt")
+    weights = os.path.join(ckpt_dir, "ema.pt" if use_ema else "model.pt")
     model.load_state_dict(torch.load(weights, map_location=device, weights_only=True))
     model.eval()
     print(f"Loaded: {weights}")
@@ -186,13 +181,13 @@ def load_val_samples(data_root, split, num_samples, feature_mode, max_frames=196
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
-    args = parse_args()
+    parser, args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    model, config = load_model(args.checkpoint, device=device)
+    model, config = load_model(args.checkpoint, device=device, use_ema=not args.no_ema)
     feature_mode  = config.get("feature_mode", "humanml3d")
 
     mean = np.load(os.path.join(args.data_root, "Mean.npy"))
@@ -214,6 +209,8 @@ def main():
         )
         print(f"\nValidation-set mode: {len(samples)} clips from '{args.split}' split\n")
     else:
+        if not args.prompts:
+            parser.error("--prompts is required when --num_samples is 0.")
         samples = None
         print(f"\nPrompt mode: {len(args.prompts)} prompts\n")
 

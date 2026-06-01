@@ -54,7 +54,7 @@ def parse_args():
     # training
     p.add_argument("--epochs",       type=int,   default=500)
     p.add_argument("--batch_size",   type=int,   default=128)
-    p.add_argument("--lr",           type=float, default=2e-4)
+    p.add_argument("--lr",           type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--max_frames",   type=int,   default=196)
     p.add_argument("--num_workers",  type=int,   default=4)
