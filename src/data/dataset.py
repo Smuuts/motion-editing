@@ -4,24 +4,19 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-# Channels extracted from the 263-dim HumanML3D vector for SMPL mode (130 dims):
-#   [0:4]    root_rot_vel + root_XZ_vel + root_y  (velocity-based root)
-#   [67:193] body_pose 6D for 21 non-root joints  (rot_data)
-_SMPL_CHANNELS = np.array(list(range(4)) + list(range(67, 193)))
-
-
 class HumanML3DDataset(Dataset):
     """
     Loads HumanML3D motion clips and their text annotations.
 
     Each item returns:
-        motion  : (max_frames, D) float32 tensor, normalised feature vectors
+        motion  : (max_frames, 263) float32 tensor, normalised feature vectors
         text    : one randomly sampled annotation string
         length  : actual number of frames T (before padding)
 
     feature_mode:
-        "humanml3d" — full 263-dim HumanML3D feature vector
-        "group"     — 130-dim subset: root velocity/height + body pose 6D (21 joints)
+        "humanml3d" — full 263-dim flat feature vector (for MotionDiT)
+        "group"     — full 263-dim feature vector, consumed by GroupDiT which
+                      partitions channels into 7 per-body-part group tokens
     """
 
     def __init__(
@@ -41,14 +36,9 @@ class HumanML3DDataset(Dataset):
         # normalisation statistics — slice to the active channels for SMPL/joint mode
         mean = np.load(os.path.join(data_root, "Mean.npy"))  # (263,)
         std  = np.load(os.path.join(data_root, "Std.npy"))   # (263,)
-        if feature_mode == "group":
-            self.mean = mean[_SMPL_CHANNELS]  # (130,)
-            self.std  = std[_SMPL_CHANNELS]   # (130,)
-            self.feature_dim = len(_SMPL_CHANNELS)
-        else:
-            self.mean = mean
-            self.std  = std
-            self.feature_dim = 263
+        self.mean = mean
+        self.std  = std
+        self.feature_dim = 263
 
         # clip IDs for this split
         split_file = os.path.join(data_root, f"{split}.txt")
@@ -81,8 +71,6 @@ class HumanML3DDataset(Dataset):
         clip_id = self.ids[idx]
 
         vecs = np.load(os.path.join(self.vec_dir, f"{clip_id}.npy"))  # (T, 263)
-        if self.feature_mode == "group":
-            vecs = vecs[:, _SMPL_CHANNELS]                            # (T, 130)
         # LEDITS++ inversion operates in this normalised space — the model was trained
         # on normalised features, so x0 passed to invert() must also be normalised.
         # Keep the raw (pre-normalisation) version if you need FK evaluation later:

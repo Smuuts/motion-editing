@@ -251,7 +251,7 @@ class MotionDiT(_MotionDiTBase):
 
 
 # Body-part groups: (name, joint_indices into the 21-joint body tensor).
-# Joint indices are 0-based, ordered as they appear in the SMPL 130-dim vector:
+# Joint indices are 0-based (SMPL joints 1–21, zero-indexed):
 #   0=L_Hip 1=R_Hip 2=Spine1 3=L_Knee 4=R_Knee 5=Spine2 6=L_Ankle 7=R_Ankle
 #   8=Spine3 9=L_Foot 10=R_Foot 11=Neck 12=L_Collar 13=R_Collar 14=Head
 #   15=L_Shoulder 16=R_Shoulder 17=L_Elbow 18=R_Elbow 19=L_Wrist 20=R_Wrist
@@ -270,11 +270,52 @@ _N_GROUPS = 1 + len(_BODY_PART_GROUPS)  # 7: root + 6 body-part groups
 # Used by masking.py, analyse_attention.py, and the LLM fallback mask.
 GROUP_NAMES: list[str] = ["root"] + [name for name, _ in _BODY_PART_GROUPS]
 
-# Inverse permutation: maps the group-concatenated joint order back to the
-# canonical 21-joint order so output can be scattered back correctly.
-# Group concat order: left_leg[0,3,6,9] right_leg[1,4,7,10] spine[2,5,8]
-#                     left_arm[12,15,17,19] right_arm[13,16,18,20] head[11,14]
-_JOINT_INV_PERM = [0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 19, 11, 15, 20, 12, 16, 13, 17, 14, 18]
+
+def _build_group_channels() -> list[list[int]]:
+    """
+    Partition all 263 HumanML3D channels into 7 per-group index lists
+    (root, left_leg, right_leg, spine, left_arm, right_arm, head).
+
+    For each non-root joint j (0-indexed in the 21-joint body array):
+      position  → channels [4 + j*3  : 4 + j*3  + 3]
+      rotation  → channels [67 + j*6 : 67 + j*6 + 6]
+      velocity  → channels [193 + (j+1)*3 : 193 + (j+1)*3 + 3]
+        (velocity array is 22-joint; index 0 = root, so body joint j maps to vel index j+1)
+
+    Root group gets: root kinematics [0:4] + root velocity [193:196].
+    Left/right leg groups additionally get the two foot-contact channels
+    for their ankle and foot joints ([259:263] in L_Ankle/R_Ankle/L_Foot/R_Foot order).
+
+    All 263 channels appear exactly once across the 7 lists.
+    """
+    def pos_ch(j):      return list(range(4   + j * 3,     4   + j * 3 + 3))
+    def rot_ch(j):      return list(range(67  + j * 6,     67  + j * 6 + 6))
+    def vel_ch(smpl_j): return list(range(193 + smpl_j*3, 193 + smpl_j*3 + 3))
+
+    root_ch = list(range(4)) + vel_ch(0)  # kinematics [0:4] + root vel [193:196] → 7D
+
+    body_groups: list[list[int]] = []
+    for _, joint_ids in _BODY_PART_GROUPS:
+        ch: list[int] = []
+        for j in joint_ids:
+            ch += pos_ch(j) + rot_ch(j) + vel_ch(j + 1)
+        body_groups.append(ch)
+
+    # Foot-contact labels [259:263]: L_Ankle, R_Ankle, L_Foot, R_Foot
+    # L_Ankle (joint 6) and L_Foot (joint 9) belong to left_leg  (body index 0)
+    # R_Ankle (joint 7) and R_Foot (joint 10) belong to right_leg (body index 1)
+    body_groups[0] += [259, 261]   # left_leg  ← L_Ankle, L_Foot contact
+    body_groups[1] += [260, 262]   # right_leg ← R_Ankle, R_Foot contact
+
+    channels = [root_ch] + body_groups
+    assert sorted(sum(channels, [])) == list(range(263)), \
+        "Group channel indices must be a partition of [0, 263)"
+    return channels
+
+
+_GROUP_CHANNELS: list[list[int]] = _build_group_channels()
+# Per-group input/output dims: [7, 50, 50, 36, 48, 48, 24] — sums to 263
+_GROUP_DIMS:     list[int]       = [len(ch) for ch in _GROUP_CHANNELS]
 
 
 class GroupDiT(_MotionDiTBase):
@@ -285,11 +326,11 @@ class GroupDiT(_MotionDiTBase):
     right leg, spine, left arm, right arm, head), giving F×7=1,372 tokens
     instead of F=196 (MotionDiT) or F×22=4,312 (full joint-level).
 
-    Each group token is the learned projection of the concatenated 6D rotations
-    of that body part (or the 4-dim root features for the root token).
-    A group identity embedding and a frame positional embedding are added.
+    Each group token carries the full HumanML3D features for its joints:
+    positions + 6D rotations + velocities, with foot-contact labels for the
+    leg groups. Per-group dims: [7, 50, 50, 36, 48, 48, 24] → 263D total.
 
-    Input/output shape: (B, F, 130) — identical to SMPL-mode MotionDiT.
+    Input/output shape: (B, F, 263).
 
     LEDITS++ note: cross-attention maps are (B, heads, F*G, L_text) where G=7.
     Reshape to (B, heads, F, G, L_text), then average over heads and edit-token
@@ -312,13 +353,10 @@ class GroupDiT(_MotionDiTBase):
         super().__init__()
         self.latent_dim = latent_dim
         self.max_frames = max_frames
-        self.input_dim  = 130  # fixed: 4 root + 21 × 6 body joints
+        self.input_dim  = 263
 
-        # Input/output dims per group: root=4, body parts=n_joints×6
-        group_dims = [4] + [len(ids) * 6 for _, ids in _BODY_PART_GROUPS]
-
-        self.in_projs  = nn.ModuleList([nn.Linear(d, latent_dim) for d in group_dims])
-        self.out_projs = nn.ModuleList([nn.Linear(latent_dim, d) for d in group_dims])
+        self.in_projs  = nn.ModuleList([nn.Linear(d, latent_dim) for d in _GROUP_DIMS])
+        self.out_projs = nn.ModuleList([nn.Linear(latent_dim, d) for d in _GROUP_DIMS])
 
         self.group_emb = nn.Embedding(_N_GROUPS, latent_dim)
         self.pos_emb   = FramePositionalEmbedding(max_frames, latent_dim)
@@ -331,12 +369,11 @@ class GroupDiT(_MotionDiTBase):
         self.final_norm    = nn.LayerNorm(latent_dim)
         self.null_text_emb = nn.Parameter(torch.randn(1, 77, context_dim) * 0.02)
 
-        self.register_buffer("inv_perm", torch.tensor(_JOINT_INV_PERM))
         self._init_weights()
 
     def forward(
         self,
-        motion:     torch.Tensor,         # (B, F, 130)
+        motion:     torch.Tensor,         # (B, F, 263)
         t:          torch.Tensor,         # (B,)
         context:    torch.Tensor | None,  # (B, L, context_dim) or None
         store_attn: bool = False,
@@ -349,13 +386,8 @@ class GroupDiT(_MotionDiTBase):
             context = self.null_text_emb.expand(B, -1, -1)
 
         # ── tokenise ──────────────────────────────────────────────────────────
-        root_feats  = motion[..., :4]                            # (B, F, 4)
-        body_joints = motion[..., 4:].reshape(B, F, 21, 6)      # (B, F, 21, 6)
-
-        group_feats = [root_feats] + [
-            body_joints[:, :, ids, :].reshape(B, F, len(ids) * 6)
-            for _, ids in _BODY_PART_GROUPS
-        ]
+        # Slice each group's channels from the full 263D vector.
+        group_feats = [motion[..., ch] for ch in _GROUP_CHANNELS]
 
         # project each group → latent_dim, stack → (B, F, G, latent_dim)
         tokens = torch.stack(
@@ -381,19 +413,14 @@ class GroupDiT(_MotionDiTBase):
 
         tokens = self.final_norm(tokens).reshape(B, F, G, self.latent_dim)
 
-        # ── reconstruct (B, F, 130) ───────────────────────────────────────────
-        root_pred = self.out_projs[0](tokens[:, :, 0])          # (B, F, 4)
-
-        # project each body-part group and cat in group order → (B, F, 21, 6)
-        body_pred = torch.cat([
-            self.out_projs[i + 1](tokens[:, :, i + 1]).reshape(B, F, len(ids), 6)
-            for i, (_, ids) in enumerate(_BODY_PART_GROUPS)
-        ], dim=2)
-
-        # reorder from group-concat order back to canonical joint order
-        body_pred = body_pred[:, :, self.inv_perm]              # (B, F, 21, 6)
-
-        return torch.cat([root_pred, body_pred.reshape(B, F, 126)], dim=-1)
+        # ── reconstruct (B, F, 263) ───────────────────────────────────────────
+        # Compute projections first so we know the actual dtype (AMP may differ
+        # from tokens.dtype when LayerNorm upcasts to float32 internally).
+        group_outs = [self.out_projs[g](tokens[:, :, g]) for g in range(len(_GROUP_CHANNELS))]
+        out = torch.zeros(B, F, 263, device=tokens.device, dtype=group_outs[0].dtype)
+        for g, ch in enumerate(_GROUP_CHANNELS):
+            out[..., ch] = group_outs[g]
+        return out
 
 
 def build_model(config: dict, device="cpu") -> _MotionDiTBase:

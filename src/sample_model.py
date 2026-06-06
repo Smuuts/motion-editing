@@ -34,8 +34,6 @@ from model.text_encoder import CLIPTextEncoder
 from model.schedule import NoiseSchedule
 from model.sampler import DDPMSampler
 from utils.visualise import recover_from_ric, save_animation, save_comparison_animation
-from utils.skeleton import recover_world_positions_smpl
-from data.dataset import _SMPL_CHANNELS
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -81,7 +79,7 @@ def load_model(ckpt_dir: str, device, use_ema: bool = True):
         config = json.load(f)
 
     feature_mode = config.get("feature_mode", "humanml3d")
-    input_dim    = len(_SMPL_CHANNELS) if feature_mode == "group" else 263
+    input_dim    = 263
     context_dim  = 768 if "L/14" in config.get("clip_version", "ViT-B/32") else 512
     model = build_model({
         "feature_mode": feature_mode,
@@ -106,10 +104,7 @@ def load_model(ckpt_dir: str, device, use_ema: bool = True):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def recover_joints(raw_features: np.ndarray, feature_mode: str) -> np.ndarray:
-    """Raw (denormalised) features → world-space joint positions (T, 22, 3)."""
-    if feature_mode == "group":
-        t = torch.from_numpy(raw_features.astype(np.float32)).unsqueeze(0)
-        return recover_world_positions_smpl(t)[0].numpy()
+    """Raw (denormalised) (T, 263) features → world-space joint positions (T, 22, 3)."""
     return recover_from_ric(raw_features, joints_num=22)
 
 
@@ -165,7 +160,7 @@ def load_val_samples(data_root, split, num_samples, feature_mode, max_frames=196
         raw = np.load(os.path.join(vec_dir, f"{cid}.npy"))        # (T, 263) raw
         T   = min(len(raw), max_frames)
         raw = raw[:T]
-        raw_feat = raw[:, _SMPL_CHANNELS] if feature_mode == "group" else raw
+        raw_feat = raw
 
         with open(os.path.join(text_dir, f"{cid}.txt")) as f:
             lines = [l.strip() for l in f if l.strip()]
@@ -192,10 +187,6 @@ def main():
 
     mean = np.load(os.path.join(args.data_root, "Mean.npy"))
     std  = np.load(os.path.join(args.data_root, "Std.npy"))
-    if feature_mode == "group":
-        mean = mean[_SMPL_CHANNELS]
-        std  = std[_SMPL_CHANNELS]
-
     clip_version  = config.get("clip_version", "ViT-B/32")
     text_encoder  = CLIPTextEncoder(clip_version, device=device)
     schedule      = NoiseSchedule(timesteps=config.get("timesteps", 1000), device=device)

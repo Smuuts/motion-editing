@@ -52,8 +52,6 @@ from model.text_encoder import CLIPTextEncoder
 from model.schedule import NoiseSchedule
 from model.sampler import DDPMSampler
 from utils.visualise import recover_from_ric
-from utils.skeleton import recover_world_positions_smpl
-from data.dataset import _SMPL_CHANNELS
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -96,7 +94,7 @@ def load_model(ckpt_dir, device, use_ema=True):
         config = json.load(f)
 
     feature_mode = config.get("feature_mode", "humanml3d")
-    input_dim    = len(_SMPL_CHANNELS) if feature_mode == "group" else 263
+    input_dim    = 263
     context_dim  = 768 if "L/14" in config.get("clip_version", "ViT-B/32") else 512
 
     model = build_model({
@@ -178,10 +176,7 @@ def load_split(data_root, split, feature_mode, max_frames=196, min_frames=16,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def recover_joints(raw_features, feature_mode):
-    """Denormalised (T, D) features → (T, 22, 3) world-space joint positions."""
-    if feature_mode == "group":
-        t = torch.from_numpy(raw_features.astype(np.float32)).unsqueeze(0)
-        return recover_world_positions_smpl(t)[0].numpy()
+    """Denormalised (T, 263) features → (T, 22, 3) world-space joint positions."""
     return recover_from_ric(raw_features, joints_num=22)
 
 
@@ -343,9 +338,6 @@ def main():
 
     mean = np.load(os.path.join(args.data_root, "Mean.npy"))
     std  = np.load(os.path.join(args.data_root, "Std.npy"))
-    if feature_mode == "group":
-        mean = mean[_SMPL_CHANNELS]
-        std  = std[_SMPL_CHANNELS]
 
     text_encoder = CLIPTextEncoder(config.get("clip_version", "ViT-B/32"), device=device)
     schedule     = NoiseSchedule(timesteps=config.get("timesteps", 1000), device=device)
@@ -376,7 +368,7 @@ def main():
 
         # ground-truth raw features
         raw_263  = np.load(clip["vec_path"])[:T]                               # (T, 263)
-        raw_feat = raw_263[:, _SMPL_CHANNELS] if feature_mode == "group" else raw_263  # (T, D)
+        raw_feat = raw_263  # (T, 263)
         gt_norm  = (raw_feat - mean) / std                                     # (T, D)
 
         # text context

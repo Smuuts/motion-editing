@@ -26,13 +26,12 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, LinearLR, Sequ
 import matplotlib
 matplotlib.use("Agg")
 
-from data.dataset import HumanML3DDataset, _SMPL_CHANNELS
+from data.dataset import HumanML3DDataset
 from model.dit import build_model
 from model.sampler import DDPMSampler
 from model.schedule import NoiseSchedule
 from model.text_encoder import CLIPTextEncoder
 from utils.visualise import recover_from_ric, save_comparison_animation
-from utils.skeleton import recover_world_positions_smpl
 
 
 def parse_args():
@@ -79,9 +78,6 @@ def parse_args():
 
 
 def _recover_joints(raw_feat: np.ndarray, feature_mode: str) -> np.ndarray:
-    if feature_mode == "group":
-        t = torch.from_numpy(raw_feat.astype(np.float32)).unsqueeze(0)
-        return recover_world_positions_smpl(t)[0].numpy()
     return recover_from_ric(raw_feat, joints_num=22)
 
 
@@ -246,15 +242,12 @@ def main():
 
     mean_np = np.load(os.path.join(args.data_root, "Mean.npy"))
     std_np  = np.load(os.path.join(args.data_root, "Std.npy"))
-    if args.feature_mode == "group":
-        mean_np = mean_np[_SMPL_CHANNELS]
-        std_np  = std_np[_SMPL_CHANNELS]
     motion_raw = motion_norm * std_np + mean_np
 
     vec_dir  = os.path.join(args.data_root, "new_joint_vecs")
     raw_full = np.load(os.path.join(vec_dir, f"{clip_id}.npy"))
     T_gt  = min(len(raw_full), args.max_frames)
-    raw_gt = raw_full[:T_gt, _SMPL_CHANNELS] if args.feature_mode == "group" else raw_full[:T_gt]
+    raw_gt = raw_full[:T_gt]
 
     joints_gen = _recover_joints(motion_raw, args.feature_mode)
     joints_gt  = _recover_joints(raw_gt,     args.feature_mode)
