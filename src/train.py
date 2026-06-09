@@ -1,6 +1,9 @@
 import os
 import argparse
 import json
+import glob
+
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -15,7 +18,7 @@ import matplotlib.pyplot as plt
 
 from data.dataset import build_dataloader
 from model.dit import build_model
-from model.text_encoder import CLIPTextEncoder
+from model.text_encoder import build_text_encoder, get_encoder_dims
 from model.schedule import NoiseSchedule
 from utils.checkpoint import save_checkpoint, load_checkpoint
 from utils.ema import EMA
@@ -36,6 +39,13 @@ def parse_args():
     p.add_argument("--num_heads",    type=int,   default=8)
     p.add_argument("--dropout",      type=float, default=0.1)
     p.add_argument("--clip_version", type=str,   default="ViT-B/32")
+    p.add_argument("--text_encoder", type=str,   default="clip",
+                   choices=["clip", "t5"],
+                   help="Text encoder backend: 'clip' (default) or 't5'.")
+    p.add_argument("--t5_version",   type=str,   default="t5-base",
+                   help="T5 model name (e.g. t5-base, t5-large). Used when --text_encoder=t5.")
+    p.add_argument("--t5_max_length", type=int,  default=128,
+                   help="Fixed token sequence length for T5 output. Used when --text_encoder=t5.")
 
     # diffusion
     p.add_argument("--timesteps",    type=int,   default=1000)
@@ -308,12 +318,25 @@ def main():
         print(f"HumanML3D geometric losses enabled ({', '.join(p for p in parts if not p.endswith('=0.0'))})")
 
     # text encoder
-    context_dim = 768 if "L/14" in args.clip_version else 512
+    context_dim, text_seq_len = get_encoder_dims(config)
     if train_loader.dataset.text_emb_dir is not None:
-        print("Precomputed text embeddings found — skipping CLIP model load.")
+        sample_files = glob.glob(os.path.join(train_loader.dataset.text_emb_dir, "*.npy"))[:1]
+        if sample_files:
+            sample_emb = np.load(sample_files[0])  # (num_ann, L, dim)
+            emb_seq_len, emb_dim = int(sample_emb.shape[1]), int(sample_emb.shape[2])
+            if emb_seq_len != text_seq_len or emb_dim != context_dim:
+                raise ValueError(
+                    f"Precomputed embeddings in '{train_loader.dataset.text_emb_dir}' have shape "
+                    f"(*, {emb_seq_len}, {emb_dim}), but the configured encoder "
+                    f"(--text_encoder {config.get('text_encoder', 'clip')}) expects "
+                    f"(*, {text_seq_len}, {context_dim}). "
+                    f"Re-run precompute_text.py with matching encoder settings, or "
+                    f"point --data_root to a directory without a stale text_emb/ folder."
+                )
+        print(f"Precomputed text embeddings found — skipping {config.get('text_encoder', 'clip').upper()} model load.")
         text_encoder = None
     else:
-        text_encoder = CLIPTextEncoder(args.clip_version, device=device)
+        text_encoder = build_text_encoder(config, device=device)
 
     # model
     model = build_model({
@@ -321,6 +344,7 @@ def main():
         "input_dim":    train_loader.dataset.feature_dim,
         "latent_dim":   args.latent_dim,
         "context_dim":  context_dim,
+        "text_seq_len": text_seq_len,
         "num_heads":    args.num_heads,
         "num_layers":   args.num_layers,
         "max_frames":   args.max_frames,

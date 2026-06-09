@@ -46,7 +46,7 @@ if src_dir not in sys.path:
     sys.path.insert(0, src_dir)
 
 from model.dit import build_model, GroupDiT, GROUP_NAMES
-from model.text_encoder import CLIPTextEncoder
+from model.text_encoder import build_text_encoder, get_encoder_dims
 from model.schedule import NoiseSchedule
 from data.dataset import build_dataloader
 
@@ -102,12 +102,13 @@ def _load_model(ckpt_dir: str, device):
     with open(config_path) as f:
         config = json.load(f)
 
-    context_dim = 768 if "L/14" in config.get("clip_version", "ViT-B/32") else 512
+    context_dim, text_seq_len = get_encoder_dims(config)
     model = build_model({
         "feature_mode": config.get("feature_mode", "humanml3d"),
         "input_dim":    config.get("input_dim", 263),
         "latent_dim":   config.get("latent_dim", 512),
         "context_dim":  context_dim,
+        "text_seq_len": text_seq_len,
         "num_heads":    config.get("num_heads", 8),
         "num_layers":   config.get("num_layers", 8),
         "max_frames":   config.get("max_frames", 196),
@@ -371,7 +372,7 @@ def main():
         )
 
     schedule     = NoiseSchedule(timesteps=config.get("timesteps", 1000), device=device)
-    text_encoder = CLIPTextEncoder(config.get("clip_version", "ViT-B/32"), device=device)
+    text_encoder = build_text_encoder(config, device=device)
 
     loader = build_dataloader(
         args.data_root, split="val",

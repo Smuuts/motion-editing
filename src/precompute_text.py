@@ -1,13 +1,16 @@
 """
-Pre-compute CLIP text embeddings for every HumanML3D clip.
+Pre-compute text embeddings for every HumanML3D clip.
 
-Saves {data_root}/text_emb/{clip_id}.npy  — shape (num_annotations, 77, dim), float16.
-The dataset will automatically use these files during training, eliminating the
-CLIP forward pass from the training loop.
+Saves {out_dir}/{clip_id}.npy — shape (num_annotations, L, dim), float16,
+where L is 77 for CLIP or --t5_max_length for T5.
+
+The dataset loads embeddings from {data_root}/text_emb/ automatically.
+Use --out_dir to write to a different directory (e.g. when switching encoders).
 
 Usage:
     python precompute_text.py --data_root ./data/HumanML3D
     python precompute_text.py --data_root ./data/HumanML3D --clip_version ViT-L/14
+    python precompute_text.py --data_root ./data/HumanML3D --text_encoder t5 --t5_version t5-base
 """
 
 import os
@@ -22,22 +25,30 @@ src_dir = os.path.dirname(os.path.abspath(__file__))
 if src_dir not in sys.path:
     sys.path.insert(0, src_dir)
 
-from model.text_encoder import CLIPTextEncoder
+from model.text_encoder import build_text_encoder
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--data_root",    required=True,
+    p.add_argument("--data_root",     required=True,
                    help="HumanML3D root directory (must contain texts/ and split .txt files).")
-    p.add_argument("--clip_version", default="ViT-B/32",
-                   help="CLIP variant — must match the one used in training.")
-    p.add_argument("--splits",       nargs="+", default=["train", "val", "test"],
+    p.add_argument("--out_dir",       default=None,
+                   help="Output directory for .npy files. Defaults to {data_root}/text_emb.")
+    p.add_argument("--text_encoder",  default="clip", choices=["clip", "t5"],
+                   help="Text encoder backend — must match the one used in training.")
+    p.add_argument("--clip_version",  default="ViT-B/32",
+                   help="CLIP variant (used when --text_encoder=clip).")
+    p.add_argument("--t5_version",    default="t5-base",
+                   help="T5 model name (used when --text_encoder=t5).")
+    p.add_argument("--t5_max_length", type=int, default=128,
+                   help="Fixed token length for T5 output (used when --text_encoder=t5).")
+    p.add_argument("--splits",        nargs="+", default=["train", "val", "test"],
                    help="Which split files to scan for clip IDs.")
-    p.add_argument("--batch_size",   type=int, default=512,
-                   help="Number of annotation strings encoded per CLIP forward pass.")
-    p.add_argument("--device",       default=None,
+    p.add_argument("--batch_size",    type=int, default=512,
+                   help="Number of annotation strings encoded per forward pass.")
+    p.add_argument("--device",        default=None,
                    help="'cuda' or 'cpu'. Defaults to cuda if available.")
-    p.add_argument("--overwrite",    action="store_true",
+    p.add_argument("--overwrite",     action="store_true",
                    help="Re-encode clips that already have a cached file.")
     return p.parse_args()
 
@@ -77,7 +88,7 @@ def main():
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    out_dir = os.path.join(args.data_root, "text_emb")
+    out_dir = args.out_dir or os.path.join(args.data_root, "text_emb")
     os.makedirs(out_dir, exist_ok=True)
 
     # ── collect annotations ───────────────────────────────────────────────
@@ -96,9 +107,11 @@ def main():
         print("Nothing to do.")
         return
 
-    # ── load CLIP ─────────────────────────────────────────────────────────
-    print(f"Loading CLIP {args.clip_version}...")
-    encoder = CLIPTextEncoder(args.clip_version, device=device)
+    # ── load encoder ──────────────────────────────────────────────────────
+    encoder_label = (f"T5 {args.t5_version} (max_length={args.t5_max_length})"
+                     if args.text_encoder == "t5" else f"CLIP {args.clip_version}")
+    print(f"Loading {encoder_label}...")
+    encoder = build_text_encoder(vars(args), device=device)
 
     CHUNK_SIZE = 256
     clip_ids_ordered = list(clip_annotations.keys())
@@ -139,9 +152,11 @@ def main():
     pbar.close()
 
     total_annotations = sum(len(v) for v in clip_annotations.values())
-    size_gb = total_annotations * 77 * dim * 2 / 1024 ** 3  # float16 = 2 bytes
+    seq_len = encoder.max_length
+    size_gb = total_annotations * seq_len * dim * 2 / 1024 ** 3  # float16 = 2 bytes
     print(f"\nDone. {saved} clips saved to {out_dir}/")
-    print(f"  Embedding dim: {dim}  |  Approx disk usage: {size_gb:.2f} GB (float16)")
+    print(f"  Encoder: {encoder_label}  |  seq_len: {seq_len}  |  dim: {dim}"
+          f"  |  Approx disk: {size_gb:.2f} GB (float16)")
 
 
 if __name__ == "__main__":

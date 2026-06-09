@@ -30,7 +30,7 @@ from data.dataset import HumanML3DDataset
 from model.dit import build_model
 from model.sampler import DDPMSampler
 from model.schedule import NoiseSchedule
-from model.text_encoder import CLIPTextEncoder
+from model.text_encoder import build_text_encoder, get_encoder_dims
 from utils.visualise import recover_from_ric, save_comparison_animation
 
 
@@ -39,6 +39,9 @@ def parse_args():
     p.add_argument("--data_root",     required=True)
     p.add_argument("--feature_mode",  default="humanml3d", choices=["humanml3d", "group"])
     p.add_argument("--clip_version",  default="ViT-B/32")
+    p.add_argument("--text_encoder",  default="clip", choices=["clip", "t5"])
+    p.add_argument("--t5_version",    default="t5-base")
+    p.add_argument("--t5_max_length", type=int, default=128)
     p.add_argument("--max_frames",    type=int,   default=196)
 
     # model — same defaults as train.py
@@ -122,19 +125,21 @@ def main():
     attn_mask = (torch.arange(args.max_frames, device=device)[None, :] < length).expand(B, -1)  # (B, F)
 
     # ── text embedding ────────────────────────────────────────────────────────
+    encoder_cfg = vars(args)
+    context_dim, text_seq_len = get_encoder_dims(encoder_cfg)
     if "context" in sample:
-        context_1 = sample["context"].unsqueeze(0).to(device)  # (1, 77, dim)
+        context_1 = sample["context"].unsqueeze(0).to(device)  # (1, L, dim)
         context_dim = context_1.shape[-1]
+        text_seq_len = context_1.shape[1]
         clip_text = f"[precomputed: {clip_id}]"
-        print("Using precomputed CLIP embedding.")
+        print("Using precomputed text embedding.")
     else:
-        context_dim = 768 if "L/14" in args.clip_version else 512
-        text_encoder = CLIPTextEncoder(args.clip_version, device=device)
+        text_encoder = build_text_encoder(encoder_cfg, device=device)
         clip_text = sample["text"]
         with torch.no_grad():
-            context_1 = text_encoder.encode([clip_text])       # (1, 77, dim)
+            context_1 = text_encoder.encode([clip_text])
         print(f"Text: {clip_text!r}")
-    context = context_1.expand(B, -1, -1)                      # (B, 77, dim)
+    context = context_1.expand(B, -1, -1)
 
     # ── model + schedule ──────────────────────────────────────────────────────
     model = build_model({
@@ -142,6 +147,7 @@ def main():
         "input_dim":    ds.feature_dim,
         "latent_dim":   args.latent_dim,
         "context_dim":  context_dim,
+        "text_seq_len": text_seq_len,
         "num_heads":    args.num_heads,
         "num_layers":   args.num_layers,
         "max_frames":   args.max_frames,

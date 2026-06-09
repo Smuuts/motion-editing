@@ -206,14 +206,15 @@ class MotionDiT(_MotionDiTBase):
 
     def __init__(
         self,
-        input_dim:   int   = 263,
-        latent_dim:  int   = 512,
-        context_dim: int   = 512,
-        num_heads:   int   = 8,
-        num_layers:  int   = 8,
-        max_frames:  int   = 196,
-        ff_mult:     int   = 4,
-        dropout:     float = 0.1,
+        input_dim:    int   = 263,
+        latent_dim:   int   = 512,
+        context_dim:  int   = 512,
+        num_heads:    int   = 8,
+        num_layers:   int   = 8,
+        max_frames:   int   = 196,
+        ff_mult:      int   = 4,
+        dropout:      float = 0.1,
+        text_seq_len: int   = 77,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -231,10 +232,10 @@ class MotionDiT(_MotionDiTBase):
         ])
         self.final_norm = nn.LayerNorm(latent_dim)
 
-        # null_text_emb: sequence length 77 to match CLIP, avoiding key distribution mismatch.
-        # For LEDITS++ inversion (Stage 1): pass context=None so the model uses this —
-        # inversion is unconditional and requires no source text description of the motion.
-        self.null_text_emb = nn.Parameter(torch.randn(1, 77, context_dim) * 0.02)
+        # null_text_emb length matches the text encoder's fixed output length (77 for CLIP,
+        # configurable for T5). For LEDITS++ inversion (Stage 1): pass context=None so the
+        # model uses this — inversion is unconditional.
+        self.null_text_emb = nn.Parameter(torch.randn(1, text_seq_len, context_dim) * 0.02)
         self._init_weights()
 
     def forward(
@@ -350,13 +351,14 @@ class GroupDiT(_MotionDiTBase):
 
     def __init__(
         self,
-        latent_dim:  int   = 512,
-        context_dim: int   = 512,
-        num_heads:   int   = 8,
-        num_layers:  int   = 8,
-        max_frames:  int   = 196,
-        ff_mult:     int   = 4,
-        dropout:     float = 0.1,
+        latent_dim:   int   = 512,
+        context_dim:  int   = 512,
+        num_heads:    int   = 8,
+        num_layers:   int   = 8,
+        max_frames:   int   = 196,
+        ff_mult:      int   = 4,
+        dropout:      float = 0.1,
+        text_seq_len: int   = 77,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -375,7 +377,7 @@ class GroupDiT(_MotionDiTBase):
             for _ in range(num_layers)
         ])
         self.final_norm    = nn.LayerNorm(latent_dim)
-        self.null_text_emb = nn.Parameter(torch.randn(1, 77, context_dim) * 0.02)
+        self.null_text_emb = nn.Parameter(torch.randn(1, text_seq_len, context_dim) * 0.02)
 
         self._init_weights()
 
@@ -433,13 +435,14 @@ class GroupDiT(_MotionDiTBase):
 
 def build_model(config: dict, device="cpu") -> _MotionDiTBase:
     kwargs = dict(
-        latent_dim  = config.get("latent_dim",  512),
-        context_dim = config.get("context_dim", 512),
-        num_heads   = config.get("num_heads",   8),
-        num_layers  = config.get("num_layers",  8),
-        max_frames  = config.get("max_frames",  196),
-        ff_mult     = config.get("ff_mult",     4),
-        dropout     = config.get("dropout",     0.1),
+        latent_dim   = config.get("latent_dim",   512),
+        context_dim  = config.get("context_dim",  512),
+        num_heads    = config.get("num_heads",     8),
+        num_layers   = config.get("num_layers",    8),
+        max_frames   = config.get("max_frames",    196),
+        ff_mult      = config.get("ff_mult",       4),
+        dropout      = config.get("dropout",       0.1),
+        text_seq_len = config.get("text_seq_len",  77),
     )
     if config.get("feature_mode") == "group":
         model = GroupDiT(**kwargs)

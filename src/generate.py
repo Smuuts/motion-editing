@@ -41,7 +41,7 @@ if src_dir not in sys.path:
     sys.path.insert(0, src_dir)
 
 from model.dit import build_model
-from model.text_encoder import CLIPTextEncoder
+from model.text_encoder import build_text_encoder, get_encoder_dims
 from model.schedule import NoiseSchedule
 from model.sampler import DDPMSampler
 
@@ -66,12 +66,13 @@ def load_model(ckpt_dir, device, use_ema=True):
     with open(os.path.join(ckpt_dir, "config.json")) as f:
         config = json.load(f)
 
-    context_dim = 768 if "L/14" in config.get("clip_version", "ViT-B/32") else 512
+    context_dim, text_seq_len = get_encoder_dims(config)
     model = build_model({
         "feature_mode": config.get("feature_mode", "humanml3d"),
         "input_dim":    263,
         "latent_dim":   config.get("latent_dim",  512),
         "context_dim":  context_dim,
+        "text_seq_len": text_seq_len,
         "num_heads":    config.get("num_heads",   8),
         "num_layers":   config.get("num_layers",  8),
         "max_frames":   config.get("max_frames",  196),
@@ -148,7 +149,7 @@ def main():
     mean = np.load(os.path.join(args.data_root, "Mean.npy"))
     std  = np.load(os.path.join(args.data_root, "Std.npy"))
 
-    text_encoder = CLIPTextEncoder(config.get("clip_version", "ViT-B/32"), device=device)
+    text_encoder = build_text_encoder(config, device=device)
     schedule     = NoiseSchedule(timesteps=config.get("timesteps", 1000), device=device)
     sampler      = DDPMSampler(model, schedule, device)
 
@@ -160,62 +161,73 @@ def main():
     succeeded = []
     skipped   = 0
 
-    for clip in tqdm(clips, desc="Generating"):
-        cid  = clip["id"]
-        T    = clip["T"]
-        out_path = os.path.join(args.out_dir, f"{cid}.npz")
-
-        if args.resume and os.path.exists(out_path):
-            succeeded.append(cid)
-            skipped += 1
-            continue
-
-        raw_263 = np.load(clip["vec_path"])[:T]
-        gt_norm = (raw_263 - mean) / std
-
-        if clip["context_emb"] is not None:
-            ctx_np = clip["context_emb"]
-            ctx    = torch.from_numpy(ctx_np).unsqueeze(0).to(device)
-        else:
-            with torch.no_grad():
-                ctx = text_encoder.encode([clip["text"]])
-            ctx_np = ctx[0].cpu().numpy()
-
-        try:
-            with torch.no_grad():
-                gen_norm = sampler.sample(
-                    ctx,
-                    length=T,
-                    guidance_scale=args.guidance_scale,
-                    num_steps=args.num_steps,
-                    show_progress=False,
-                ).cpu().numpy()
-        except Exception as exc:
-            print(f"  [WARN] {cid}: generation failed — {exc}")
-            continue
-
-        np.savez_compressed(out_path,
-                            gen_norm=gen_norm.astype(np.float32),
-                            gt_norm=gt_norm.astype(np.float32),
-                            ctx=ctx_np.astype(np.float32),
-                            T=np.array(T, dtype=np.int32))
-        succeeded.append(cid)
-
-    print(f"\n{len(succeeded)}/{len(clips)} clips saved"
-          + (f" ({skipped} resumed)" if skipped else "") + f" → {args.out_dir}")
-
     manifest = {
         "split":          args.split,
         "checkpoint":     args.checkpoint,
         "guidance_scale": args.guidance_scale,
         "num_steps":      args.num_steps,
         "seed":           args.seed,
-        "n_clips":        len(succeeded),
-        "clip_ids":       succeeded,
+        "n_clips":        0,
+        "clip_ids":       [],
     }
-    with open(os.path.join(args.out_dir, "manifest.json"), "w") as f:
-        json.dump(manifest, f, indent=2)
-    print(f"Manifest → {os.path.join(args.out_dir, 'manifest.json')}")
+    manifest_path = os.path.join(args.out_dir, "manifest.json")
+
+    def write_manifest():
+        manifest["n_clips"]  = len(succeeded)
+        manifest["clip_ids"] = succeeded
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+        print(f"Manifest → {manifest_path}")
+
+    try:
+        for clip in tqdm(clips, desc="Generating"):
+            cid  = clip["id"]
+            T    = clip["T"]
+            out_path = os.path.join(args.out_dir, f"{cid}.npz")
+
+            if args.resume and os.path.exists(out_path):
+                succeeded.append(cid)
+                skipped += 1
+                continue
+
+            raw_263 = np.load(clip["vec_path"])[:T]
+            gt_norm = (raw_263 - mean) / std
+
+            if clip["context_emb"] is not None:
+                ctx_np = clip["context_emb"]
+                ctx    = torch.from_numpy(ctx_np).unsqueeze(0).to(device)
+            else:
+                with torch.no_grad():
+                    ctx = text_encoder.encode([clip["text"]])
+                ctx_np = ctx[0].cpu().numpy()
+
+            try:
+                with torch.no_grad():
+                    gen_norm = sampler.sample(
+                        ctx,
+                        length=T,
+                        guidance_scale=args.guidance_scale,
+                        num_steps=args.num_steps,
+                        show_progress=False,
+                    ).cpu().numpy()
+            except Exception as exc:
+                print(f"  [WARN] {cid}: generation failed — {exc}")
+                continue
+
+            np.savez_compressed(out_path,
+                                gen_norm=gen_norm.astype(np.float32),
+                                gt_norm=gt_norm.astype(np.float32),
+                                ctx=ctx_np.astype(np.float32),
+                                T=np.array(T, dtype=np.int32))
+            succeeded.append(cid)
+
+    except KeyboardInterrupt:
+        print(f"\nInterrupted — {len(succeeded)} clips saved so far.")
+
+    finally:
+        print(f"\n{len(succeeded)}/{len(clips)} clips saved"
+              + (f" ({skipped} resumed)" if skipped else "") + f" → {args.out_dir}")
+        write_manifest()
 
 
 if __name__ == "__main__":

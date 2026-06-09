@@ -30,7 +30,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 from model.dit import build_model
-from model.text_encoder import CLIPTextEncoder
+from model.text_encoder import build_text_encoder, get_encoder_dims
 from model.schedule import NoiseSchedule
 from model.sampler import DDPMSampler
 from utils.visualise import recover_from_ric, save_animation, save_comparison_animation
@@ -79,13 +79,13 @@ def load_model(ckpt_dir: str, device, use_ema: bool = True):
         config = json.load(f)
 
     feature_mode = config.get("feature_mode", "humanml3d")
-    input_dim    = 263
-    context_dim  = 768 if "L/14" in config.get("clip_version", "ViT-B/32") else 512
+    context_dim, text_seq_len = get_encoder_dims(config)
     model = build_model({
         "feature_mode": feature_mode,
-        "input_dim":    input_dim,
+        "input_dim":    263,
         "latent_dim":   config.get("latent_dim",  512),
         "context_dim":  context_dim,
+        "text_seq_len": text_seq_len,
         "num_heads":    config.get("num_heads",   8),
         "num_layers":   config.get("num_layers",  8),
         "max_frames":   config.get("max_frames",  196),
@@ -187,8 +187,7 @@ def main():
 
     mean = np.load(os.path.join(args.data_root, "Mean.npy"))
     std  = np.load(os.path.join(args.data_root, "Std.npy"))
-    clip_version  = config.get("clip_version", "ViT-B/32")
-    text_encoder  = CLIPTextEncoder(clip_version, device=device)
+    text_encoder  = build_text_encoder(config, device=device)
     schedule      = NoiseSchedule(timesteps=config.get("timesteps", 1000), device=device)
     sampler       = DDPMSampler(model, schedule, device)
 
