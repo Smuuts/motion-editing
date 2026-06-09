@@ -10,6 +10,7 @@ Two design choices support LEDITS++ editing:
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class TimestepEmbedding(nn.Module):
@@ -73,13 +74,17 @@ class CrossAttention(nn.Module):
         k = self.k(context).reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v(context).reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
 
-        attn = torch.softmax(q @ k.transpose(-2, -1) * self.scale, dim=-1)
-        attn = self.dropout(attn)
-
         if store_attn:
+            # Materialize for attention map capture (inference only — not training).
+            attn = torch.softmax(q @ k.transpose(-2, -1) * self.scale, dim=-1)
+            attn = self.dropout(attn)
             self.last_attn_map = attn.detach()
+            out = (attn @ v).transpose(1, 2).reshape(B, N, -1)
+        else:
+            dropout_p = self.dropout.p if self.training else 0.0
+            out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+            out = out.transpose(1, 2).reshape(B, N, -1)
 
-        out = (attn @ v).transpose(1, 2).reshape(B, N, -1)
         return self.out(out)
 
 
@@ -101,12 +106,15 @@ class SelfAttention(nn.Module):
         q, k, v = qkv.unbind(dim=2)
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
-        attn = q @ k.transpose(-2, -1) * self.scale
+        attn_mask = None
         if mask is not None:
-            attn = attn.masked_fill(~mask[:, None, None, :], torch.finfo(attn.dtype).min)
-        attn = self.dropout(torch.softmax(attn, dim=-1))
+            # (B, 1, 1, N) bool mask: False positions are padding and get -inf
+            attn_mask = mask[:, None, None, :]
 
-        out = (attn @ v).transpose(1, 2).reshape(B, N, -1)
+        dropout_p = self.dropout.p if self.training else 0.0
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
+        out = out.transpose(1, 2).reshape(B, N, -1)
+
         if mask is not None:
             out = out.masked_fill(~mask[:, :, None], 0.0)
         return self.out(out)
