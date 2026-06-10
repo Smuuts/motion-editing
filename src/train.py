@@ -39,9 +39,9 @@ def parse_args():
     p.add_argument("--num_heads",    type=int,   default=8)
     p.add_argument("--dropout",      type=float, default=0.1)
     p.add_argument("--clip_version", type=str,   default="ViT-B/32")
-    p.add_argument("--text_encoder", type=str,   default="clip",
+    p.add_argument("--text_encoder", type=str,   default="t5",
                    choices=["clip", "t5"],
-                   help="Text encoder backend: 'clip' (default) or 't5'.")
+                   help="Text encoder backend: 'clip' or 't5' (default).")
     p.add_argument("--t5_version",   type=str,   default="t5-base",
                    help="T5 model name (e.g. t5-base, t5-large). Used when --text_encoder=t5.")
     p.add_argument("--t5_max_length", type=int,  default=128,
@@ -73,7 +73,7 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--max_frames",   type=int,   default=196)
     p.add_argument("--num_workers",  type=int,   default=4)
-    p.add_argument("--ema_decay",    type=float, default=0.99)
+    p.add_argument("--ema_decay",    type=float, default=0.9999)
     p.add_argument("--save_every",   type=int,   default=100)
     p.add_argument("--log_every",    type=int,   default=100)
     p.add_argument("--val_every",    type=int,   default=1,
