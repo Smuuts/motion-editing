@@ -6,14 +6,15 @@ are directly comparable to MDM, MLD, MotionDiffuse, and other HumanML3D papers.
 MPJPE is also reported for internal tracking but is not a standard benchmark metric.
 
 Required files in --evaluator_dir:
-  checkpoint/finest.tar          — from T2M repo: checkpoints/t2m/text_mot_match/model/finest.tar
-  glove/our_vab_data.npy         — from T2M repo: glove/our_vab_data.npy
-  glove/our_vab_words.pkl        — from T2M repo: glove/our_vab_words.pkl
-  glove/our_vab_idx.pkl          — from T2M repo: glove/our_vab_idx.pkl
+  checkpoint/finest.tar              — text_mot_match/model/finest.tar
+  glove/our_vab_data.npy             — GloVe word vectors
+  glove/our_vab_words.pkl
+  glove/our_vab_idx.pkl
+  t2m/Comp_v6_KLD01/meta/mean.npy    — evaluator's own normalisation
+  t2m/Comp_v6_KLD01/meta/std.npy
 
-Python dependencies:
-  pip install spacy
-  python -m spacy download en_core_web_sm
+Text is read from the HumanML3D text files' pre-tagged `word/POS` tokens —
+no spaCy / re-tokenisation needed (that would shift the text embeddings).
 
 Usage:
     python src/evaluate.py \\
@@ -55,6 +56,9 @@ def parse_args():
                    help="HumanML3D root — for Mean/Std (MPJPE) and texts/ (R-Precision).")
     p.add_argument("--evaluator_dir", required=True,
                    help="Root of T2M evaluator files (e.g. data/t2m_evaluator).")
+    p.add_argument("--eval_meta_dir", default=None,
+                   help="Dir with the T2M evaluator's own Mean/std.npy "
+                        "(default: <evaluator_dir>/t2m/Comp_v6_KLD01/meta).")
     p.add_argument("--output_dir",    default="./eval_results/evaluate")
     p.add_argument("--pool_size",     type=int,   default=32)
     p.add_argument("--smooth_sigma",  type=float, default=1.5)
@@ -84,13 +88,19 @@ def load_generated(generated_dir, data_root):
             lines = [l.strip() for l in f if l.strip()]
         if not lines:
             continue
-        text = lines[0].split("#")[0].strip()
+        # HumanML3D format: caption#word/POS word/POS ...#start#end
+        # Use the pre-tagged tokens (field 1) — same preprocessing the T2M
+        # evaluator was trained on. Re-tokenising would shift the embeddings.
+        parts  = lines[0].split("#")
+        text   = parts[0].strip()
+        tokens = parts[1].strip().split() if len(parts) > 1 and parts[1].strip() else []
 
         clips.append({
             "id":       cid,
             "gen_norm": data["gen_norm"],   # (T, 263)
             "gt_norm":  data["gt_norm"],    # (T, 263)
             "text":     text,
+            "tokens":   tokens,
             "T":        int(data["T"]),
         })
     return clips, manifest
@@ -172,6 +182,19 @@ def main():
     mean = np.load(os.path.join(args.data_root, "Mean.npy"))
     std  = np.load(os.path.join(args.data_root, "Std.npy"))
 
+    # The T2M evaluator was trained with its OWN normalisation, which differs
+    # from the HumanML3D training Mean/Std. Motions must be denormalised to raw
+    # then renormalised with the evaluator's stats before encoding, otherwise
+    # cross-modal alignment (R-Precision) collapses.
+    eval_meta = args.eval_meta_dir or os.path.join(
+        args.evaluator_dir, "t2m", "Comp_v6_KLD01", "meta")
+    eval_mean = np.load(os.path.join(eval_meta, "mean.npy"))
+    eval_std  = np.load(os.path.join(eval_meta, "std.npy"))
+
+    def to_eval_norm(motion_hml_norm):
+        raw = motion_hml_norm * std + mean
+        return ((raw - eval_mean) / eval_std).astype(np.float32)
+
     # ── MPJPE (non-standard, internal tracking only) ───────────────────────────
     print("\n── MPJPE (internal, not comparable to literature) ──────────────────────────")
     mpjpe_values = []
@@ -191,13 +214,13 @@ def main():
 
     # ── T2M embeddings ────────────────────────────────────────────────────────
     print("\n── Encoding motions and texts …")
-    gen_motions = [c["gen_norm"] for c in clips]
-    gt_motions  = [c["gt_norm"]  for c in clips]
-    texts       = [c["text"]     for c in clips]
+    gen_motions = [to_eval_norm(c["gen_norm"]) for c in clips]
+    gt_motions  = [to_eval_norm(c["gt_norm"])  for c in clips]
+    token_lists = [c["tokens"] for c in clips]
 
     gen_embs  = evaluator.encode_motion(tqdm(gen_motions, desc="  gen motions"))
     gt_embs   = evaluator.encode_motion(tqdm(gt_motions,  desc="  gt  motions"))
-    text_embs = evaluator.encode_text(texts)
+    text_embs = evaluator.encode_text(token_lists)
     print(f"  embedding dim: {gen_embs.shape[1]}")
 
     # ── FID ───────────────────────────────────────────────────────────────────
