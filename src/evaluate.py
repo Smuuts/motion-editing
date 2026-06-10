@@ -61,6 +61,8 @@ def parse_args():
                         "(default: <evaluator_dir>/t2m/Comp_v6_KLD01/meta).")
     p.add_argument("--output_dir",    default="./eval_results/evaluate")
     p.add_argument("--pool_size",     type=int,   default=32)
+    p.add_argument("--diversity_times", type=int, default=300,
+                   help="Number of random pairs for the Diversity metric.")
     p.add_argument("--smooth_sigma",  type=float, default=1.5)
     p.add_argument("--seed",          type=int,   default=42)
     return p.parse_args()
@@ -153,6 +155,27 @@ def compute_r_precision(motion_embs, text_embs, pool_size=32, top_k=(1, 2, 3), s
     return {k: counts[k] / N for k in top_k}
 
 
+# ── Multimodal Distance ─────────────────────────────────────────────────────────
+
+def compute_mm_dist(motion_embs, text_embs):
+    """Mean Euclidean distance between each motion and its own caption embedding.
+    Lower = better text-motion alignment (R-Precision's continuous counterpart)."""
+    return float(np.sqrt(((motion_embs - text_embs) ** 2).sum(axis=-1)).mean())
+
+
+# ── Diversity ───────────────────────────────────────────────────────────────────
+
+def compute_diversity(motion_embs, diversity_times=300, seed=0):
+    """Mean distance between randomly paired motion embeddings.
+    Detects mode collapse — should be close to the ground-truth diversity."""
+    n     = len(motion_embs)
+    times = min(diversity_times, n)
+    rng   = np.random.default_rng(seed)
+    first  = rng.choice(n, times, replace=False)
+    second = rng.choice(n, times, replace=False)
+    return float(np.sqrt(((motion_embs[first] - motion_embs[second]) ** 2).sum(axis=-1)).mean())
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -236,6 +259,17 @@ def main():
     for k, v in sorted(r_prec.items()):
         print(f"R-Prec@{k} {v:.4f}")
 
+    # ── Multimodal Distance ────────────────────────────────────────────────────
+    print("\n── Multimodal Distance ─────────────────────────────────────────────────────")
+    mm_dist = compute_mm_dist(gen_embs, text_embs)
+    print(f"MM-Dist {mm_dist:.4f}  (lower = better; distance to own caption)")
+
+    # ── Diversity ──────────────────────────────────────────────────────────────
+    print("\n── Diversity ───────────────────────────────────────────────────────────────")
+    div_gen = compute_diversity(gen_embs, args.diversity_times, seed=args.seed)
+    div_gt  = compute_diversity(gt_embs,  args.diversity_times, seed=args.seed)
+    print(f"Diversity (gen) {div_gen:.4f}   (real motions: {div_gt:.4f} — closer is better)")
+
     # ── Save ──────────────────────────────────────────────────────────────────
     summary = {
         "generated_dir": args.generated_dir,
@@ -245,7 +279,11 @@ def main():
         "mpjpe_std_mm":  round(float(mpjpe_arr.std()  * 1000), 4),
         "fid":           round(fid, 6),
         "r_precision":   {f"top_{k}": round(v, 6) for k, v in r_prec.items()},
+        "mm_dist":       round(mm_dist, 6),
+        "diversity":     round(div_gen, 6),
+        "diversity_gt":  round(div_gt, 6),
         "pool_size":     effective_pool,
+        "diversity_times": min(args.diversity_times, N),
         "generation_args": {k: v for k, v in manifest.items() if k != "clip_ids"},
     }
     out_json = os.path.join(args.output_dir, "results.json")
