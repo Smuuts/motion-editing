@@ -21,7 +21,8 @@ Usage:
         --generated_dir generated/val \\
         --data_root     data/HumanML3D \\
         --evaluator_dir data/t2m_evaluator \\
-        [--output_dir   eval_results/val] \\
+        --experiment_name val \\
+        [--output_dir   eval_results] \\
         [--pool_size 32] \\
         [--smooth_sigma 1.5] \\
         [--seed 42]
@@ -56,10 +57,13 @@ def parse_args():
                    help="HumanML3D root — for Mean/Std (MPJPE) and texts/ (R-Precision).")
     p.add_argument("--evaluator_dir", required=True,
                    help="Root of T2M evaluator files (e.g. data/t2m_evaluator).")
+    p.add_argument("--experiment_name", required=True,
+                   help="Experiment name — results are written to "
+                        "<output_dir>/results_<experiment_name>.json.")
     p.add_argument("--eval_meta_dir", default=None,
                    help="Dir with the T2M evaluator's own Mean/std.npy "
                         "(default: <evaluator_dir>/t2m/Comp_v6_KLD01/meta).")
-    p.add_argument("--output_dir",    default="./eval_results/evaluate")
+    p.add_argument("--output_dir",    default="./eval_results")
     p.add_argument("--pool_size",     type=int,   default=32)
     p.add_argument("--diversity_times", type=int, default=300,
                    help="Number of random pairs for the Diversity metric.")
@@ -286,7 +290,7 @@ def main():
         "diversity_times": min(args.diversity_times, N),
         "generation_args": {k: v for k, v in manifest.items() if k != "clip_ids"},
     }
-    out_json = os.path.join(args.output_dir, "results.json")
+    out_json = os.path.join(args.output_dir, f"results_{args.experiment_name}.json")
     with open(out_json, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"\nResults → {out_json}")

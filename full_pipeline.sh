@@ -29,7 +29,7 @@ SPLIT="val"
 OUTPUT_DIR="runs/${EXP_NAME}"
 CHECKPOINT="${OUTPUT_DIR}/checkpoint_latest"
 GENERATION_DIR="generated/${EXP_NAME}"
-EVAL_DIR="eval_results/${EXP_NAME}"
+EVAL_DIR="eval_results"
 
 # ----------------------------------------------------------------------
 # Helpers
@@ -68,11 +68,12 @@ python src/generate.py \
 # ----------------------------------------------------------------------
 # 3. Evaluate
 # ----------------------------------------------------------------------
-log "Evaluating -> ${EVAL_DIR}"
+log "Evaluating -> ${EVAL_DIR}/results_${EXP_NAME}.json"
 python src/evaluate.py \
-  --generated_dir  "${GENERATION_DIR}" \
-  --data_root      "${DATA_ROOT}" \
-  --evaluator_dir  "${EVALUATOR_DIR}" \
-  --output_dir     "${EVAL_DIR}"
+  --generated_dir    "${GENERATION_DIR}" \
+  --data_root        "${DATA_ROOT}" \
+  --evaluator_dir    "${EVALUATOR_DIR}" \
+  --experiment_name  "${EXP_NAME}" \
+  --output_dir       "${EVAL_DIR}"
 
-log "Pipeline complete. Results in ${EVAL_DIR}"
+log "Pipeline complete. Results in ${EVAL_DIR}/results_${EXP_NAME}.json"
