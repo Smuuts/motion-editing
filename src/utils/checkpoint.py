@@ -15,7 +15,7 @@ def save_checkpoint(output_dir, epoch, model, ema, optimizer, scheduler, config)
     latest = os.path.join(output_dir, "checkpoint_latest")
     if os.path.islink(latest):
         os.remove(latest)
-    os.symlink(ckpt_dir, latest)
+    os.symlink(os.path.basename(ckpt_dir), latest)
     print(f"  Saved checkpoint: {ckpt_dir}")
 
 

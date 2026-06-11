@@ -26,7 +26,7 @@ from utils.logger import Logger
 from utils.skeleton import hml3d_geometric_losses
 
 
-def parse_args():
+def build_parser():
     p = argparse.ArgumentParser()
     p.add_argument("--data_root",    required=True, default="./data/HumanML3D")
     p.add_argument("--output_dir",   default="./runs/exp_1")
@@ -85,8 +85,22 @@ def parse_args():
 
     # resume
     p.add_argument("--resume",       type=str,   default=None,
-                   help="Path to a checkpoint directory to resume from.")
-    return p.parse_args()
+                   help="Path to a checkpoint directory to resume from. "
+                        "When set, missing args are filled from the saved "
+                        "config.json in --output_dir (explicit CLI args still win).")
+    return p
+
+
+def parse_args():
+    return build_parser().parse_args()
+
+
+def explicit_cli_keys():
+    """Return the set of arg dest names that were explicitly passed on the CLI."""
+    p = build_parser()
+    for action in p._actions:
+        action.default = argparse.SUPPRESS
+    return set(vars(p.parse_args()).keys())
 
 
 def _save_figure(path, title, ylabel, *series):
@@ -275,14 +289,33 @@ def validate_one_epoch(
 
 def main():
     args = parse_args()
-    print("Training MotionDiT with config:")
-    for k, v in vars(args).items():
-        print(f"  {k}: {v}")
 
     config = vars(args)
     if args.config:
         with open(args.config) as f:
             config.update(json.load(f))
+
+    # On resume, treat the saved config in --output_dir as the base so model
+    # architecture etc. need not be re-specified. Explicit CLI args still win,
+    # and resume/output_dir are kept so the resume itself isn't clobbered.
+    if args.resume:
+        saved_path = os.path.join(args.output_dir, "config.json")
+        if os.path.exists(saved_path):
+            with open(saved_path) as f:
+                saved = json.load(f)
+            cli_keys = explicit_cli_keys()
+            preserved = cli_keys | {"resume", "output_dir"}
+            for k, v in saved.items():
+                if k not in preserved:
+                    config[k] = v
+            print(f"Resume: loaded config from {saved_path} "
+                  f"(overridden by CLI args: {sorted(cli_keys - {'resume', 'output_dir'})})")
+        else:
+            print(f"Resume: no saved config at {saved_path}, using CLI args only.")
+
+    print("Training MotionDiT with config:")
+    for k, v in config.items():
+        print(f"  {k}: {v}")
 
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "config.json"), "w") as f:
