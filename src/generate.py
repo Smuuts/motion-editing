@@ -149,7 +149,8 @@ def main():
     mean = np.load(os.path.join(args.data_root, "Mean.npy"))
     std  = np.load(os.path.join(args.data_root, "Std.npy"))
 
-    text_encoder = build_text_encoder(config, device=device)
+    # Built lazily: only needed for clips without a precomputed text embedding.
+    text_encoder = None
     schedule     = NoiseSchedule(timesteps=config.get("timesteps", 1000), device=device)
     sampler      = DDPMSampler(model, schedule, device)
 
@@ -197,6 +198,8 @@ def main():
                 ctx_np = clip["context_emb"]
                 ctx    = torch.from_numpy(ctx_np).unsqueeze(0).to(device)
             else:
+                if text_encoder is None:
+                    text_encoder = build_text_encoder(config, device=device)
                 with torch.no_grad():
                     ctx = text_encoder.encode([clip["text"]])
                 ctx_np = ctx[0].cpu().numpy()

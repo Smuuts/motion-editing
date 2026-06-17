@@ -67,11 +67,6 @@ _TEST_PROMPTS = [
     ("a person sits down",                          None),   # whole-body control
 ]
 
-# CLIP special token IDs
-_BOS = 49406
-_EOS = 49407
-_PAD = 0
-
 # Tokens that dominate HumanML3D attention due to dataset frequency ("a person ...")
 # rather than semantic content.  The M1 mask (Phase 2) must exclude these — otherwise
 # "a" / "person" absorb most of the attention weight and make the mask uniform.
@@ -85,17 +80,6 @@ _STOP_WORDS = {
     "up", "down", "forward", "backward", "side", "out",
     "slowly", "quickly", "slightly",
 }
-
-try:
-    from clip.simple_tokenizer import SimpleTokenizer as _CLIPTokenizer
-    _vocab_inv = {v: k for k, v in _CLIPTokenizer().encoder.items()}
-
-    def _decode(tid: int) -> str:
-        return _vocab_inv.get(tid, f"[{tid}]").replace("</w>", "")
-except Exception:
-    def _decode(tid: int) -> str:
-        return str(tid)
-
 
 def _load_model(ckpt_dir: str, device):
     config_path = os.path.join(ckpt_dir, "config.json")
@@ -121,30 +105,6 @@ def _load_model(ckpt_dir: str, device):
     )
     model.eval()
     return model, config
-
-
-def get_content_token_info(prompt: str):
-    """
-    Tokenise prompt with CLIP and return (indices, labels) for content tokens,
-    i.e. excluding BOS, EOS, and padding positions.
-    indices : list[int]  — positions in [0, 77) to index into L_text dimension
-    labels  : list[str]  — decoded string for each position
-    """
-    try:
-        import clip
-        token_ids = clip.tokenize([prompt])[0]  # (77,) int32
-    except ImportError:
-        return list(range(1, 10)), [f"tok{i}" for i in range(1, 10)]
-
-    idxs, labels = [], []
-    for pos, tid in enumerate(token_ids.tolist()):
-        if tid == _BOS or tid == _PAD:
-            continue
-        if tid == _EOS:
-            break
-        idxs.append(pos)
-        labels.append(_decode(tid))
-    return idxs, labels
 
 
 def get_semantic_token_info(all_idxs: list[int], all_labels: list[str]):
@@ -410,8 +370,10 @@ def main():
     for i, (prompt, expected_group) in enumerate(_TEST_PROMPTS):
         print(f"[{i+1}/{len(_TEST_PROMPTS)}] \"{prompt}\"")
 
-        context = text_encoder.encode([prompt] * B)     # (B, 77, dim)
-        content_idxs, content_labels = get_content_token_info(prompt)
+        context = text_encoder.encode([prompt] * B)     # (B, L_text, dim)
+        # token_info() comes from the encoder itself, so the selected column
+        # positions match this encoder's L_text dimension (CLIP=77 or T5=max_length).
+        content_idxs, content_labels = text_encoder.token_info(prompt)
         sem_idxs, sem_labels = get_semantic_token_info(content_idxs, content_labels)
         print(f"  All tokens:      {content_labels}")
         print(f"  Semantic tokens: {sem_labels}")

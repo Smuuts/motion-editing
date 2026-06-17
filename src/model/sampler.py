@@ -20,7 +20,6 @@ LEDITS++ implementation will extend this class with two additional methods:
 """
 
 import torch
-import torch.nn.functional as F
 from tqdm import tqdm
 
 
@@ -72,30 +71,6 @@ class DDPMSampler:
             # DDPM reverse step. For LEDITS++ Stage 3: after this step, frames
             # whose mask column is all-zero must be overwritten with
             # schedule.q_sample(x0_source, t-1) to guarantee zero drift.
-            x = self._ddpm_step(x, t_batch, eps)
+            x = self.schedule.p_sample(x, t_batch, eps)
 
         return x[0]  # (length, 263)
-
-    def _ddpm_step(self, x_t, t, eps_pred):
-        """One step of the DDPM reverse process."""
-        s = self.schedule
-
-        beta_t        = s.betas[t][:, None, None]
-        alpha_t       = s.alphas[t][:, None, None]
-        acp_t         = s.alphas_cumprod[t][:, None, None]
-        sqrt_omacp_t  = s.sqrt_one_minus_alphas_cumprod[t][:, None, None]
-
-        # predicted x0
-        x0_pred = (x_t - sqrt_omacp_t * eps_pred) / acp_t.sqrt()
-        x0_pred = x0_pred.clamp(-5, 5)  # stability clip
-
-        # posterior mean
-        nonzero_t = (t > 0).float()[:, None, None]
-        denom = (1 - acp_t).clamp(min=1e-8)
-        coef1 = (s.alphas_cumprod_prev[t][:, None, None].sqrt() * beta_t) / denom
-        coef2 = (alpha_t.sqrt() * (1 - s.alphas_cumprod_prev[t][:, None, None])) / denom
-        mean  = coef1 * x0_pred + coef2 * x_t
-
-        noise = torch.randn_like(x_t)
-        var   = s.posterior_variance[t][:, None, None]
-        return torch.where(nonzero_t > 0, mean + var.sqrt() * noise, x0_pred)

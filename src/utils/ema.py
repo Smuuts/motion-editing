@@ -7,10 +7,12 @@ the online model and typically gives better sample quality.
 Usage:
     ema = EMA(model, decay=0.9999)
     # after each optimizer.step():
-    ema.update()
-    # for inference:
-    with ema.average_parameters():
-        output = model(...)
+    ema.update_from(model)
+    # for inference / evaluation, use the maintained shadow model directly:
+    output = ema.ema_model(...)
+
+LEDITS++ note: all inference passes (inversion + editing) use ema_model, loaded
+from checkpoint_latest/ema.pt rather than model.pt.
 """
 
 from copy import deepcopy
@@ -25,10 +27,6 @@ class EMA:
         self.ema_model.eval()
         for p in self.ema_model.parameters():
             p.requires_grad_(False)
-
-    @torch.no_grad()
-    def update(self):
-        pass  # updated via update_from below
 
     @torch.no_grad()
     def update_from(self, online_model: nn.Module):

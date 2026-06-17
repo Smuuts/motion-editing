@@ -1,5 +1,6 @@
 import os
 import json
+import shutil
 import torch
 
 
@@ -13,8 +14,11 @@ def save_checkpoint(output_dir, epoch, model, ema, optimizer, scheduler, config)
     with open(os.path.join(ckpt_dir, "config.json"), "w") as f:
         json.dump({**config, "epoch": epoch}, f, indent=2)
     latest = os.path.join(output_dir, "checkpoint_latest")
-    if os.path.islink(latest):
+    # Clear any existing pointer — symlink, or a stray file/dir from an aborted run.
+    if os.path.islink(latest) or os.path.isfile(latest):
         os.remove(latest)
+    elif os.path.isdir(latest):
+        shutil.rmtree(latest)
     os.symlink(os.path.basename(ckpt_dir), latest)
     print(f"  Saved checkpoint: {ckpt_dir}")
 

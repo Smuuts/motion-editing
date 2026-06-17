@@ -239,6 +239,7 @@ def train_one_epoch(
 @torch.no_grad()
 def validate_one_epoch(
     ema_model, text_encoder, schedule, loader, device, epoch,
+    snr_gamma=5.0,
     hml3d_stats=None, hml3d_pos_weight=0.0, hml3d_vel_weight=0.0, hml3d_foot_weight=0.0,
 ):
     ema_model.eval()
@@ -268,7 +269,18 @@ def validate_one_epoch(
         with autocast(device_type=device.type):
             prediction = ema_model(x_t, t, context, mask=attn_mask)
             loss_mask = attn_mask.float().unsqueeze(-1)
-            loss = ((noise - prediction) ** 2 * loss_mask).sum() / (loss_mask.sum() * noise.shape[-1])
+            per_elem  = (noise - prediction) ** 2 * loss_mask
+
+            # Mirror train_one_epoch's objective so the train/val curves are the
+            # same quantity and can be overlaid in training_loss.png.
+            if snr_gamma > 0.0:
+                valid_elems = (attn_mask.float().sum(dim=1) * noise.shape[-1]).clamp(min=1)
+                per_sample  = per_elem.sum(dim=(1, 2)) / valid_elems
+                snr_t       = schedule.snr[t]
+                snr_weight  = snr_t.clamp(max=snr_gamma) / snr_t
+                loss = (per_sample * snr_weight).mean()
+            else:
+                loss = per_elem.sum() / (loss_mask.sum() * noise.shape[-1]).clamp(min=1)
 
         if hml3d_stats is not None:
             x0_pred = schedule.predict_x0_from_eps(x_t, t, prediction.float())
@@ -445,6 +457,7 @@ def main():
             rng_gpu = torch.cuda.get_rng_state(device) if device.type == "cuda" else None
             val_loss = validate_one_epoch(
                 ema.ema_model, text_encoder, schedule, val_loader, device, epoch,
+                snr_gamma=args.snr_gamma,
                 hml3d_stats=hml3d_geo_stats,
                 hml3d_pos_weight=args.hml3d_pos_weight,
                 hml3d_vel_weight=args.hml3d_vel_weight,

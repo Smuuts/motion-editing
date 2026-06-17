@@ -21,7 +21,11 @@ if __name__ == "__main__":
 
     print("Sample keys:", sample.keys())
     print("Motion shape:", sample["motion"].shape)
-    print("Context shape:", sample["context"].shape)
+    # "context" only present when precomputed text_emb/ exists; otherwise "text".
+    if "context" in sample:
+        print("Context shape:", sample["context"].shape)
+    else:
+        print("Text:", sample["text"])
     print("Length:", sample["length"])
     print("ID:", sample["id"])
 

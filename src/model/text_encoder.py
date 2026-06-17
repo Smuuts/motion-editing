@@ -10,8 +10,17 @@ Both return (B, L, dim) per-token embeddings compatible with the cross-attention
 in MotionDiT / GroupDiT.  Both expose:
   encoder.dim         — embedding dimension (int)
   encoder.max_length  — fixed sequence length L (int)
-  encoder.encode(texts, dropout_prob) -> (B, L, dim)
-  encoder.null_embedding(batch_size)  -> (B, L, dim) all-zero
+  encoder.encode(texts)        -> (B, L, dim)
+  encoder.token_info(text)     -> (positions, labels) of content tokens
+
+token_info() is the tokenizer-agnostic entry point LEDITS++ Stage 2 uses to pick
+which columns of the L_text attention dimension belong to real instruction words
+(excluding BOS/EOS/padding) — see analyse_attention.py and the M1 mask.
+
+The unconditional ("null") branch is NOT provided here: the model owns a learned
+null_text_emb (used via context=None), which is what CFG dropout trains. A zero
+embedding is deliberately not exposed so callers cannot accidentally substitute a
+different null than the one the model was trained with.
 
 Use build_text_encoder(config, device) to select the backend from a config dict.
 Use get_encoder_dims(config) -> (dim, seq_len) to derive model build kwargs
@@ -62,6 +71,15 @@ class CLIPTextEncoder(nn.Module):
         self.model.eval()
         self.tokenize = clip.tokenize
 
+        # CLIP special token ids (fixed by the BPE vocabulary)
+        self._bos, self._eos, self._pad = 49406, 49407, 0
+        try:
+            from clip.simple_tokenizer import SimpleTokenizer
+            decoder = SimpleTokenizer().decoder
+            self._decode_tok = lambda tid: decoder.get(tid, f"[{tid}]").replace("</w>", "")
+        except Exception:
+            self._decode_tok = lambda tid: str(tid)
+
         # embedding dim: ViT-B/32 -> 512, ViT-L/14 -> 768
         self.dim = self.model.token_embedding.embedding_dim
         self.max_length = 77
@@ -71,16 +89,8 @@ class CLIPTextEncoder(nn.Module):
             p.requires_grad_(False)
 
     @torch.no_grad()
-    def encode(self, texts: list[str], dropout_prob: float = 0.0) -> torch.Tensor:
-        """
-        Encode a list of strings into per-token embeddings.
-
-        texts         : list of B strings
-        dropout_prob  : fraction of items in the batch to replace with null
-                        embeddings (classifier-free guidance training)
-
-        Returns (B, 77, dim).
-        """
+    def encode(self, texts: list[str]) -> torch.Tensor:
+        """Encode B strings into per-token embeddings. Returns (B, 77, dim)."""
         tokens = self.tokenize(texts, truncate=True).to(self.device)
 
         # extract per-token features from the transformer
@@ -90,22 +100,26 @@ class CLIPTextEncoder(nn.Module):
         x = self.model.transformer(x)
         x = x.permute(1, 0, 2)
         x = self.model.ln_final(x).type(self.model.dtype)
-        context = x.float()  # (B, 77, dim)
+        return x.float()  # (B, 77, dim)
 
-        # classifier-free guidance: zero out some embeddings during training
-        if dropout_prob > 0.0:
-            mask = torch.rand(len(texts), device=self.device) < dropout_prob
-            context[mask] = 0.0
+    def token_info(self, text: str) -> tuple[list[int], list[str]]:
+        """
+        Return (positions, labels) of content tokens — excluding BOS, EOS and
+        padding — as they appear in encode()'s L_text (=77) dimension.
 
-        # LEDITS++ Stage 2 mask M1: to average attention only over edit-instruction
-        # tokens (not BOS, EOS, or padding), call self.tokenize() on the edit text
-        # and find the non-zero token IDs; their positions in [0, 77) are the indices
-        # to select from the L_text dimension of the stored cross-attention maps.
-        return context
-
-    def null_embedding(self, batch_size: int) -> torch.Tensor:
-        """Return all-zero context for unconditional forward passes."""
-        return torch.zeros(batch_size, self.max_length, self.dim, device=self.device)
+        LEDITS++ Stage 2 mask M1 averages the stored cross-attention maps over
+        exactly these column positions.
+        """
+        token_ids = self.tokenize([text], truncate=True)[0].tolist()  # (77,)
+        idxs, labels = [], []
+        for pos, tid in enumerate(token_ids):
+            if tid == self._bos or tid == self._pad:
+                continue
+            if tid == self._eos:
+                break
+            idxs.append(pos)
+            labels.append(self._decode_tok(tid))
+        return idxs, labels
 
 
 class T5TextEncoder(nn.Module):
@@ -142,16 +156,8 @@ class T5TextEncoder(nn.Module):
             p.requires_grad_(False)
 
     @torch.no_grad()
-    def encode(self, texts: list[str], dropout_prob: float = 0.0) -> torch.Tensor:
-        """
-        Encode a list of strings into per-token embeddings.
-
-        texts         : list of B strings
-        dropout_prob  : fraction of items in the batch to replace with null
-                        embeddings (classifier-free guidance training)
-
-        Returns (B, max_length, dim).
-        """
+    def encode(self, texts: list[str]) -> torch.Tensor:
+        """Encode B strings into per-token embeddings. Returns (B, max_length, dim)."""
         enc = self.tokenizer(
             texts,
             max_length=self.max_length,
@@ -166,17 +172,25 @@ class T5TextEncoder(nn.Module):
         context = out.last_hidden_state.float()  # (B, max_length, dim)
 
         # zero out padding positions so they don't pollute cross-attention
-        context = context * attention_mask[:, :, None].float()
+        return context * attention_mask[:, :, None].float()
 
-        if dropout_prob > 0.0:
-            mask = torch.rand(len(texts), device=self.device) < dropout_prob
-            context[mask] = 0.0
-
-        return context
-
-    def null_embedding(self, batch_size: int) -> torch.Tensor:
-        """Return all-zero context for unconditional forward passes."""
-        return torch.zeros(batch_size, self.max_length, self.dim, device=self.device)
+    def token_info(self, text: str) -> tuple[list[int], list[str]]:
+        """
+        Return (positions, labels) of content tokens — excluding the EOS sentinel
+        and padding — as they appear in encode()'s L_text (=max_length) dimension.
+        T5 has no BOS token. Sub-word pieces keep their own positions; the SentencePiece
+        word-boundary marker (▁) is rendered as a leading space and stripped.
+        """
+        ids = self.tokenizer(
+            [text], max_length=self.max_length, truncation=True
+        )["input_ids"][0]
+        idxs, labels = [], []
+        for pos, tid in enumerate(ids):
+            if tid == self.tokenizer.pad_token_id or tid == self.tokenizer.eos_token_id:
+                continue
+            idxs.append(pos)
+            labels.append(self.tokenizer.convert_ids_to_tokens(tid).replace("▁", " ").strip())
+        return idxs, labels
 
 
 def build_text_encoder(config: dict, device="cpu") -> "CLIPTextEncoder | T5TextEncoder":

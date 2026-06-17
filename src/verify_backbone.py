@@ -155,7 +155,7 @@ def main():
             eps_c  = model(x_t, t_batch, contexts, mask=attn_mask)
             x0_c   = schedule.predict_x0_from_eps(x_t, t_batch, eps_c)
             mpjpe_c = compute_mpjpe(
-                x0_c, motions, mean_t, std_t, feature_mode, mask=attn_mask
+                x0_c, motions, mean_t, std_t, mask=attn_mask
             ).item()
 
             # Unconditional: context=None → model uses null_text_emb
@@ -163,7 +163,7 @@ def main():
             eps_u  = model(x_t, t_batch, context=None, mask=attn_mask)
             x0_u   = schedule.predict_x0_from_eps(x_t, t_batch, eps_u)
             mpjpe_u = compute_mpjpe(
-                x0_u, motions, mean_t, std_t, feature_mode, mask=attn_mask
+                x0_u, motions, mean_t, std_t, mask=attn_mask
             ).item()
 
             # Noise MSE — should be well below 1.0 (random baseline)

@@ -56,7 +56,8 @@ class NoiseSchedule:
         Forward process: add noise to x0 at timestep t.
         x0   : (B, T, D)
         t    : (B,) integer timesteps
-        Returns x_t of the same shape as x0.
+        Returns (x_t, noise), both the same shape as x0. The noise is returned
+        so the training loss can regress against the exact epsilon target.
 
         LEDITS++ Stage 1: edit-friendly inversion runs the forward process in
         reverse (t=0 → t=N), stepping x_t → x_{t+1} at each inversion step.
@@ -89,6 +90,23 @@ class NoiseSchedule:
         sqrt_omacp = self.sqrt_one_minus_alphas_cumprod[t][:, None, None]
         return (x_t - sqrt_omacp * eps) / sqrt_acp
 
+    def posterior_mean(self, x0, x_t, t):
+        """DDPM posterior mean μ̃_t(x0, x_t) = E[x_{t-1} | x_t, x0].
+
+        Shared by p_sample (reverse sampling) and the edit-friendly inversion
+        (LEDITS++ Stage 1), so both define x_{t-1} consistently. x0 is the
+        (predicted or true) clean signal; x_t the current noisy sample.
+        """
+        beta_t   = self.betas[t][:, None, None]
+        alpha_t  = self.alphas[t][:, None, None]
+        acp_t    = self.alphas_cumprod[t][:, None, None]
+        acp_prev = self.alphas_cumprod_prev[t][:, None, None]
+
+        denom = (1 - acp_t).clamp(min=1e-8)
+        coef1 = (acp_prev.sqrt() * beta_t) / denom
+        coef2 = (alpha_t.sqrt() * (1 - acp_prev)) / denom
+        return coef1 * x0 + coef2 * x_t
+
     def p_sample(self, x_t, t, eps_pred):
         """Reverse DDPM step: compute x_{t-1} from x_t and predicted noise.
 
@@ -97,23 +115,12 @@ class NoiseSchedule:
         column is all-zero must be overwritten with q_sample(x0_source, t-1) — the
         source motion noised to t-1 — to guarantee zero drift on unedited frames.
         """
-        beta_t       = self.betas[t][:, None, None]
-        alpha_t      = self.alphas[t][:, None, None]
-        acp_t        = self.alphas_cumprod[t][:, None, None]
-        sqrt_omacp_t = self.sqrt_one_minus_alphas_cumprod[t][:, None, None]
+        x0_pred = self.predict_x0_from_eps(x_t, t, eps_pred).clamp(-5, 5)
+        mean    = self.posterior_mean(x0_pred, x_t, t)
 
-        x0_pred = (x_t - sqrt_omacp_t * eps_pred) / acp_t.sqrt()
-        x0_pred = x0_pred.clamp(-5, 5)
-
-        # alphas_cumprod[0] == 1.0 exactly, so 1-acp_t == 0 at t=0.
-        # Guard the denominator; the t==0 branch never uses mean anyway.
+        # alphas_cumprod[0] == 1.0 exactly, so 1-acp_t == 0 at t=0 → posterior
+        # is degenerate; return x0_pred directly there.
         nonzero_t = (t > 0).float()[:, None, None]
-        denom = (1 - acp_t).clamp(min=1e-8)
-        coef1 = (self.alphas_cumprod_prev[t][:, None, None].sqrt() * beta_t) / denom
-        coef2 = (alpha_t.sqrt() * (1 - self.alphas_cumprod_prev[t][:, None, None])) / denom
-        mean = coef1 * x0_pred + coef2 * x_t
-
         noise = torch.randn_like(x_t)
         var = self.posterior_variance[t][:, None, None]
-        # At t=0 the posterior is degenerate; return x0_pred directly.
         return torch.where(nonzero_t > 0, mean + var.sqrt() * noise, x0_pred)
