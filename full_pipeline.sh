@@ -9,7 +9,7 @@ set -euo pipefail
 # ----------------------------------------------------------------------
 LEARNING_RATE=1e-4
 EXP_NAME="exp_test"
-DATA_ROOT="data/HumanML3D"
+DATA_ROOT="data/HumanML3D/HumanML3D"   # processed dataset lives inside the HumanML3D submodule
 EVALUATOR_DIR="data/t2m_evaluator"
 FEATURE_MODE="humanml3d"
 TEXT_ENCODER="t5"

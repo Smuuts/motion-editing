@@ -1,0 +1,6 @@
+[submodule "data/HumanML3D"]
+	path = data/HumanML3D
+	url = git@github.com:EricGuo5513/HumanML3D.git
+[submodule "data/motionfix"]
+	path = data/motionfix
+	url = https://github.com/athn-nik/motionfix.git
