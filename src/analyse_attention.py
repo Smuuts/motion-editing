@@ -122,14 +122,20 @@ def get_semantic_token_info(all_idxs: list[int], all_labels: list[str]):
     return sem_idxs, sem_labels
 
 
-def extract_and_aggregate(model, x_t, t_batch, context, mask, F: int, G: int | None):
+def extract_per_layer_head(model, x_t, t_batch, context, mask, F: int, G: int | None):
     """
-    Run one forward pass with store_attn=True, collect per-layer maps,
-    and return a single averaged array.
+    Run one forward pass with store_attn=True, collect per-layer maps, and average
+    over the batch only — keeping the layer and head axes so the grand mean over
+    (layer, head) can be decomposed.
+
+    The default grand-mean view averages over all layers AND heads, which washes
+    out grounding that, if present, tends to live in a few mid-stack heads
+    (cf. prompt-to-prompt / LEDITS++). Returning the (L, H, ...) tensor lets the
+    caller score each (layer, head) separately before collapsing.
 
     Returns:
-      GroupDiT  → (F, G, L_text)  numpy float32
-      MotionDiT → (F, L_text)     numpy float32
+      GroupDiT  → (L, H, F, G, L_text)  numpy float32
+      MotionDiT → (L, H, F, L_text)     numpy float32
     """
     with torch.no_grad():
         model(x_t, t_batch, context, store_attn=True, mask=mask)
@@ -141,152 +147,207 @@ def extract_and_aggregate(model, x_t, t_batch, context, mask, F: int, G: int | N
             "store_attn=True must be passed to the model."
         )
 
-    # Stack and average over layers, batch, heads → (N_tokens, L_text)
     stacked = torch.stack(layer_maps, dim=0).float()  # (L, B, H, N, L_text)
-    avg = stacked.mean(dim=(0, 1, 2))                 # (N_tokens, L_text)
+    avg_b   = stacked.mean(dim=1)                      # (L, H, N, L_text)
+    L, H, _, _ = avg_b.shape
 
     if G is not None:
-        return avg.reshape(F, G, -1).cpu().numpy()   # (F, G, L_text)
+        return avg_b.reshape(L, H, F, G, -1).cpu().numpy()  # (L, H, F, G, L_text)
     else:
-        return avg.reshape(F, -1).cpu().numpy()      # (F, L_text)
+        return avg_b.reshape(L, H, F, -1).cpu().numpy()     # (L, H, F, L_text)
+
+
+def extract_avg_per_layer_head(model, schedule, motions, timesteps, context, mask,
+                               F: int, G: int | None):
+    """
+    Per-(layer, head) attention averaged over multiple denoise steps.
+
+    For each t in `timesteps` the motions are re-noised to t (q_sample) and one
+    forward pass is run; the maps are averaged over the sweep. This mirrors how the
+    editing pipeline builds its mask — by averaging attention over the inversion
+    trajectory — whereas extract_per_layer_head uses a single fixed noise level.
+
+    Returns the same shape as extract_per_layer_head:
+      GroupDiT  → (L, H, F, G, L_text);  MotionDiT → (L, H, F, L_text)
+    """
+    B = motions.shape[0]
+    acc = None
+    for t in timesteps:
+        t_batch = torch.full((B,), int(t), device=motions.device, dtype=torch.long)
+        x_t, _ = schedule.q_sample(motions, t_batch)
+        maps = extract_per_layer_head(model, x_t, t_batch, context, mask, F=F, G=G)
+        acc = maps if acc is None else acc + maps
+    return acc / len(timesteps)
 
 
 def _plot_group_analysis(
-    attn_fgl: np.ndarray,           # (F, G, L_text)
+    attn_single: np.ndarray,        # (F, G, L_text) — single noise level
+    attn_avg: np.ndarray,           # (F, G, L_text) — averaged over denoise steps
     content_idxs: list[int],        # all content token positions
     content_labels: list[str],
-    sem_idxs: list[int],            # semantic-only token positions (stop words removed)
-    sem_labels: list[str],
     prompt: str,
     expected_group: str | None,
     save_path: str,
     subsample: int,
+    single_lbl: str = "single step",
+    avg_lbl: str = "averaged",
 ):
-    F, G, _ = attn_fgl.shape
+    """One figure per prompt comparing the single-step and averaged attention.
 
-    def _derive(idxs):
-        spatio     = attn_fgl[:, :, idxs].mean(axis=2)   # (F, G)
-        spatio_sub = spatio[::subsample]
-        group_prof = spatio.mean(axis=0)                  # (G,)
-        tok_group  = attn_fgl[:, :, idxs].mean(axis=0).T # (num_tok, G)
-        return spatio_sub, group_prof, tok_group
+    All panels use every content token (BOS/EOS/padding already excluded), not the
+    stop-word-filtered semantic subset.
+    """
+    G = attn_single.shape[1]
 
-    spatio_all, gprof_all, tg_all = _derive(content_idxs)
-    spatio_sem, gprof_sem, tg_sem = _derive(sem_idxs)
+    def _derive(attn):
+        spatio    = attn[:, :, content_idxs].mean(axis=2)        # (F, G)
+        return spatio[::subsample], spatio.mean(axis=0)          # (F//sub, G), (G,)
 
-    bar_colors = [
-        "tab:gray" if n == "root" else
-        ("tab:red" if n == expected_group else "steelblue")
-        for n in GROUP_NAMES
-    ]
-    frame_ticks = list(range(0, spatio_all.shape[0], max(1, spatio_all.shape[0] // 10)))
+    spatio_s, gprof_s = _derive(attn_single)
+    spatio_a, gprof_a = _derive(attn_avg)
+    # averaged token × group matrix
+    tok_group = attn_avg[:, :, content_idxs].mean(axis=0).T      # (num_tok, G)
 
-    fig = plt.figure(figsize=(18, 11))
-    gs  = gridspec.GridSpec(3, 2, height_ratios=[1.3, 1.3, 1.0], hspace=0.55, wspace=0.32)
+    frame_ticks = list(range(0, spatio_s.shape[0], max(1, spatio_s.shape[0] // 10)))
+    hmax = max(spatio_s.max(), spatio_a.max()) or 1.0            # shared scale → fair comparison
+
+    fig = plt.figure(figsize=(18, 12))
+    gs  = gridspec.GridSpec(3, 2, height_ratios=[1.3, 1.3, 1.1], hspace=0.5, wspace=0.32)
 
     def _heatmap(ax, data, title):
-        im = ax.imshow(data.T, aspect="auto", cmap="hot", origin="upper",
-                       vmin=0, vmax=data.max() or 1.0)
-        ax.set_yticks(range(G))
-        ax.set_yticklabels(GROUP_NAMES, fontsize=8)
+        im = ax.imshow(data.T, aspect="auto", cmap="hot", origin="upper", vmin=0, vmax=hmax)
+        ax.set_yticks(range(G)); ax.set_yticklabels(GROUP_NAMES, fontsize=8)
         ax.set_xticks(frame_ticks)
         ax.set_xticklabels([str(i * subsample) for i in frame_ticks], fontsize=7)
-        ax.set_xlabel("Frame", fontsize=8)
-        ax.set_ylabel("Group", fontsize=8)
+        ax.set_xlabel("Frame", fontsize=8); ax.set_ylabel("Group", fontsize=8)
         ax.set_title(title, fontsize=9)
         plt.colorbar(im, ax=ax, fraction=0.015, pad=0.01)
 
-    def _bar(ax, gprof, title):
-        ax.barh(range(G), gprof, color=bar_colors)
-        ax.set_yticks(range(G))
-        ax.set_yticklabels(GROUP_NAMES, fontsize=8)
-        ax.set_xlabel("Mean attention", fontsize=8)
-        ax.set_title(title, fontsize=9)
-        ax.grid(True, axis="x", linestyle="--", alpha=0.4)
-
-    def _tokmat(ax, tg, labels, title):
-        im = ax.imshow(tg, aspect="auto", cmap="Blues", origin="upper",
-                       vmin=0, vmax=tg.max() or 1.0)
-        ax.set_xticks(range(G))
-        ax.set_xticklabels(GROUP_NAMES, rotation=40, ha="right", fontsize=7)
-        ax.set_yticks(range(len(labels)))
-        ax.set_yticklabels(labels, fontsize=8)
-        ax.set_xlabel("Group", fontsize=8)
-        ax.set_ylabel("Token", fontsize=8)
-        ax.set_title(title, fontsize=9)
-        plt.colorbar(im, ax=ax, fraction=0.035, pad=0.04)
-
-    # Row 0: all-token spatiotemporal heatmap
+    # (a) single-step heatmap, (b) averaged heatmap — shared colour scale
     _heatmap(fig.add_subplot(gs[0, :]),
-             spatio_all, f'(a) All content tokens  —  "{prompt}"')
+             spatio_s, f'(a) Spatiotemporal attention — {single_lbl}  —  "{prompt}"')
+    _heatmap(fig.add_subplot(gs[1, :]),
+             spatio_a, f'(b) Spatiotemporal attention — {avg_lbl}  —  "{prompt}"')
 
-    # Row 1: semantic-only spatiotemporal heatmap
-    sem_title = f'(b) Semantic tokens only  {sem_labels}  —  "{prompt}"'
-    _heatmap(fig.add_subplot(gs[1, :]), spatio_sem, sem_title)
-
-    # Row 2 left: group profiles overlaid
-    ax_bar = fig.add_subplot(gs[2, 0])
-    x = np.arange(G)
-    w = 0.38
-    ax_bar.barh(x - w/2, gprof_all, w, color="steelblue",  alpha=0.8, label="all tokens")
-    ax_bar.barh(x + w/2, gprof_sem, w, color="tab:orange", alpha=0.8, label="semantic only")
+    # (c) group profile: single vs averaged overlaid
+    ax = fig.add_subplot(gs[2, 0])
+    x = np.arange(G); w = 0.38
+    ax.barh(x - w/2, gprof_s, w, color="steelblue",  alpha=0.85, label=single_lbl)
+    ax.barh(x + w/2, gprof_a, w, color="tab:orange", alpha=0.85, label=avg_lbl)
     for xi, name in enumerate(GROUP_NAMES):
         if name == expected_group:
-            ax_bar.axhline(xi, color="tab:red", linewidth=1.2, linestyle="--", alpha=0.7)
-    ax_bar.set_yticks(range(G))
-    ax_bar.set_yticklabels(GROUP_NAMES, fontsize=8)
-    ax_bar.set_xlabel("Mean attention", fontsize=8)
-    title_bar = "(c) Group profiles (all vs. semantic)"
+            ax.axhline(xi, color="tab:red", linewidth=1.2, linestyle="--", alpha=0.7)
+    ax.set_yticks(range(G)); ax.set_yticklabels(GROUP_NAMES, fontsize=8)
+    ax.set_xlabel("Mean attention", fontsize=8)
+    title_c = "(c) Group profile (single vs. averaged)"
     if expected_group:
-        title_bar += f"\n[expected: {expected_group} — dashed red]"
-    ax_bar.set_title(title_bar, fontsize=9)
-    ax_bar.legend(fontsize=8)
-    ax_bar.grid(True, axis="x", linestyle="--", alpha=0.4)
+        title_c += f"\n[expected: {expected_group} — dashed red]"
+    ax.set_title(title_c, fontsize=9)
+    ax.legend(fontsize=8)
+    ax.grid(True, axis="x", linestyle="--", alpha=0.4)
 
-    # Row 2 right: semantic token × group matrix
-    _tokmat(fig.add_subplot(gs[2, 1]), tg_sem, sem_labels,
-            "(d) Semantic-token × group matrix")
+    # (d) token × group matrix (averaged)
+    ax = fig.add_subplot(gs[2, 1])
+    im = ax.imshow(tok_group, aspect="auto", cmap="Blues", origin="upper",
+                   vmin=0, vmax=tok_group.max() or 1.0)
+    ax.set_xticks(range(G))
+    ax.set_xticklabels(GROUP_NAMES, rotation=40, ha="right", fontsize=7)
+    ax.set_yticks(range(len(content_labels)))
+    ax.set_yticklabels(content_labels, fontsize=8)
+    ax.set_xlabel("Group", fontsize=8); ax.set_ylabel("Token", fontsize=8)
+    ax.set_title(f"(d) Token × group matrix ({avg_lbl})", fontsize=9)
+    plt.colorbar(im, ax=ax, fraction=0.035, pad=0.04)
 
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
+def _peak_group_per_lh(attn_lhfgl: np.ndarray, idxs: list[int]) -> np.ndarray:
+    """
+    Per (layer, head) peak body-part group (excluding root), using the mean over
+    the given text-token columns and over frames.
+
+    attn_lhfgl : (L, H, F, G, L_text)
+    Returns    : (L, H) int array of group indices into GROUP_NAMES (>= 1, root excluded).
+    """
+    gp = attn_lhfgl[:, :, :, 1:, :][..., idxs].mean(axis=(2, 4))  # (L, H, G-1)
+    return gp.argmax(axis=-1) + 1                                  # (L, H)
+
+
+def _plot_layerhead_alignment(
+    acc_lh: np.ndarray,        # (L, H) alignment accuracy across evaluable prompts
+    grand_score: float,        # grand-mean (all layers+heads) semantic-token score
+    save_path: str,
+):
+    """Heatmap of per-(layer, head) alignment accuracy, to reveal whether grounding
+    is concentrated in specific heads that the grand mean washes out."""
+    L, H = acc_lh.shape
+    fig, ax = plt.subplots(figsize=(1.1 * H + 3, 0.5 * L + 2))
+    im = ax.imshow(acc_lh, aspect="auto", cmap="viridis", origin="upper",
+                   vmin=0.0, vmax=1.0)
+    ax.set_xticks(range(H)); ax.set_xticklabels([f"h{h}" for h in range(H)], fontsize=8)
+    ax.set_yticks(range(L)); ax.set_yticklabels([f"L{l}" for l in range(L)], fontsize=8)
+    ax.set_xlabel("Head"); ax.set_ylabel("Layer")
+    for l in range(L):
+        for h in range(H):
+            ax.text(h, l, f"{acc_lh[l, h]:.2f}", ha="center", va="center",
+                    color="white" if acc_lh[l, h] < 0.6 else "black", fontsize=7)
+    best = np.unravel_index(int(acc_lh.argmax()), acc_lh.shape)
+    ax.set_title(
+        f"Per-(layer, head) alignment accuracy\n"
+        f"grand-mean (all L+H) = {grand_score:.0%}   "
+        f"best = L{best[0]}·h{best[1]} ({acc_lh[best]:.0%})",
+        fontsize=10,
+    )
+    plt.colorbar(im, ax=ax, fraction=0.04, pad=0.02, label="alignment accuracy")
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _plot_frame_analysis(
-    attn_fl: np.ndarray,       # (F, L_text)
+    attn_single: np.ndarray,   # (F, L_text) — single noise level
+    attn_avg: np.ndarray,      # (F, L_text) — averaged over denoise steps
     content_idxs: list[int],
     content_labels: list[str],
     prompt: str,
     save_path: str,
     subsample: int,
+    single_lbl: str = "single step",
+    avg_lbl: str = "averaged",
 ):
-    """Fallback visualisation for MotionDiT (no body-part group dimension)."""
-    spatio_sub = attn_fl[::subsample][:, content_idxs]        # (F//sub, num_tok)
-    temporal   = spatio_sub.mean(axis=1)                       # (F//sub,)
+    """MotionDiT fallback (no body-part group dimension): single vs averaged in one figure."""
+    sub_s = attn_single[::subsample][:, content_idxs]            # (F//sub, num_tok)
+    sub_a = attn_avg[::subsample][:, content_idxs]
+    hmax = max(sub_s.max(), sub_a.max()) or 1.0                  # shared scale
+    xticks = range(0, sub_s.shape[0], max(1, sub_s.shape[0] // 8))
+    xlabels = [str(i * subsample) for i in xticks]
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig = plt.figure(figsize=(15, 9))
+    gs  = gridspec.GridSpec(2, 2, height_ratios=[1.3, 1.0], hspace=0.4, wspace=0.25)
 
-    ax = axes[0]
-    im = ax.imshow(spatio_sub.T, aspect="auto", cmap="hot", origin="upper")
-    ax.set_xticks(range(0, spatio_sub.shape[0], max(1, spatio_sub.shape[0] // 8)))
-    ax.set_xticklabels(
-        [str(i * subsample) for i in range(0, spatio_sub.shape[0], max(1, spatio_sub.shape[0] // 8))],
-        fontsize=8,
-    )
-    ax.set_yticks(range(len(content_labels)))
-    ax.set_yticklabels(content_labels, fontsize=8)
-    ax.set_xlabel("Frame")
-    ax.set_title(f'Token × frame attention\n"{prompt}"', fontsize=9)
-    plt.colorbar(im, ax=ax)
+    def _tokframe(ax, data, title):
+        im = ax.imshow(data.T, aspect="auto", cmap="hot", origin="upper", vmin=0, vmax=hmax)
+        ax.set_xticks(list(xticks)); ax.set_xticklabels(xlabels, fontsize=8)
+        ax.set_yticks(range(len(content_labels)))
+        ax.set_yticklabels(content_labels, fontsize=8)
+        ax.set_xlabel("Frame")
+        ax.set_title(title, fontsize=9)
+        plt.colorbar(im, ax=ax)
 
-    ax = axes[1]
-    ax.plot(temporal)
+    _tokframe(fig.add_subplot(gs[0, 0]), sub_s, f'(a) Token × frame — {single_lbl}')
+    _tokframe(fig.add_subplot(gs[0, 1]), sub_a, f'(b) Token × frame — {avg_lbl}')
+
+    # (c) temporal attention profile, single vs averaged overlaid
+    ax = fig.add_subplot(gs[1, :])
+    ax.plot(sub_s.mean(axis=1), color="steelblue",  label=single_lbl)
+    ax.plot(sub_a.mean(axis=1), color="tab:orange", label=avg_lbl)
     ax.set_xlabel("Frame (subsampled)")
     ax.set_ylabel("Mean attention over content tokens")
-    ax.set_title("Temporal attention profile", fontsize=9)
+    ax.set_title(f'(c) Temporal attention profile  —  "{prompt}"', fontsize=9)
+    ax.legend(fontsize=8)
     ax.grid(True, linestyle="--", alpha=0.4)
 
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=150)
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -307,6 +368,11 @@ def parse_args():
                         "200–400 shows clearer body-part structure than t≈0 or t≈999.")
     p.add_argument("--subsample",    type=int, default=4,
                    help="Frame subsampling factor for heatmap x-axis readability.")
+    p.add_argument("--avg_num_steps", type=int, default=20,
+                   help="Number of evenly spaced denoise steps in [1, T) to average "
+                        "attention over for the averaged plot. This approximates how the "
+                        "editing pipeline averages attention over the inversion trajectory, "
+                        "alongside the single-step plot at --noise_level.")
     return p.parse_args()
 
 
@@ -359,13 +425,23 @@ def main():
     t_batch = torch.full((B,), args.noise_level, device=device, dtype=torch.long)
     x_t, _ = schedule.q_sample(motions, t_batch)
 
+    # Timesteps for the averaged-attention plot: evenly spaced over the diffusion range.
+    avg_timesteps = np.unique(
+        np.linspace(1, schedule.T - 1, args.avg_num_steps).round().astype(int)
+    )
+
     print(f"\nMotions:       {B} validation clips, {F} frames each")
-    print(f"Noise level:   t = {args.noise_level}")
+    print(f"Noise level:   t = {args.noise_level} (single-step plot)")
+    print(f"Averaged plot: {len(avg_timesteps)} steps t ∈ [{avg_timesteps[0]}, {avg_timesteps[-1]}]")
     print(f"Prompts:       {len(_TEST_PROMPTS)}\n")
 
     alignment_results = []
     n_correct = 0
     n_evaluable = 0
+
+    # Per-(layer, head) accumulator: counts how often each head's semantic-token
+    # peak group matches the expected group, across the evaluable prompts.
+    lh_correct: np.ndarray | None = None   # (L, H) initialised lazily once shapes known
 
     for i, (prompt, expected_group) in enumerate(_TEST_PROMPTS):
         print(f"[{i+1}/{len(_TEST_PROMPTS)}] \"{prompt}\"")
@@ -379,23 +455,33 @@ def main():
         print(f"  Semantic tokens: {sem_labels}")
 
         try:
-            attn_np = extract_and_aggregate(
+            attn_lh = extract_per_layer_head(
                 model, x_t, t_batch, context, attn_mask, F=F, G=G
+            )
+            attn_lh_avg = extract_avg_per_layer_head(
+                model, schedule, motions, avg_timesteps, context, attn_mask, F=F, G=G
             )
         except RuntimeError as e:
             print(f"  ERROR: {e}")
             continue
 
-        # Save visualisation
-        slug      = prompt.replace(" ", "_")[:45]
-        save_path = os.path.join(args.output_dir, f"{i:02d}_{slug}.png")
+        # Grand mean over (layer, head). Two views:
+        #   single — attention at the fixed noise level args.noise_level
+        #   avg    — averaged over avg_timesteps (matches the editing pipeline)
+        # The alignment scoring below uses the single-step view, unchanged.
+        attn_np     = attn_lh.mean(axis=(0, 1))       # (F, G, L_text) or (F, L_text)
+        attn_np_avg = attn_lh_avg.mean(axis=(0, 1))
+
+        slug       = prompt.replace(" ", "_")[:45]
+        save_path  = os.path.join(args.output_dir, f"{i:02d}_{slug}.png")
+        single_lbl = f"single step t={args.noise_level}"
+        avg_lbl    = f"avg over {len(avg_timesteps)} steps"
 
         if is_group:
-            _plot_group_analysis(
-                attn_np, content_idxs, content_labels,
-                sem_idxs, sem_labels,
-                prompt, expected_group, save_path, args.subsample,
-            )
+            # One figure per prompt: single-step and averaged views combined.
+            _plot_group_analysis(attn_np, attn_np_avg, content_idxs, content_labels,
+                                 prompt, expected_group, save_path, args.subsample,
+                                 single_lbl, avg_lbl)
 
             def _peak(idxs):
                 gp = attn_np[:, 1:, idxs].mean(axis=(0, 2))  # (G-1,)
@@ -411,6 +497,13 @@ def main():
                 n_correct   += int(aligned_sem)   # score on semantic tokens
                 m_all = "✓" if aligned_all else "✗"
                 m_sem = "✓" if aligned_sem else "✗"
+
+                # Per-(layer, head): does each head's semantic-token peak match?
+                expected_idx = GROUP_NAMES.index(expected_group)
+                peak_lh = _peak_group_per_lh(attn_lh, sem_idxs)   # (L, H)
+                if lh_correct is None:
+                    lh_correct = np.zeros(peak_lh.shape, dtype=np.int64)
+                lh_correct += (peak_lh == expected_idx).astype(np.int64)
             else:
                 aligned_all = aligned_sem = None
                 m_all = m_sem = "—"
@@ -420,10 +513,8 @@ def main():
             print(f"  Peak (semantic):    {peak_sem:<12}  expected: {expected_group or 'N/A':<12}  {m_sem}")
 
         else:
-            _plot_frame_analysis(
-                attn_np, content_idxs, content_labels,
-                prompt, save_path, args.subsample,
-            )
+            _plot_frame_analysis(attn_np, attn_np_avg, content_idxs, content_labels,
+                                 prompt, save_path, args.subsample, single_lbl, avg_lbl)
             peak_group = None
             aligned    = None
             print("  (MotionDiT: temporal analysis only — no group alignment score)")
@@ -446,6 +537,27 @@ def main():
     )
     score_all = n_correct_all / n_evaluable if n_evaluable > 0 else 0.0
 
+    # ── Per-(layer, head) breakdown ─────────────────────────────────────────────
+    # The grand mean averages over all layers and heads; if grounding exists in only
+    # a few heads it is invisible there. This finds the best single (layer, head)
+    # and reports its accuracy, so the "diffuse" verdict isn't an averaging artifact.
+    best_layerhead = None
+    if is_group and lh_correct is not None and n_evaluable > 0:
+        acc_lh = lh_correct / n_evaluable          # (L, H)
+        L_n, H_n = acc_lh.shape
+        bl, bh = np.unravel_index(int(acc_lh.argmax()), acc_lh.shape)
+        lh_path = os.path.join(args.output_dir, "per_layer_head_alignment.png")
+        _plot_layerhead_alignment(acc_lh, score_sem, lh_path)
+        best_layerhead = {
+            "best_layer":           int(bl),
+            "best_head":            int(bh),
+            "best_layerhead_score": float(acc_lh[bl, bh]),
+            "best_layer_mean":      float(acc_lh.mean(axis=1).max()),  # best layer, heads avgd
+            "best_head_mean":       float(acc_lh.mean(axis=0).max()),  # best head, layers avgd
+            "accuracy_matrix":      acc_lh.round(4).tolist(),
+            "plot":                 lh_path,
+        }
+
     summary = {
         "model_type":              type(model).__name__,
         "feature_mode":            feature_mode,
@@ -456,6 +568,7 @@ def main():
         "n_evaluable":             n_evaluable,
         "n_correct_all_tok":       n_correct_all,
         "n_correct_sem_tok":       n_correct,
+        "per_layer_head":          best_layerhead,
         "results":                 alignment_results,
     }
     summary_path = os.path.join(args.output_dir, "alignment_summary.json")
@@ -481,6 +594,11 @@ def main():
     if is_group and n_evaluable > 0:
         print(f"  Alignment (all tokens):   {score_all:.0%}  ({n_correct_all}/{n_evaluable})")
         print(f"  Alignment (semantic tok): {score_sem:.0%}  ({n_correct}/{n_evaluable})  ← decision basis")
+        if best_layerhead is not None:
+            bl, bh = best_layerhead["best_layer"], best_layerhead["best_head"]
+            print(f"  Best single (layer,head): L{bl}·h{bh} = "
+                  f"{best_layerhead['best_layerhead_score']:.0%}  "
+                  f"(vs {score_sem:.0%} grand-mean — gap = grounding hidden by averaging)")
         print(f"  Stop words removed:       {sorted(_STOP_WORDS)}")
     print(f"  Decision:                 {verdict}")
     print(f"  Output:                   {args.output_dir}/")

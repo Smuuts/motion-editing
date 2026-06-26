@@ -183,6 +183,8 @@ def save_comparison_animation(
     clip_id: str = "",
     fps: int = 20,
     figsize: tuple = (12, 6),
+    gen_label: str = "Generated",
+    gt_label: str = None,
 ):
     """
     Side-by-side animation: generated (left) vs ground truth (right).
@@ -190,6 +192,7 @@ def save_comparison_animation(
     joints_gen, joints_gt  : (T, 22, 3) world-space positions.
     mpjpe_per_frame        : (T_common,) root-relative MPJPE in metres.
     total_mpjpe            : mean MPJPE over T_common frames.
+    gen_label, gt_label    : panel captions. gt_label defaults to "Ground Truth [clip_id]".
     """
     T_common = len(mpjpe_per_frame)
     T_gen    = len(joints_gen)
@@ -215,8 +218,11 @@ def save_comparison_animation(
         short = title[:72] + "…" if len(title) > 72 else title
         fig.suptitle(short, color="white", fontsize=8, y=0.99)
 
-    ax_gen.set_title("Generated", color="white", fontsize=9, pad=4)
-    ax_gt.set_title(f"Ground Truth  [{clip_id}]", color="white", fontsize=9, pad=4)
+    def _wrap(s, n=46):
+        return s if len(s) <= n else s[:n] + "…"
+    ax_gen.set_title(_wrap(gen_label), color="white", fontsize=9, pad=4)
+    ax_gt.set_title(_wrap(gt_label if gt_label is not None else f"Ground Truth  [{clip_id}]"),
+                    color="white", fontsize=9, pad=4)
 
     mpjpe_txt = fig.text(
         0.5, 0.01,

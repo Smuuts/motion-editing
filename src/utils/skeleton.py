@@ -19,10 +19,12 @@ PARENTS = [-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18,
 #   [4:67]   21 joint positions (root-relative, local frame), 21×3
 #   [67:193] 21 joint rotations 6D, 21×6
 #   [193:259] 22 joint velocity vectors, 22×3
-#   [259:263] foot contact binary labels: L_Ankle, R_Ankle, L_Foot, R_Foot
+#   [259:263] foot contact binary labels: L_Ankle, L_Foot, R_Ankle, R_Foot
+#     (HumanML3D concatenates feet_l=(L_Ankle,L_Foot) then feet_r=(R_Ankle,R_Foot))
 #
-# Foot joint indices in the 21-joint position array (0-indexed, i.e. joint_id - 1):
-_HML3D_FOOT_JOINTS = [6, 7, 9, 10]  # L_Ankle=7, R_Ankle=8, L_Foot=10, R_Foot=11
+# Foot joint indices in the 21-joint position array (0-indexed, i.e. joint_id - 1),
+# ordered to match the [259:263] contact channels above:
+_HML3D_FOOT_JOINTS = [6, 9, 7, 10]  # L_Ankle=7, L_Foot=10, R_Ankle=8, R_Foot=11
 
 
 def hml3d_geometric_losses(
@@ -71,7 +73,8 @@ def hml3d_geometric_losses(
         l_vel = vel_sq_err.mean()
 
     # L_foot: penalise foot velocity when GT contact label is active (MDM Eq. 4)
-    # Contact channels [259:263]: L_Ankle, R_Ankle, L_Foot, R_Foot (binary in GT)
+    # Contact channels [259:263]: L_Ankle, L_Foot, R_Ankle, R_Foot (binary in GT),
+    # paired element-wise with _HML3D_FOOT_JOINTS in the same order.
     foot_contact  = (x_gt[..., 259:263] >= 0.5).float()          # (B, T, 4)
     foot_pos_pred = pos_pred[:, :, _HML3D_FOOT_JOINTS, :]         # (B, T, 4, 3)
     foot_vel_pred = foot_pos_pred[:, 1:] - foot_pos_pred[:, :-1]  # (B, T-1, 4, 3)
