@@ -79,3 +79,48 @@ def build_group_channels() -> list[list[int]]:
 # Per-group channel index lists and their dims: [7, 50, 50, 36, 48, 48, 24] → 263
 GROUP_CHANNELS: list[list[int]] = build_group_channels()
 GROUP_DIMS:     list[int]       = [len(ch) for ch in GROUP_CHANNELS]
+
+
+# ── SMPL-H 135-d layout ─────────────────────────────────────────────────────────
+# Feature vector: [trans_delta(3) | body_pose_6d(126) | global_orient_6d(6)].
+# Each of the 21 body joints is one contiguous 6D rotation block — far cleaner than
+# HumanML3D's four scattered arrays (positions/rotations/velocities/contacts).
+SMPLH_FEAT_DIM = 135
+
+
+def build_group_channels_smpl() -> list[list[int]]:
+    """
+    Partition the 135 SMPL-H channels into the same 7 body-part groups.
+
+    Body joint j (0-indexed into the 21-joint body array, = SMPL joint j+1) owns its 6D
+    rotation block [3 + j*6 : 3 + j*6 + 6]. The root group gets the pelvis translation delta
+    [0:3] plus the global orientation [129:135]. Dims: [9, 24, 24, 18, 24, 24, 12] → 135.
+    """
+    def rot6d(j):  # joint j's 6D rotation block
+        return list(range(3 + j * 6, 3 + j * 6 + 6))
+
+    root_ch = [0, 1, 2] + list(range(129, 135))   # trans_delta + global_orient_6d
+    body_groups = [[c for j in joint_ids for c in rot6d(j)]
+                   for _, joint_ids in BODY_PART_GROUPS]
+
+    channels = [root_ch] + body_groups
+    assert sorted(sum(channels, [])) == list(range(SMPLH_FEAT_DIM)), \
+        "SMPL-H group channels must be a partition of [0, 135)"
+    return channels
+
+
+GROUP_CHANNELS_SMPL: list[list[int]] = build_group_channels_smpl()
+GROUP_DIMS_SMPL:     list[int]       = [len(ch) for ch in GROUP_CHANNELS_SMPL]
+
+
+def group_layout(feature_mode: str) -> tuple[list[list[int]], list[int], int]:
+    """(group_channels, group_dims, total_feature_dim) for a grouped feature_mode.
+
+    'humanml3d' (and legacy 'group') → 263-d HumanML3D partition;
+    'smplh' → 135-d SMPL-H partition. Both share N_GROUPS / GROUP_NAMES.
+    """
+    if feature_mode in ("humanml3d", "group"):
+        return GROUP_CHANNELS, GROUP_DIMS, 263
+    if feature_mode == "smplh":
+        return GROUP_CHANNELS_SMPL, GROUP_DIMS_SMPL, SMPLH_FEAT_DIM
+    raise ValueError(f"Unknown grouped feature_mode: {feature_mode!r}")

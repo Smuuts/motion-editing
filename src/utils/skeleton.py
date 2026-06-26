@@ -90,6 +90,67 @@ def hml3d_geometric_losses(
     return {"pos": l_pos, "vel": l_vel, "foot": l_foot}
 
 
+# SMPL 22-joint feet (world-space FK joints): L_Ankle, L_Foot, R_Ankle, R_Foot.
+_SMPLH_FOOT_JOINTS = [7, 10, 8, 11]
+
+
+def smplh_geometric_losses(
+    x_pred_norm: torch.Tensor,          # (B, T, 135) predicted clean SMPL-H features, normalised
+    x_gt_norm:   torch.Tensor,          # (B, T, 135) ground-truth clean features, normalised
+    mean:        torch.Tensor,          # (135,)
+    std:         torch.Tensor,          # (135,)
+    J_rest:      torch.Tensor,          # (22, 3) neutral rest joints
+    parents:     torch.Tensor,          # (22,)   kinematic-tree parents
+    mask:        torch.Tensor | None = None,  # (B, T) True = real frame
+    foot_thre:   float = 0.01,          # world foot speed (m/frame) below which GT foot = in contact
+) -> dict[str, torch.Tensor]:
+    """
+    MDM-style geometric losses for the SMPL-H (135-d) rep, on world-space joints obtained by forward
+    kinematics (`smplh_world_joints`). Mirrors `hml3d_geometric_losses`, but the foot-contact label
+    is derived from GT foot velocity (the SMPL-H rep has no explicit contact channels).
+    """
+    from data.smplh_features import smplh_world_joints
+
+    x_pred = x_pred_norm.clamp(-5, 5) * std + mean
+    x_gt   = x_gt_norm               * std + mean
+    Jp = smplh_world_joints(x_pred, J_rest, parents)   # (B, T, 22, 3)
+    Jg = smplh_world_joints(x_gt,   J_rest, parents)
+
+    # L_pos: per-joint position MSE
+    sq_err = (Jp - Jg) ** 2
+    if mask is not None:
+        sq_err = sq_err * mask[:, :, None, None].float()
+        l_pos  = sq_err.sum() / (mask.float().sum() * 22 * 3).clamp(min=1)
+    else:
+        l_pos = sq_err.mean()
+
+    # L_vel: frame-to-frame position-difference MSE
+    vel_pred, vel_gt = Jp[:, 1:] - Jp[:, :-1], Jg[:, 1:] - Jg[:, :-1]
+    vel_sq_err = (vel_pred - vel_gt) ** 2
+    if mask is not None:
+        vel_mask   = (mask[:, :-1] & mask[:, 1:]).float()
+        vel_sq_err = vel_sq_err * vel_mask[:, :, None, None]
+        l_vel      = vel_sq_err.sum() / (vel_mask.sum() * 22 * 3).clamp(min=1)
+    else:
+        l_vel = vel_sq_err.mean()
+
+    # L_foot: penalise predicted foot velocity where the GT foot is in contact
+    foot_pred = Jp[:, :, _SMPLH_FOOT_JOINTS, :]
+    foot_gt   = Jg[:, :, _SMPLH_FOOT_JOINTS, :]
+    fvel_pred = foot_pred[:, 1:] - foot_pred[:, :-1]                    # (B, T-1, 4, 3)
+    fvel_gt   = foot_gt[:, 1:]   - foot_gt[:, :-1]
+    contact   = (fvel_gt.norm(dim=-1) < foot_thre).float()[..., None]  # (B, T-1, 4, 1)
+    foot_sq_err = (fvel_pred * contact) ** 2
+    if mask is not None:
+        vel_mask    = (mask[:, :-1] & mask[:, 1:]).float()
+        foot_sq_err = foot_sq_err * vel_mask[:, :, None, None]
+        l_foot      = foot_sq_err.sum() / (vel_mask.sum() * 4 * 3).clamp(min=1)
+    else:
+        l_foot = foot_sq_err.mean()
+
+    return {"pos": l_pos, "vel": l_vel, "foot": l_foot}
+
+
 def _joint_positions_humanml3d(x: torch.Tensor) -> torch.Tensor:
     """x: (B, T, 263) denormalized → (B, T, 22, 3) root-relative local-frame positions."""
     joints_21 = x[..., 4:67].reshape(*x.shape[:-1], 21, 3)

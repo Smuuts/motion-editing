@@ -13,7 +13,8 @@ Layout matches `data/motionfix/src/data/features.py` (`_get_body_pose` / `_get_b
 
 import numpy as np
 import torch
-from smplx.lbs import batch_rodrigues
+import torch.nn.functional as F
+from smplx.lbs import batch_rodrigues, batch_rigid_transform
 
 # SMPL 22-joint order; left<->right swap permutation for sagittal mirroring.
 #  0 pelvis 1 L_hip 2 R_hip 3 spine1 4 L_knee 5 R_knee 6 spine2 7 L_ankle 8 R_ankle
@@ -55,6 +56,63 @@ def smplh_to_features(rots, trans) -> np.ndarray:
     tdelta = torch.einsum("tdi,td->ti", torch.roll(R, 1, 0), tv)
     tdelta[0] = 0
     return torch.cat([tdelta, pose6d, orient6d], dim=-1).numpy().astype(np.float32)
+
+
+def rotation_6d_to_matrix(d6: torch.Tensor) -> torch.Tensor:
+    """6D rotation (..., 6) -> rotation matrix (..., 3, 3) via Gram-Schmidt (pytorch3d
+    convention — inverse of `aa_to_6d`/`matrix_to_rotation_6d`)."""
+    a1, a2 = d6[..., :3], d6[..., 3:]
+    b1 = F.normalize(a1, dim=-1)
+    b2 = F.normalize(a2 - (b1 * a2).sum(-1, keepdim=True) * b1, dim=-1)
+    b3 = torch.cross(b1, b2, dim=-1)
+    return torch.stack((b1, b2, b3), dim=-2)
+
+
+def features_to_rotmats(feat: torch.Tensor):
+    """135-d feature (..., 135) -> (rotmats (..., 22, 3, 3), trans_delta (..., 3)).
+
+    rotmats[..., 0] = global orient; [..., 1:] = the 21 body joints.
+    """
+    lead = feat.shape[:-1]
+    go = rotation_6d_to_matrix(feat[..., 129:135])                       # (...,3,3)
+    bp = rotation_6d_to_matrix(feat[..., 3:129].reshape(*lead, 21, 6))   # (...,21,3,3)
+    rotmats = torch.cat([go.unsqueeze(-3), bp], dim=-3)                   # (...,22,3,3)
+    return rotmats, feat[..., 0:3]
+
+
+def smplh_rest_joints_and_parents(body_model):
+    """Neutral-shape rest joints (22, 3) and kinematic-tree parents (22,) from a SMPLHLayer."""
+    J_rest = (body_model.J_regressor @ body_model.v_template)[:22].clone()   # betas=0
+    parents = body_model.parents[:22].clone().long()
+    return J_rest, parents
+
+
+def smplh_world_joints(feat: torch.Tensor, J_rest: torch.Tensor, parents: torch.Tensor):
+    """135-d features (B, T, 135) -> world-space joints (B, T, 22, 3).
+
+    Cheap joints-only forward kinematics (`batch_rigid_transform`, no LBS/vertices). The
+    pelvis-frame `trans_delta` is rotated to the world frame by the per-frame global orient and
+    integrated over time so foot-contact velocities are measured in world space.
+    """
+    B, T, _ = feat.shape
+    rotmats, trans_delta = features_to_rotmats(feat)            # (B,T,22,3,3), (B,T,3)
+    go = rotmats[:, :, 0]                                       # (B,T,3,3) global orient
+    # world velocity v_i = R_{i-1} @ trans_delta_i (inverse of change_for), then cumulative sum
+    v = torch.zeros_like(trans_delta)
+    v[:, 1:] = torch.einsum("btij,btj->bti", go[:, :-1], trans_delta[:, 1:])
+    t_world = torch.cumsum(v, dim=1)                            # (B,T,3)
+    J = J_rest.to(feat).unsqueeze(0).expand(B * T, -1, -1)      # (B*T,22,3)
+    posed, _ = batch_rigid_transform(rotmats.reshape(B * T, 22, 3, 3), J, parents.to(feat.device))
+    return posed.reshape(B, T, 22, 3) + t_world[:, :, None]
+
+
+def smplh_decode_to_joints(feat_raw: np.ndarray, body_model) -> np.ndarray:
+    """RAW (T, 135) features -> (T, 22, 3) world joints (numpy). For decode / visualization."""
+    J_rest, parents = smplh_rest_joints_and_parents(body_model)
+    feat = torch.as_tensor(feat_raw, dtype=torch.float32)[None]   # (1,T,135)
+    with torch.no_grad():
+        joints = smplh_world_joints(feat, J_rest, parents)[0]
+    return joints.cpu().numpy()
 
 
 def mirror_smplh(rots, trans):

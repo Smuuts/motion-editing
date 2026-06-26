@@ -103,8 +103,26 @@ def load_model(ckpt_dir: str, device, use_ema: bool = True):
 # Joint recovery helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
+_SMPLH_BODY_MODEL = None
+
+
+def _smplh_body_model(model_path: str = "data/motionfix/data/body_models/smplh"):
+    """Lazily build + cache a neutral SMPLHLayer for decoding smplh features to joints."""
+    global _SMPLH_BODY_MODEL
+    if _SMPLH_BODY_MODEL is None:
+        import smplx
+        _SMPLH_BODY_MODEL = smplx.SMPLHLayer(model_path=model_path, gender="neutral", ext="npz").eval()
+    return _SMPLH_BODY_MODEL
+
+
 def recover_joints(raw_features: np.ndarray, feature_mode: str) -> np.ndarray:
-    """Raw (denormalised) (T, 263) features → world-space joint positions (T, 22, 3)."""
+    """Raw (denormalised) features → world-space joint positions (T, 22, 3).
+
+    'humanml3d' (263) via RIC recovery; 'smplh' (135) via SMPL forward kinematics.
+    """
+    if feature_mode == "smplh":
+        from data.smplh_features import smplh_decode_to_joints
+        return smplh_decode_to_joints(raw_features, _smplh_body_model())
     return recover_from_ric(raw_features, joints_num=22)
 
 

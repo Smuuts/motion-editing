@@ -133,7 +133,8 @@ def main():
 
     # ── load model, schedule, encoder, normalisation stats ──────────────────────
     model, config = load_model(args.checkpoint, device=device, use_ema=not args.no_ema)
-    is_group = config.get("feature_mode", "humanml3d") == "group"
+    # Both 'humanml3d' and 'smplh' are body-part-grouped (GroupDiT); legacy 'group' too.
+    is_group = config.get("feature_mode", "humanml3d") in ("humanml3d", "smplh", "group")
     print(f"feature_mode={config.get('feature_mode')}  is_group={is_group}")
 
     mean = np.load(os.path.join(args.data_root, "Mean.npy"))   # (263,)

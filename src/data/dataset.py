@@ -14,9 +14,11 @@ class HumanML3DDataset(Dataset):
         length  : actual number of frames T (before padding)
 
     feature_mode:
-        "humanml3d" — full 263-dim flat feature vector (for MotionDiT)
-        "group"     — full 263-dim feature vector, consumed by GroupDiT which
-                      partitions channels into 7 per-body-part group tokens
+        "humanml3d" / "group" — 263-dim HumanML3D vectors in `data_root/new_joint_vecs/`,
+                      consumed by GroupDiT (partitioned into 7 per-body-part group tokens).
+        "smplh"     — 135-dim SMPL-H feature vectors stored flat as `data_root/<id>.npy`
+                      (from src/data/amass_to_smplh.py). Texts come from `text_root` (the
+                      processed HumanML3D dir), since the SMPL feature dir has none.
     """
 
     def __init__(
@@ -26,19 +28,26 @@ class HumanML3DDataset(Dataset):
         max_frames: int = 196,
         min_frames: int = 16,
         feature_mode: str = "humanml3d",
+        text_root: str | None = None,
     ):
-        assert feature_mode in ("humanml3d", "group"), f"Unknown feature_mode: {feature_mode}"
+        assert feature_mode in ("humanml3d", "group", "smplh"), \
+            f"Unknown feature_mode: {feature_mode}"
         self.data_root = data_root
         self.max_frames = max_frames
         self.min_frames = min_frames
         self.feature_mode = feature_mode
+        # texts/text_emb live with the processed dataset; for smplh that differs from data_root.
+        text_root = text_root or data_root
 
-        # normalisation statistics — slice to the active channels for SMPL/joint mode
-        mean = np.load(os.path.join(data_root, "Mean.npy"))  # (263,)
-        std  = np.load(os.path.join(data_root, "Std.npy"))   # (263,)
+        is_smplh = feature_mode == "smplh"
+        self.feature_dim = 135 if is_smplh else 263
+        # smplh feats are flat <id>.npy at data_root; HumanML3D vecs are in new_joint_vecs/.
+        self.vec_dir = data_root if is_smplh else os.path.join(data_root, "new_joint_vecs")
+
+        mean = np.load(os.path.join(data_root, "Mean.npy"))  # (feature_dim,)
+        std  = np.load(os.path.join(data_root, "Std.npy"))
         self.mean = mean
         self.std  = std
-        self.feature_dim = 263
 
         # clip IDs for this split
         split_file = os.path.join(data_root, f"{split}.txt")
@@ -48,15 +57,14 @@ class HumanML3DDataset(Dataset):
         # filter out clips that are too short after loading lengths
         self.ids = self._filter_by_length()
 
-        self.vec_dir      = os.path.join(data_root, "new_joint_vecs")
-        self.text_dir     = os.path.join(data_root, "texts")
-        text_emb_dir      = os.path.join(data_root, "text_emb")
+        self.text_dir     = os.path.join(text_root, "texts")
+        text_emb_dir      = os.path.join(text_root, "text_emb")
         self.text_emb_dir = text_emb_dir if os.path.isdir(text_emb_dir) else None
 
     def _filter_by_length(self):
         valid = []
         for clip_id in self.ids:
-            path = os.path.join(self.data_root, "new_joint_vecs", f"{clip_id}.npy")
+            path = os.path.join(self.vec_dir, f"{clip_id}.npy")
             if not os.path.exists(path):
                 continue
             T = np.load(path, mmap_mode="r").shape[0]
@@ -105,9 +113,9 @@ class HumanML3DDataset(Dataset):
 
 def build_dataloader(data_root, split="train", batch_size=64,
                      max_frames=196, num_workers=4, shuffle=None,
-                     feature_mode="humanml3d"):
+                     feature_mode="humanml3d", text_root=None):
     dataset = HumanML3DDataset(data_root, split=split, max_frames=max_frames,
-                               feature_mode=feature_mode)
+                               feature_mode=feature_mode, text_root=text_root)
     if shuffle is None:
         shuffle = (split == "train")
     return DataLoader(

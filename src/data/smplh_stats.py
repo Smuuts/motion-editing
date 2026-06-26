@@ -23,10 +23,9 @@ def main():
     args = ap.parse_args()
 
     ids = [l.strip() for l in open(args.split) if l.strip()]
-    # Welford-style streaming mean/var over frames (channels = last axis).
+    # Vectorised running sum / sum-of-squares over frames (float64), one load per clip.
     n = 0
-    mean = None
-    m2 = None
+    s = ssq = None
     missing = 0
     for cid in tqdm(ids, desc="stats"):
         p = os.path.join(args.feat_dir, f"{cid}.npy")
@@ -34,14 +33,13 @@ def main():
             missing += 1
             continue
         x = np.load(p).astype(np.float64)              # (T,135)
-        if mean is None:
-            mean = np.zeros(x.shape[1]); m2 = np.zeros(x.shape[1])
-        for frame in x:                                # update per frame
-            n += 1
-            d = frame - mean
-            mean += d / n
-            m2 += d * (frame - mean)
-    std = np.sqrt(m2 / max(n - 1, 1))
+        if s is None:
+            s = np.zeros(x.shape[1]); ssq = np.zeros(x.shape[1])
+        n += x.shape[0]
+        s += x.sum(0)
+        ssq += (x * x).sum(0)
+    mean = s / max(n, 1)
+    std = np.sqrt(np.maximum(ssq / max(n, 1) - mean ** 2, 0.0))
     std = np.maximum(std, args.eps)
 
     np.save(os.path.join(args.feat_dir, "Mean.npy"), mean.astype(np.float32))

@@ -19,9 +19,8 @@ import torch.nn.functional as F
 from model.body_groups import (
     BODY_PART_GROUPS as _BODY_PART_GROUPS,
     N_GROUPS as _N_GROUPS,
-    GROUP_CHANNELS as _GROUP_CHANNELS,
-    GROUP_DIMS as _GROUP_DIMS,
     GROUP_NAMES,
+    group_layout as _group_layout,
 )
 
 
@@ -295,6 +294,7 @@ class GroupDiT(_MotionDiTBase):
 
     def __init__(
         self,
+        feature_mode: str   = "humanml3d",
         latent_dim:   int   = 512,
         context_dim:  int   = 512,
         num_heads:    int   = 8,
@@ -307,10 +307,13 @@ class GroupDiT(_MotionDiTBase):
         super().__init__()
         self.latent_dim = latent_dim
         self.max_frames = max_frames
-        self.input_dim  = 263
+        # Representation-specific channel partition: 'humanml3d' (263) or 'smplh' (135).
+        # The body-part grouping (N_GROUPS, GROUP_NAMES) is shared across both.
+        self.feature_mode = feature_mode
+        self.group_channels, group_dims, self.input_dim = _group_layout(feature_mode)
 
-        self.in_projs  = nn.ModuleList([nn.Linear(d, latent_dim) for d in _GROUP_DIMS])
-        self.out_projs = nn.ModuleList([nn.Linear(latent_dim, d) for d in _GROUP_DIMS])
+        self.in_projs  = nn.ModuleList([nn.Linear(d, latent_dim) for d in group_dims])
+        self.out_projs = nn.ModuleList([nn.Linear(latent_dim, d) for d in group_dims])
 
         self.group_emb = nn.Embedding(_N_GROUPS, latent_dim)
         self.pos_emb   = FramePositionalEmbedding(max_frames, latent_dim)
@@ -340,8 +343,8 @@ class GroupDiT(_MotionDiTBase):
             context = self.null_text_emb.expand(B, -1, -1)
 
         # ── tokenise ──────────────────────────────────────────────────────────
-        # Slice each group's channels from the full 263D vector.
-        group_feats = [motion[..., ch] for ch in _GROUP_CHANNELS]
+        # Slice each group's channels from the full feature vector (263 or 135).
+        group_feats = [motion[..., ch] for ch in self.group_channels]
 
         # project each group → latent_dim, stack → (B, F, G, latent_dim)
         tokens = torch.stack(
@@ -367,12 +370,12 @@ class GroupDiT(_MotionDiTBase):
 
         tokens = self.final_norm(tokens).reshape(B, F, G, self.latent_dim)
 
-        # ── reconstruct (B, F, 263) ───────────────────────────────────────────
+        # ── reconstruct (B, F, input_dim) ─────────────────────────────────────
         # Compute projections first so we know the actual dtype (AMP may differ
         # from tokens.dtype when LayerNorm upcasts to float32 internally).
-        group_outs = [self.out_projs[g](tokens[:, :, g]) for g in range(len(_GROUP_CHANNELS))]
-        out = torch.zeros(B, F, 263, device=tokens.device, dtype=group_outs[0].dtype)
-        for g, ch in enumerate(_GROUP_CHANNELS):
+        group_outs = [self.out_projs[g](tokens[:, :, g]) for g in range(len(self.group_channels))]
+        out = torch.zeros(B, F, self.input_dim, device=tokens.device, dtype=group_outs[0].dtype)
+        for g, ch in enumerate(self.group_channels):
             out[..., ch] = group_outs[g]
         return out
 
@@ -388,8 +391,12 @@ def build_model(config: dict, device="cpu") -> _MotionDiTBase:
         dropout      = config.get("dropout",       0.1),
         text_seq_len = config.get("text_seq_len",  77),
     )
-    if config.get("feature_mode") == "group":
-        model = GroupDiT(**kwargs)
+    feature_mode = config.get("feature_mode", "humanml3d")
+    # Both supported modes are body-part-grouped: 'humanml3d' (263) and 'smplh' (135).
+    # Legacy 'group' checkpoints are GroupDiT-263 → identical to 'humanml3d'.
+    if feature_mode in ("humanml3d", "smplh", "group"):
+        model = GroupDiT(feature_mode=feature_mode, **kwargs)
     else:
+        # Legacy flat MotionDiT (deprecated) — kept only for loading old flat checkpoints.
         model = MotionDiT(input_dim=config.get("input_dim", 263), **kwargs)
     return model.to(device)

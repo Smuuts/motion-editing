@@ -23,7 +23,7 @@ from model.schedule import NoiseSchedule
 from utils.checkpoint import save_checkpoint, load_checkpoint
 from utils.ema import EMA
 from utils.logger import Logger
-from utils.skeleton import hml3d_geometric_losses
+from utils.skeleton import hml3d_geometric_losses, smplh_geometric_losses
 
 
 def build_parser():
@@ -54,15 +54,22 @@ def build_parser():
 
     # data
     p.add_argument("--feature_mode", type=str,   default="humanml3d",
-                   choices=["humanml3d", "group"],
-                   help="'humanml3d' = full 263-dim flat (MotionDiT); "
-                        "'group' = 263-dim partitioned into per-body-part group tokens (GroupDiT)")
+                   choices=["humanml3d", "smplh"],
+                   help="Both modes are body-part-grouped (GroupDiT). 'humanml3d' = 263-d HumanML3D "
+                        "features; 'smplh' = 135-d SMPL-H features (from src/data/amass_to_smplh.py).")
+    p.add_argument("--text_root", type=str, default=None,
+                   help="Where texts/ and text_emb/ live (default: --data_root). For smplh, point at "
+                        "the processed HumanML3D dir (e.g. data/HumanML3D/HumanML3D).")
+    p.add_argument("--smplh_model_path", type=str,
+                   default="data/motionfix/data/body_models/smplh",
+                   help="SMPLHLayer dir (smplh mode geometric losses). Needs SMPLH_NEUTRAL.npz.")
     p.add_argument("--hml3d_pos_weight",  type=float, default=0.1,
-                   help="Weight for MDM L_pos joint position loss (humanml3d mode only). 0 = disabled.")
+                   help="Weight for MDM L_pos joint position loss (humanml3d: stored joints; "
+                        "smplh: SMPL-FK joints). 0 = disabled.")
     p.add_argument("--hml3d_vel_weight",  type=float, default=0.1,
-                   help="Weight for MDM L_vel velocity consistency loss (humanml3d mode only). 0 = disabled.")
+                   help="Weight for MDM L_vel velocity consistency loss. 0 = disabled.")
     p.add_argument("--hml3d_foot_weight", type=float, default=0.01,
-                   help="Weight for MDM L_foot contact loss (humanml3d mode only). 0 = disabled.")
+                   help="Weight for MDM L_foot contact loss. 0 = disabled.")
     p.add_argument("--snr_gamma",     type=float, default=5.0,
                    help="Min-SNR weighting gamma (Hang et al. 2023). 0 = disabled.")
 
@@ -139,7 +146,7 @@ def train_one_epoch(
     model, ema, text_encoder, schedule, optimizer, scaler,
     loader, device, cfg_dropout, logger, epoch, log_every,
     snr_gamma=5.0,
-    hml3d_stats=None, hml3d_pos_weight=0.0, hml3d_vel_weight=0.0, hml3d_foot_weight=0.0,
+    geo_fn=None, hml3d_pos_weight=0.0, hml3d_vel_weight=0.0, hml3d_foot_weight=0.0,
 ):
     model.train()
     total_loss = 0.0
@@ -190,10 +197,9 @@ def train_one_epoch(
                 loss = per_elem.sum() / (loss_mask.sum() * noise.shape[-1]).clamp(min=1)
 
         geo_log = {}
-        if hml3d_stats is not None:
+        if geo_fn is not None:
             x0_pred = schedule.predict_x0_from_eps(x_t, t, prediction.float())
-            mean_h, std_h = hml3d_stats
-            geo = hml3d_geometric_losses(x0_pred, motion.float(), mean_h, std_h, mask=attn_mask)
+            geo = geo_fn(x0_pred, motion.float(), attn_mask)
             if hml3d_pos_weight  > 0.0 and torch.isfinite(geo["pos"]):
                 loss = loss + hml3d_pos_weight  * geo["pos"]
                 geo_log["train/geo_pos"]  = geo["pos"].item()
@@ -240,7 +246,7 @@ def train_one_epoch(
 def validate_one_epoch(
     ema_model, text_encoder, schedule, loader, device, epoch,
     snr_gamma=5.0,
-    hml3d_stats=None, hml3d_pos_weight=0.0, hml3d_vel_weight=0.0, hml3d_foot_weight=0.0,
+    geo_fn=None, hml3d_pos_weight=0.0, hml3d_vel_weight=0.0, hml3d_foot_weight=0.0,
 ):
     ema_model.eval()
     torch.manual_seed(0)
@@ -282,10 +288,9 @@ def validate_one_epoch(
             else:
                 loss = per_elem.sum() / (loss_mask.sum() * noise.shape[-1]).clamp(min=1)
 
-        if hml3d_stats is not None:
+        if geo_fn is not None:
             x0_pred = schedule.predict_x0_from_eps(x_t, t, prediction.float())
-            mean_h, std_h = hml3d_stats
-            geo = hml3d_geometric_losses(x0_pred, motion.float(), mean_h, std_h, mask=attn_mask)
+            geo = geo_fn(x0_pred, motion.float(), attn_mask)
             if hml3d_pos_weight  > 0.0 and torch.isfinite(geo["pos"]):
                 loss = loss + hml3d_pos_weight  * geo["pos"]
             if hml3d_vel_weight  > 0.0 and torch.isfinite(geo["vel"]):
@@ -342,6 +347,7 @@ def main():
         max_frames=args.max_frames,
         num_workers=args.num_workers,
         feature_mode=args.feature_mode,
+        text_root=args.text_root,
     )
     train_loader = build_dataloader(args.data_root, split="train", **loader_kwargs)
     print(f"Training on {len(train_loader.dataset)} clips")
@@ -356,11 +362,28 @@ def main():
     std_t  = torch.from_numpy(ds.std).float().to(device)
     feature_stats = (mean_t, std_t)
 
-    hml3d_geo_stats = None
+    # Geometric losses: route to the rep-specific implementation. Built as a closure
+    # geo_fn(x0_pred, motion, mask) -> {"pos","vel","foot"} so run/validate stay rep-agnostic.
+    geo_fn = None
     if any([args.hml3d_pos_weight, args.hml3d_vel_weight, args.hml3d_foot_weight]):
-        hml3d_geo_stats = feature_stats
+        if args.feature_mode == "smplh":
+            import smplx
+            from data.smplh_features import smplh_rest_joints_and_parents
+            body_model = smplx.SMPLHLayer(model_path=args.smplh_model_path,
+                                          gender="neutral", ext="npz").to(device).eval()
+            for p in body_model.parameters():
+                p.requires_grad_(False)
+            J_rest, parents = smplh_rest_joints_and_parents(body_model)
+            J_rest, parents = J_rest.to(device), parents.to(device)
+            geo_fn = lambda x0, m, mask: smplh_geometric_losses(
+                x0, m, mean_t, std_t, J_rest, parents, mask=mask)
+            geo_label = "SMPL-FK"
+        else:
+            geo_fn = lambda x0, m, mask: hml3d_geometric_losses(
+                x0, m, mean_t, std_t, mask=mask)
+            geo_label = "HumanML3D"
         parts = [f"pos={args.hml3d_pos_weight}", f"vel={args.hml3d_vel_weight}", f"foot={args.hml3d_foot_weight}"]
-        print(f"HumanML3D geometric losses enabled ({', '.join(p for p in parts if not p.endswith('=0.0'))})")
+        print(f"{geo_label} geometric losses enabled ({', '.join(p for p in parts if not p.endswith('=0.0'))})")
 
     # text encoder
     context_dim, text_seq_len = get_encoder_dims(config)
@@ -440,7 +463,7 @@ def main():
             train_loader, device, args.cfg_dropout,
             logger, epoch, args.log_every,
             snr_gamma=args.snr_gamma,
-            hml3d_stats=hml3d_geo_stats,
+            geo_fn=geo_fn,
             hml3d_pos_weight=args.hml3d_pos_weight,
             hml3d_vel_weight=args.hml3d_vel_weight,
             hml3d_foot_weight=args.hml3d_foot_weight,
@@ -458,7 +481,7 @@ def main():
             val_loss = validate_one_epoch(
                 ema.ema_model, text_encoder, schedule, val_loader, device, epoch,
                 snr_gamma=args.snr_gamma,
-                hml3d_stats=hml3d_geo_stats,
+                geo_fn=geo_fn,
                 hml3d_pos_weight=args.hml3d_pos_weight,
                 hml3d_vel_weight=args.hml3d_vel_weight,
                 hml3d_foot_weight=args.hml3d_foot_weight,
