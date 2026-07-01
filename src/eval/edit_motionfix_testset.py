@@ -49,7 +49,7 @@ from editing import MotionEditor
 from data.smplh_features import (
     smplh_to_features, features_to_smpl, smpl_to_gen_layout, resample_motion,
 )
-from sample_model import load_model
+from utils.model_io import load_model
 
 
 def parse_args():

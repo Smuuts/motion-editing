@@ -96,8 +96,8 @@ class HumanML3DDataset(Dataset):
         if self.text_emb_dir is not None:
             emb_path = os.path.join(self.text_emb_dir, f"{clip_id}.npy")
             emb = np.load(emb_path)                          # (num_ann, 77, dim) float16
-            idx = random.randrange(len(emb))
-            context = torch.from_numpy(emb[idx].astype(np.float32))  # (77, dim)
+            ann_idx = random.randrange(len(emb))
+            context = torch.from_numpy(emb[ann_idx].astype(np.float32))  # (77, dim)
             return {"motion": motion, "context": context, "length": T, "id": clip_id}
 
         text_path = os.path.join(self.text_dir, f"{clip_id}.txt")

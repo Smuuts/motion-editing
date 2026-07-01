@@ -40,10 +40,10 @@ src_dir = os.path.dirname(os.path.abspath(__file__))
 if src_dir not in sys.path:
     sys.path.insert(0, src_dir)
 
-from model.dit import build_model
-from model.text_encoder import build_text_encoder, get_encoder_dims
+from model.text_encoder import build_text_encoder
 from model.schedule import NoiseSchedule
 from model.sampler import DDPMSampler
+from utils.model_io import load_model
 
 
 def parse_args():
@@ -57,36 +57,15 @@ def parse_args():
     p.add_argument("--out_dir",        required=True)
     p.add_argument("--max_clips",      type=int, default=None)
     p.add_argument("--guidance_scale", type=float, default=4.0)
-    p.add_argument("--num_steps",      type=int, default=1000)
+    p.add_argument("--num_steps",      type=int, default=1000,
+                   help="Must equal the checkpoint's diffusion timesteps (config.json's "
+                        "'timesteps', usually 1000) — DDPMSampler only supports "
+                        "full-resolution sampling.")
     p.add_argument("--seed",           type=int, default=42)
     p.add_argument("--no_ema",         action="store_true")
     p.add_argument("--resume",         action="store_true",
                    help="Skip clips whose .npz already exists in out_dir.")
     return p.parse_args()
-
-
-def load_model(ckpt_dir, device, use_ema=True):
-    with open(os.path.join(ckpt_dir, "config.json")) as f:
-        config = json.load(f)
-
-    context_dim, text_seq_len = get_encoder_dims(config)
-    model = build_model({
-        "feature_mode": config.get("feature_mode", "humanml3d"),
-        "input_dim":    263,
-        "latent_dim":   config.get("latent_dim",  512),
-        "context_dim":  context_dim,
-        "text_seq_len": text_seq_len,
-        "num_heads":    config.get("num_heads",   8),
-        "num_layers":   config.get("num_layers",  8),
-        "max_frames":   config.get("max_frames",  196),
-        "dropout":      0.0,
-    }, device=device)
-
-    weights = os.path.join(ckpt_dir, "ema.pt" if use_ema else "model.pt")
-    model.load_state_dict(torch.load(weights, map_location=device, weights_only=True))
-    model.eval()
-    print(f"Loaded: {weights}")
-    return model, config
 
 
 def load_split(data_root, split, max_frames, min_frames=16, max_clips=None, seed=42):

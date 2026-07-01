@@ -16,8 +16,6 @@ Validation-set mode  (--num_samples N):
 import os
 import sys
 import argparse
-import json
-import random
 import numpy as np
 import torch
 from scipy.ndimage import gaussian_filter1d
@@ -29,11 +27,13 @@ if src_dir not in sys.path:
 import matplotlib
 matplotlib.use("Agg")
 
-from model.dit import build_model
-from model.text_encoder import build_text_encoder, get_encoder_dims
+from model.text_encoder import build_text_encoder
 from model.schedule import NoiseSchedule
 from model.sampler import DDPMSampler
-from utils.visualise import recover_from_ric, save_animation, save_comparison_animation
+from utils.model_io import load_model
+from utils.visualise import (
+    recover_from_ric, save_animation, save_comparison_animation, mpjpe_from_joints,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -63,40 +63,14 @@ def parse_args():
     # Generation hyper-parameters
     p.add_argument("--length",         type=int,   default=196)
     p.add_argument("--guidance_scale", type=float, default=4.0)
-    p.add_argument("--num_steps",      type=int,   default=1000)
+    p.add_argument("--num_steps",      type=int,   default=1000,
+                   help="Must equal the checkpoint's diffusion timesteps (config.json's "
+                        "'timesteps', usually 1000) — DDPMSampler only supports "
+                        "full-resolution sampling.")
     p.add_argument("--smooth_sigma",   type=float, default=1.5)
     p.add_argument("--no_ema",         action="store_true",
                    help="Load model.pt instead of ema.pt.")
     return p, p.parse_args()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Model loading
-# ──────────────────────────────────────────────────────────────────────────────
-
-def load_model(ckpt_dir: str, device, use_ema: bool = True):
-    with open(os.path.join(ckpt_dir, "config.json")) as f:
-        config = json.load(f)
-
-    feature_mode = config.get("feature_mode", "humanml3d")
-    context_dim, text_seq_len = get_encoder_dims(config)
-    model = build_model({
-        "feature_mode": feature_mode,
-        "input_dim":    263,
-        "latent_dim":   config.get("latent_dim",  512),
-        "context_dim":  context_dim,
-        "text_seq_len": text_seq_len,
-        "num_heads":    config.get("num_heads",   8),
-        "num_layers":   config.get("num_layers",  8),
-        "max_frames":   config.get("max_frames",  196),
-        "dropout":      0.0,
-    }, device=device)
-
-    weights = os.path.join(ckpt_dir, "ema.pt" if use_ema else "model.pt")
-    model.load_state_dict(torch.load(weights, map_location=device, weights_only=True))
-    model.eval()
-    print(f"Loaded: {weights}")
-    return model, config
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -124,26 +98,6 @@ def recover_joints(raw_features: np.ndarray, feature_mode: str) -> np.ndarray:
         from data.smplh_features import smplh_decode_to_joints
         return smplh_decode_to_joints(raw_features, _smplh_body_model())
     return recover_from_ric(raw_features, joints_num=22)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# MPJPE (root-relative, per frame)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def compute_mpjpe(joints_gen: np.ndarray, joints_gt: np.ndarray):
-    """
-    Root-relative MPJPE over the overlapping frame range.
-
-    Returns
-        per_frame  : (T_common,) MPJPE in metres for each frame
-        total      : scalar mean MPJPE
-        T_common   : number of frames compared
-    """
-    T_common = min(len(joints_gen), len(joints_gt))
-    gen = joints_gen[:T_common] - joints_gen[:T_common, 0:1, :]  # root-relative
-    gt  = joints_gt[:T_common]  - joints_gt[:T_common,  0:1, :]
-    per_frame = np.sqrt(((gen - gt) ** 2).sum(axis=-1)).mean(axis=-1)  # (T_common,)
-    return per_frame, float(per_frame.mean()), T_common
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -260,7 +214,7 @@ def main():
             if args.smooth_sigma > 0:
                 joints_gt = gaussian_filter1d(joints_gt, sigma=args.smooth_sigma, axis=0)
 
-            per_frame, total_mpjpe, T_common = compute_mpjpe(joints_gen, joints_gt)
+            per_frame, total_mpjpe, T_common = mpjpe_from_joints(joints_gen, joints_gt)
             print(f"   MPJPE: {total_mpjpe*1000:.1f} mm  (over {T_common} frames)")
 
             out_path = os.path.join(args.output_dir, f"{i:03d}_{clip_id}_{slug}.mp4")

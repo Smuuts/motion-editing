@@ -50,9 +50,7 @@ from model.text_encoder import build_text_encoder
 from model.body_groups import GROUP_NAMES
 from editing import MotionEditor
 from utils.visualise import recover_from_ric, save_comparison_animation
-
-# Reuse the checkpoint loader from the generation script (config + EMA weights).
-from sample_model import load_model
+from utils.model_io import load_model
 
 
 def parse_args():

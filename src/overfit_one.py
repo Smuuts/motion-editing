@@ -31,7 +31,7 @@ from model.dit import build_model
 from model.sampler import DDPMSampler
 from model.schedule import NoiseSchedule
 from model.text_encoder import build_text_encoder, get_encoder_dims
-from utils.visualise import recover_from_ric, save_comparison_animation
+from utils.visualise import recover_from_ric, save_comparison_animation, mpjpe_from_joints
 
 
 def parse_args():
@@ -82,14 +82,6 @@ def parse_args():
 
 def _recover_joints(raw_feat: np.ndarray, feature_mode: str) -> np.ndarray:
     return recover_from_ric(raw_feat, joints_num=22)
-
-
-def _compute_mpjpe(joints_gen: np.ndarray, joints_gt: np.ndarray):
-    T = min(len(joints_gen), len(joints_gt))
-    gen = joints_gen[:T] - joints_gen[:T, 0:1]
-    gt  = joints_gt[:T]  - joints_gt[:T,  0:1]
-    per_frame = np.sqrt(((gen - gt) ** 2).sum(axis=-1)).mean(axis=-1)
-    return per_frame, float(per_frame.mean()), T
 
 
 def main():
@@ -262,7 +254,7 @@ def main():
         joints_gen = gaussian_filter1d(joints_gen, sigma=args.smooth_sigma, axis=0)
         joints_gt  = gaussian_filter1d(joints_gt,  sigma=args.smooth_sigma, axis=0)
 
-    per_frame, total_mpjpe, T_common = _compute_mpjpe(joints_gen, joints_gt)
+    per_frame, total_mpjpe, T_common = mpjpe_from_joints(joints_gen, joints_gt)
     print(f"MPJPE: {total_mpjpe * 1000:.1f} mm  (over {T_common} frames)")
 
     os.makedirs(args.output_dir, exist_ok=True)

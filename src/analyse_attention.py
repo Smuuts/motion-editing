@@ -45,10 +45,12 @@ src_dir = os.path.dirname(os.path.abspath(__file__))
 if src_dir not in sys.path:
     sys.path.insert(0, src_dir)
 
-from model.dit import build_model, GroupDiT, GROUP_NAMES
-from model.text_encoder import build_text_encoder, get_encoder_dims
+from model.dit import GroupDiT, GROUP_NAMES
+from model.text_encoder import build_text_encoder
 from model.schedule import NoiseSchedule
 from data.dataset import build_dataloader
+from utils.model_io import load_model
+from utils.masks import length_to_mask
 
 # G = 7: ["root", "left_leg", "right_leg", "spine", "left_arm", "right_arm", "head"]
 _G = len(GROUP_NAMES)
@@ -80,32 +82,6 @@ _STOP_WORDS = {
     "up", "down", "forward", "backward", "side", "out",
     "slowly", "quickly", "slightly",
 }
-
-def _load_model(ckpt_dir: str, device):
-    config_path = os.path.join(ckpt_dir, "config.json")
-    with open(config_path) as f:
-        config = json.load(f)
-
-    context_dim, text_seq_len = get_encoder_dims(config)
-    model = build_model({
-        "feature_mode": config.get("feature_mode", "humanml3d"),
-        "input_dim":    config.get("input_dim", 263),
-        "latent_dim":   config.get("latent_dim", 512),
-        "context_dim":  context_dim,
-        "text_seq_len": text_seq_len,
-        "num_heads":    config.get("num_heads", 8),
-        "num_layers":   config.get("num_layers", 8),
-        "max_frames":   config.get("max_frames", 196),
-        "dropout":      0.0,
-    }, device=device)
-
-    ema_path = os.path.join(ckpt_dir, "ema.pt")
-    model.load_state_dict(
-        torch.load(ema_path, map_location=device, weights_only=True)
-    )
-    model.eval()
-    return model, config
-
 
 def get_semantic_token_info(all_idxs: list[int], all_labels: list[str]):
     """
@@ -383,7 +359,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    model, config = _load_model(args.checkpoint, device)
+    model, config = load_model(args.checkpoint, device)
     feature_mode = config.get("feature_mode", "humanml3d")
     is_group     = isinstance(model, GroupDiT)
     G            = _G if is_group else None
@@ -420,7 +396,7 @@ def main():
         device=device,
     )
     B, F, _ = motions.shape
-    attn_mask = torch.arange(F, device=device)[None, :] < lengths[:, None]
+    attn_mask = length_to_mask(lengths, F)
 
     t_batch = torch.full((B,), args.noise_level, device=device, dtype=torch.long)
     x_t, _ = schedule.q_sample(motions, t_batch)

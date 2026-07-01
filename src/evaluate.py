@@ -46,7 +46,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 from model.t2m_eval import T2MEvaluator
-from utils.visualise import recover_from_ric
+from utils.visualise import recover_from_ric, mpjpe_from_joints
 from data.hml3d_features import extract_hml3d_features, get_tgt_offsets
 
 
@@ -117,15 +117,6 @@ def load_generated(generated_dir, data_root):
             "T":        int(data["T"]),
         })
     return clips, manifest
-
-
-# ── MPJPE ─────────────────────────────────────────────────────────────────────
-
-def mpjpe_from_joints(joints_gen, joints_gt):
-    T = min(len(joints_gen), len(joints_gt))
-    gen = joints_gen[:T] - joints_gen[:T, 0:1]
-    gt  = joints_gt[:T]  - joints_gt[:T,  0:1]
-    return float(np.sqrt(((gen - gt) ** 2).sum(axis=-1)).mean(axis=-1).mean())
 
 
 # ── FID ───────────────────────────────────────────────────────────────────────
@@ -292,7 +283,8 @@ def main():
         if args.smooth_sigma > 0:
             joints_gen = gaussian_filter1d(joints_gen, sigma=args.smooth_sigma, axis=0)
             joints_gt  = gaussian_filter1d(joints_gt,  sigma=args.smooth_sigma, axis=0)
-        mpjpe_values.append(mpjpe_from_joints(joints_gen, joints_gt))
+        _, clip_mpjpe, _ = mpjpe_from_joints(joints_gen, joints_gt)
+        mpjpe_values.append(clip_mpjpe)
 
     mpjpe_arr = np.array(mpjpe_values)
     print(f"MPJPE   {mpjpe_arr.mean()*1000:.2f} ± {mpjpe_arr.std()*1000:.2f} mm  (N={N})")

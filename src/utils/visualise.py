@@ -94,6 +94,123 @@ def recover_from_ric(data: np.ndarray, joints_num: int = 22) -> np.ndarray:
     return np.concatenate([r_pos[..., None, :], positions], axis=-2)
 
 
+def mpjpe_from_joints(joints_a: np.ndarray, joints_b: np.ndarray):
+    """Root-relative Mean Per-Joint Position Error between two joint sequences.
+
+    joints_a, joints_b : (T, J, 3) world-space positions (any joint count/order,
+                          as long as both arrays use the same one). Joint 0 is
+                          treated as the root and subtracted out before comparing.
+    Compares only the overlapping frame range if the two sequences differ in length.
+
+    Returns (per_frame (T_common,), mean: float, T_common: int).
+    """
+    T_common = min(len(joints_a), len(joints_b))
+    a = joints_a[:T_common] - joints_a[:T_common, 0:1]
+    b = joints_b[:T_common] - joints_b[:T_common, 0:1]
+    per_frame = np.sqrt(((a - b) ** 2).sum(axis=-1)).mean(axis=-1)  # (T_common,)
+    return per_frame, float(per_frame.mean()), T_common
+
+
+# ── Shared rendering helpers ────────────────────────────────────────────────────
+#
+# save_animation / show_animation / save_comparison_animation all draw the same
+# KINEMATIC_CHAIN skeleton on one or two black 3D axes and recentre the viewport
+# on the root joint every frame; these helpers hold that common setup/update logic
+# so the three entry points below only differ in how many axes they use and
+# whether the result is saved or shown.
+
+def _style_3d_axis(ax):
+    """Black background + hidden panes — the shared look of every skeleton axis."""
+    ax.set_facecolor("black")
+    for pane in (ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane):
+        pane.fill = False
+
+
+def _init_3d_axis(ax, z_min, z_max, title=None):
+    """One-time axis setup (view angle, labels, height range) — call from init_func."""
+    ax.set_zlim(z_min, z_max)
+    ax.view_init(elev=20, azim=-70)
+    ax.set_xlabel("X",       color="gray", fontsize=7)
+    ax.set_ylabel("Z (fwd)", color="gray", fontsize=7)
+    ax.set_zlabel("Y (up)",  color="gray", fontsize=7)
+    ax.tick_params(colors="gray", labelsize=6)
+    if title:
+        ax.set_title(title, color="white", fontsize=9, pad=4)
+
+
+def _make_skeleton_lines(ax):
+    """Create one empty Line3D per KINEMATIC_CHAIN entry on `ax`. Returns [(chain, line), ...]."""
+    return [
+        (chain, ax.plot([], [], [], "-o", color=color, markersize=3, linewidth=2)[0])
+        for chain, color in zip(KINEMATIC_CHAIN, CHAIN_COLORS)
+    ]
+
+
+def _update_skeleton(ax, lines, joints, frame, hw, z_min, z_max):
+    """Recentre the viewport on the current pelvis position and redraw one frame's pose.
+
+    joints : (T, J, 3) SMPL axes (X=right, Y=up, Z=fwd), mapped to matplotlib's
+             (X, Y=depth, Z=vertical) by swapping SMPL's Y and Z.
+    """
+    cx, cy = joints[frame, 0, 0], joints[frame, 0, 2]
+    ax.set_xlim(cx - hw, cx + hw)
+    ax.set_ylim(cy - hw, cy + hw)
+    ax.set_zlim(z_min, z_max)
+    for chain, line in lines:
+        line.set_data(joints[frame, chain, 0], joints[frame, chain, 2])
+        line.set_3d_properties(joints[frame, chain, 1])
+
+
+def _height_range(*joint_arrays):
+    """Global Y (height) range across one or more (T, J, 3) joint arrays, padded by 0.2 m."""
+    lo = min(j[:, :, 1].min() for j in joint_arrays)
+    hi = max(j[:, :, 1].max() for j in joint_arrays)
+    return lo - 0.2, hi + 0.2
+
+
+def _animate_skeleton(joints, title, fps, figsize, save_path):
+    """Shared driver for save_animation / show_animation.
+
+    joints    : (T, 22, 3) numpy array, world-space metres.
+    save_path : output path (.mp4/.gif) to save, or None to show interactively (blocking).
+    """
+    T = joints.shape[0]
+    hw = 1.0   # viewport half-width in metres (body ~0.5 m wide, arms ~0.8 m)
+    z_min, z_max = _height_range(joints)
+
+    fig = plt.figure(figsize=figsize, facecolor="black")
+    fig.patch.set_facecolor("black")
+    ax = fig.add_subplot(111, projection="3d")
+    _style_3d_axis(ax)
+    lines = _make_skeleton_lines(ax)
+
+    def init():
+        _init_3d_axis(ax, z_min, z_max, title=title)
+        return [l for _, l in lines]
+
+    def update(frame):
+        _update_skeleton(ax, lines, joints, frame, hw, z_min, z_max)
+        return [l for _, l in lines]
+
+    # blit=False required because axis limits change every frame
+    ani = animation.FuncAnimation(
+        fig, update, frames=T,
+        init_func=init, blit=False, interval=1000 // fps,
+    )
+
+    if save_path is None:
+        plt.show()   # blocks until the window is closed; `ani` must stay alive until then
+        return
+
+    writer = "ffmpeg" if save_path.endswith(".mp4") else "pillow"
+    ani.save(save_path, writer=writer, fps=fps, dpi=100,
+             savefig_kwargs={"facecolor": "black"})
+    plt.close(fig)
+    print(f"Saved animation: {save_path}")
+
+
+# ── Public entry points ──────────────────────────────────────────────────────────
+
 def save_animation(
     joints: np.ndarray,
     save_path: str,
@@ -111,66 +228,17 @@ def save_animation(
     of 1.0 m, so a walking character stays centred rather than appearing as a tiny
     dot in a large axis when the trajectory is long.
     """
-    T = joints.shape[0]
+    _animate_skeleton(joints, title, fps, figsize, save_path)
 
-    # Centre each frame on its pelvis position so the viewport follows the character.
-    # SMPL Y=up → matplotlib Z=vertical; SMPL Z=fwd → matplotlib Y=depth
-    hw = 1.0   # half-width of the viewport in metres (body ~0.5 m wide, arms ~0.8 m)
 
-    # Height range is global (person shouldn't jump off screen), lateral follows root.
-    z_min = joints[:, :, 1].min() - 0.2   # SMPL Y (height)
-    z_max = joints[:, :, 1].max() + 0.2
-
-    fig = plt.figure(figsize=figsize, facecolor="black")
-    ax  = fig.add_subplot(111, projection="3d")
-    fig.patch.set_facecolor("black")
-    ax.set_facecolor("black")
-    for pane in [ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane]:
-        pane.fill = False
-
-    lines = []
-    for chain, color in zip(KINEMATIC_CHAIN, CHAIN_COLORS):
-        line, = ax.plot([], [], [], "-o", color=color, markersize=3, linewidth=2)
-        lines.append((chain, line))
-
-    def init():
-        ax.set_zlim(z_min, z_max)
-        ax.view_init(elev=20, azim=-70)
-        ax.set_xlabel("X", color="gray", fontsize=7)
-        ax.set_ylabel("Z (fwd)", color="gray", fontsize=7)
-        ax.set_zlabel("Y (up)", color="gray", fontsize=7)
-        ax.tick_params(colors="gray", labelsize=6)
-        if title:
-            ax.set_title(title, color="white", fontsize=9, pad=4)
-        return [l for _, l in lines]
-
-    def update(frame):
-        # Recentre viewport on current pelvis XZ position.
-        cx = joints[frame, 0, 0]   # pelvis X (SMPL X → mpl X)
-        cy = joints[frame, 0, 2]   # pelvis Z (SMPL Z → mpl Y)
-        ax.set_xlim(cx - hw, cx + hw)
-        ax.set_ylim(cy - hw, cy + hw)
-        ax.set_zlim(z_min, z_max)
-
-        for chain, line in lines:
-            xs = joints[frame, chain, 0]
-            ys = joints[frame, chain, 2]   # SMPL Z → mpl Y
-            zs = joints[frame, chain, 1]   # SMPL Y → mpl Z
-            line.set_data(xs, ys)
-            line.set_3d_properties(zs)
-        return [l for _, l in lines]
-
-    # blit=False required because axis limits change every frame
-    ani = animation.FuncAnimation(
-        fig, update, frames=T,
-        init_func=init, blit=False, interval=1000 // fps,
-    )
-
-    writer = "ffmpeg" if save_path.endswith(".mp4") else "pillow"
-    ani.save(save_path, writer=writer, fps=fps, dpi=100,
-             savefig_kwargs={"facecolor": "black"})
-    plt.close(fig)
-    print(f"Saved animation: {save_path}")
+def show_animation(
+    joints: np.ndarray,
+    title: str = "",
+    fps: int = 20,
+    figsize: tuple = (6, 6),
+):
+    """Display a skeleton animation interactively (blocking). Viewport follows root."""
+    _animate_skeleton(joints, title, fps, figsize, save_path=None)
 
 
 def save_comparison_animation(
@@ -199,19 +267,14 @@ def save_comparison_animation(
     T_gt     = len(joints_gt)
     T        = max(T_gen, T_gt)
     hw       = 1.0
-
-    z_min = min(joints_gen[:, :, 1].min(), joints_gt[:, :, 1].min()) - 0.2
-    z_max = max(joints_gen[:, :, 1].max(), joints_gt[:, :, 1].max()) + 0.2
+    z_min, z_max = _height_range(joints_gen, joints_gt)
 
     fig = plt.figure(figsize=figsize, facecolor="black")
     fig.patch.set_facecolor("black")
     ax_gen = fig.add_subplot(121, projection="3d")
     ax_gt  = fig.add_subplot(122, projection="3d")
-
     for ax in (ax_gen, ax_gt):
-        ax.set_facecolor("black")
-        for pane in [ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane]:
-            pane.fill = False
+        _style_3d_axis(ax)
         ax.tick_params(colors="gray", labelsize=6)
 
     if title:
@@ -230,47 +293,24 @@ def save_comparison_animation(
         ha="center", color="cyan", fontsize=9,
     )
 
-    lines_gen, lines_gt = [], []
-    for chain, color in zip(KINEMATIC_CHAIN, CHAIN_COLORS):
-        lg, = ax_gen.plot([], [], [], "-o", color=color, markersize=3, linewidth=2)
-        lr, = ax_gt.plot([], [], [], "-o", color=color, markersize=3, linewidth=2)
-        lines_gen.append((chain, lg))
-        lines_gt.append((chain, lr))
+    lines_gen = _make_skeleton_lines(ax_gen)
+    lines_gt  = _make_skeleton_lines(ax_gt)
 
     def _init():
-        for ax in (ax_gen, ax_gt):
-            ax.set_zlim(z_min, z_max)
-            ax.view_init(elev=20, azim=-70)
-            ax.set_xlabel("X",      color="gray", fontsize=7)
-            ax.set_ylabel("Z (fwd)", color="gray", fontsize=7)
-            ax.set_zlabel("Y (up)", color="gray", fontsize=7)
+        _init_3d_axis(ax_gen, z_min, z_max)
+        _init_3d_axis(ax_gt,  z_min, z_max)
         return [l for _, l in lines_gen] + [l for _, l in lines_gt] + [mpjpe_txt]
 
     def _update(frame):
         if frame < T_gen:
-            cx, cy = joints_gen[frame, 0, 0], joints_gen[frame, 0, 2]
-            ax_gen.set_xlim(cx - hw, cx + hw)
-            ax_gen.set_ylim(cy - hw, cy + hw)
-            ax_gen.set_zlim(z_min, z_max)
-            for chain, line in lines_gen:
-                line.set_data(joints_gen[frame, chain, 0], joints_gen[frame, chain, 2])
-                line.set_3d_properties(joints_gen[frame, chain, 1])
-
+            _update_skeleton(ax_gen, lines_gen, joints_gen, frame, hw, z_min, z_max)
         if frame < T_gt:
-            cx, cy = joints_gt[frame, 0, 0], joints_gt[frame, 0, 2]
-            ax_gt.set_xlim(cx - hw, cx + hw)
-            ax_gt.set_ylim(cy - hw, cy + hw)
-            ax_gt.set_zlim(z_min, z_max)
-            for chain, line in lines_gt:
-                line.set_data(joints_gt[frame, chain, 0], joints_gt[frame, chain, 2])
-                line.set_3d_properties(joints_gt[frame, chain, 1])
-
+            _update_skeleton(ax_gt, lines_gt, joints_gt, frame, hw, z_min, z_max)
         if frame < T_common:
             mpjpe_txt.set_text(
                 f"Frame {frame:3d}: {mpjpe_per_frame[frame] * 1000:.1f} mm  |  "
                 f"Avg: {total_mpjpe * 1000:.1f} mm"
             )
-
         return [l for _, l in lines_gen] + [l for _, l in lines_gt] + [mpjpe_txt]
 
     ani = animation.FuncAnimation(
@@ -282,59 +322,3 @@ def save_comparison_animation(
              savefig_kwargs={"facecolor": "black"})
     plt.close(fig)
     print(f"Saved comparison: {save_path}")
-
-
-def show_animation(
-    joints: np.ndarray,
-    title: str = "",
-    fps: int = 20,
-    figsize: tuple = (6, 6),
-):
-    """Display a skeleton animation interactively (blocking). Viewport follows root."""
-    T   = joints.shape[0]
-    hw  = 1.0
-    z_min = joints[:, :, 1].min() - 0.2
-    z_max = joints[:, :, 1].max() + 0.2
-
-    fig = plt.figure(figsize=figsize, facecolor="black")
-    ax  = fig.add_subplot(111, projection="3d")
-    fig.patch.set_facecolor("black")
-    ax.set_facecolor("black")
-    for pane in [ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane]:
-        pane.fill = False
-
-    lines = []
-    for chain, color in zip(KINEMATIC_CHAIN, CHAIN_COLORS):
-        line, = ax.plot([], [], [], "-o", color=color, markersize=3, linewidth=2)
-        lines.append((chain, line))
-
-    def init():
-        ax.set_zlim(z_min, z_max)
-        ax.view_init(elev=20, azim=-70)
-        ax.set_xlabel("X", color="gray", fontsize=7)
-        ax.set_ylabel("Z (fwd)", color="gray", fontsize=7)
-        ax.set_zlabel("Y (up)", color="gray", fontsize=7)
-        ax.tick_params(colors="gray", labelsize=6)
-        if title:
-            ax.set_title(title, color="white", fontsize=9, pad=4)
-        return [l for _, l in lines]
-
-    def update(frame):
-        cx = joints[frame, 0, 0]
-        cy = joints[frame, 0, 2]
-        ax.set_xlim(cx - hw, cx + hw)
-        ax.set_ylim(cy - hw, cy + hw)
-        ax.set_zlim(z_min, z_max)
-        for chain, line in lines:
-            xs = joints[frame, chain, 0]
-            ys = joints[frame, chain, 2]
-            zs = joints[frame, chain, 1]
-            line.set_data(xs, ys)
-            line.set_3d_properties(zs)
-        return [l for _, l in lines]
-
-    ani = animation.FuncAnimation(  # noqa: F841 — must be kept alive for plt.show()
-        fig, update, frames=T,
-        init_func=init, blit=False, interval=1000 // fps,
-    )
-    plt.show()
