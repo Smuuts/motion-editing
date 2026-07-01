@@ -10,7 +10,7 @@ or artifacts derived by scripts in this repo.
 |---|---|---|
 | `data/HumanML3D/` | **Submodule** — full HumanML3D repo (`amass_data/`, `index.csv`, processing notebooks), and home of the processed dataset + SMPL features below. | `github.com/EricGuo5513/HumanML3D` |
 | `data/HumanML3D/HumanML3D/` | **Processed** HumanML3D the model trains on: `Mean.npy`, `Std.npy`, `new_joints/`, `new_joint_vecs/` (263-d), `texts/`, `{train,val,test}.txt`. This is `--data_root`. | produced by the HumanML3D repo |
-| `data/HumanML3D/HumanML3D_smplh/` | **Derived** — HumanML3D in 135-d SMPL-H features for SMPL-rep training (`<id>.npy`, `M<id>.npy`, `Mean.npy`, `Std.npy`). | `src/data/amass_to_smplh.py` + `smplh_stats.py` |
+| `data/HumanML3D/HumanML3D_smplh/` | **Derived** — HumanML3D in 135-d SMPL-H features for SMPL-rep training. Mirrors the processed layout: `new_joint_vecs/` (`<id>.npy` + `M<id>.npy`), `texts/`, `Mean.npy`, `Std.npy`, `{train,val,test}.txt`. Self-contained: this is `--data_root` for smplh train/generate. | `src/data/amass_to_smplh.py` + `smplh_stats.py` |
 | `data/motionfix/` | **Submodule** — MotionFix repo. Contains the dataset (`data/motionfix-dataset/*.pth.tar`), SMPL-H body models (`data/body_models/smplh/`), the TMR evaluator (`eval-deps/`), and its venv (`mfix-env/`). | `github.com/athn-nik/motionfix` |
 | `data/t2m_evaluator/` | Guo et al. T2M evaluator (FID / R-precision) used by `src/evaluate.py`: `checkpoint/`, `glove/`, `t2m/`. | T2M / HumanML3D release |
 | `data/motionfix/motionfix_smpl/` | **Derived** — SMPL fits for the MotionFix eval bridge / ceiling refs. | `src/eval/joints2smpl_fit.py` |
@@ -78,15 +78,18 @@ python src/data/amass_to_smplh.py \
     --splits $HML/train.txt $HML/val.txt $HML/test.txt
 python src/data/smplh_stats.py --feat_dir data/HumanML3D/HumanML3D_smplh --split $HML/train.txt
 ```
-Produces 135-d `[trans_delta | body_pose_6d | global_orient_6d]` per clip (+ `M`-mirror) and
-`Mean/Std.npy`. HumanAct12 clips (~1191) are skipped — no SMPL params. Filter the split files to
-existing ids before training:
+Produces 135-d `[trans_delta | body_pose_6d | global_orient_6d]` per clip (+ `M`-mirror) under
+`new_joint_vecs/`, plus `Mean/Std.npy` at the root. HumanAct12 clips (~1191) are skipped — no SMPL
+params. Then filter the split files to existing ids and copy the text annotations over so the dir
+is self-contained (no `text_root` needed at train time):
 
 ```bash
 SMPLH=data/HumanML3D/HumanML3D_smplh
 for s in train val test; do
-  grep -Fxf <(ls $SMPLH | sed 's/\.npy$//') data/HumanML3D/HumanML3D/$s.txt > $SMPLH/$s.txt
+  grep -Fxf <(ls $SMPLH/new_joint_vecs | sed 's/\.npy$//') data/HumanML3D/HumanML3D/$s.txt > $SMPLH/$s.txt
 done
+cp -r data/HumanML3D/HumanML3D/texts $SMPLH/texts        # annotations (M-mirror texts included)
+# text_emb/ is optional — copy it too if you precomputed embeddings; otherwise text is encoded on the fly
 ```
 
 ## 4. T2M evaluator

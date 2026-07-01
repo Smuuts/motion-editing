@@ -17,7 +17,9 @@ from tqdm import tqdm
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--feat_dir", required=True, help="Dir of 135-d feature .npy from amass_to_smplh.py.")
+    ap.add_argument("--feat_dir", required=True,
+                    help="smplh dataset dir from amass_to_smplh.py (contains new_joint_vecs/). "
+                         "Mean.npy/Std.npy are written to its root.")
     ap.add_argument("--split", required=True, help="train.txt — ids to compute stats over.")
     ap.add_argument("--eps", type=float, default=1e-8, help="Std floor (avoid divide-by-zero channels).")
     args = ap.parse_args()
@@ -28,7 +30,7 @@ def main():
     s = ssq = None
     missing = 0
     for cid in tqdm(ids, desc="stats"):
-        p = os.path.join(args.feat_dir, f"{cid}.npy")
+        p = os.path.join(args.feat_dir, "new_joint_vecs", f"{cid}.npy")
         if not os.path.exists(p):
             missing += 1
             continue

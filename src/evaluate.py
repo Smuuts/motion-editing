@@ -47,6 +47,7 @@ matplotlib.use("Agg")
 
 from model.t2m_eval import T2MEvaluator
 from utils.visualise import recover_from_ric
+from data.hml3d_features import extract_hml3d_features, get_tgt_offsets
 
 
 def parse_args():
@@ -54,7 +55,13 @@ def parse_args():
     p.add_argument("--generated_dir", required=True,
                    help="Directory written by generate.py (contains .npz files + manifest.json).")
     p.add_argument("--data_root",     required=True,
-                   help="HumanML3D root — for Mean/Std (MPJPE) and texts/ (R-Precision).")
+                   help="Processed HumanML3D root — texts/ (R-Precision), 263 Mean/Std "
+                        "(humanml3d MPJPE), and new_joints/ (smplh tgt-offset reference).")
+    p.add_argument("--smplh_feat_root", default=None,
+                   help="smplh mode only: dir with the 135-d feature Mean/Std used to "
+                        "denormalise the generated clips (defaults to manifest['data_root']).")
+    p.add_argument("--smplh_model_path", default="data/motionfix/data/body_models/smplh",
+                   help="smplh mode only: SMPLHLayer dir (needs SMPLH_NEUTRAL.npz).")
     p.add_argument("--evaluator_dir", required=True,
                    help="Root of T2M evaluator files (e.g. data/t2m_evaluator).")
     p.add_argument("--experiment_name", required=True,
@@ -180,6 +187,51 @@ def compute_diversity(motion_embs, diversity_times=300, seed=0):
     return float(np.sqrt(((motion_embs[first] - motion_embs[second]) ** 2).sum(axis=-1)).mean())
 
 
+# ── Feature decoding (rep-aware) ────────────────────────────────────────────────
+#
+# The T2M evaluator only understands 263-d HumanML3D features, so smplh-generated
+# clips (135-d) are decoded to joints via SMPL forward kinematics and re-extracted into
+# 263-d features. Both gen AND gt go through the identical path so the FID stays a
+# self-consistent comparison. The decode is: raw135 -> Y-up joints (smplh_decode_to_joints)
+# -> extract_hml3d_features -> raw263.
+
+def build_decoders(feature_mode, args, manifest, mean, std):
+    """Return (to_raw263, to_joints): closures mapping a *normalised* motion (as stored in
+    the .npz) to raw 263-d HumanML3D features and to (T, 22, 3) Y-up joints respectively."""
+    if feature_mode != "smplh":
+        def to_raw263(m_norm):
+            return (m_norm * std + mean).astype(np.float32)
+        def to_joints(m_norm):
+            return recover_from_ric((m_norm * std + mean).astype(np.float32), joints_num=22)
+        return to_raw263, to_joints
+
+    # smplh: denormalise with the 135-d feature stats, FK to joints, re-extract 263.
+    import smplx
+    from data.smplh_features import smplh_decode_to_joints
+
+    feat_root = args.smplh_feat_root or manifest.get("data_root")
+    if feat_root is None:
+        raise ValueError("smplh eval needs the 135-d feature Mean/Std: pass --smplh_feat_root "
+                         "or regenerate so manifest['data_root'] is present.")
+    smplh_mean = np.load(os.path.join(feat_root, "Mean.npy"))
+    smplh_std  = np.load(os.path.join(feat_root, "Std.npy"))
+    body_model = smplx.SMPLHLayer(model_path=args.smplh_model_path, gender="neutral", ext="npz").eval()
+
+    # Rest-pose skeleton to retarget onto: taken once from a reference HumanML3D clip.
+    ref_dir = os.path.join(args.data_root, "new_joints")
+    ref_files = sorted(f for f in os.listdir(ref_dir) if f.endswith(".npy"))
+    tgt_offsets = get_tgt_offsets(np.load(os.path.join(ref_dir, ref_files[0])))
+
+    def to_joints(m_norm):
+        raw135 = (m_norm * smplh_std + smplh_mean).astype(np.float32)
+        return smplh_decode_to_joints(raw135, body_model)     # (T, 22, 3) Y-up
+
+    def to_raw263(m_norm):
+        return extract_hml3d_features(to_joints(m_norm), tgt_offsets)   # (T-1, 263)
+
+    return to_raw263, to_joints
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -206,6 +258,12 @@ def main():
         device=device,
     )
 
+    feature_mode = manifest.get("feature_mode", "humanml3d")
+    # Robustness: manifests from older runs lack feature_mode — infer from the stored dim.
+    if clips and clips[0]["gen_norm"].shape[-1] == 135:
+        feature_mode = "smplh"
+    print(f"Feature mode: {feature_mode}")
+
     mean = np.load(os.path.join(args.data_root, "Mean.npy"))
     std  = np.load(os.path.join(args.data_root, "Std.npy"))
 
@@ -218,19 +276,19 @@ def main():
     eval_mean = np.load(os.path.join(eval_meta, "mean.npy"))
     eval_std  = np.load(os.path.join(eval_meta, "std.npy"))
 
-    def to_eval_norm(motion_hml_norm):
-        raw = motion_hml_norm * std + mean
+    # Rep-aware decode: humanml3d passes through; smplh runs SMPL-FK -> re-extract 263.
+    to_raw263, to_joints = build_decoders(feature_mode, args, manifest, mean, std)
+
+    def to_eval_norm(motion_norm):
+        raw = to_raw263(motion_norm)
         return ((raw - eval_mean) / eval_std).astype(np.float32)
 
     # ── MPJPE (non-standard, internal tracking only) ───────────────────────────
     print("\n── MPJPE (internal, not comparable to literature) ──────────────────────────")
     mpjpe_values = []
     for clip in tqdm(clips, desc="MPJPE"):
-        T       = clip["T"]
-        gen_raw = clip["gen_norm"] * std + mean
-        gt_raw  = clip["gt_norm"]  * std + mean
-        joints_gen = recover_from_ric(gen_raw, joints_num=22)
-        joints_gt  = recover_from_ric(gt_raw,  joints_num=22)
+        joints_gen = to_joints(clip["gen_norm"])
+        joints_gt  = to_joints(clip["gt_norm"])
         if args.smooth_sigma > 0:
             joints_gen = gaussian_filter1d(joints_gen, sigma=args.smooth_sigma, axis=0)
             joints_gt  = gaussian_filter1d(joints_gt,  sigma=args.smooth_sigma, axis=0)
@@ -278,6 +336,7 @@ def main():
     summary = {
         "generated_dir": args.generated_dir,
         "evaluator_dir": args.evaluator_dir,
+        "feature_mode":  feature_mode,
         "n_clips":       N,
         "mpjpe_mean_mm": round(float(mpjpe_arr.mean() * 1000), 4),
         "mpjpe_std_mm":  round(float(mpjpe_arr.std()  * 1000), 4),

@@ -56,10 +56,9 @@ def build_parser():
     p.add_argument("--feature_mode", type=str,   default="humanml3d",
                    choices=["humanml3d", "smplh"],
                    help="Both modes are body-part-grouped (GroupDiT). 'humanml3d' = 263-d HumanML3D "
-                        "features; 'smplh' = 135-d SMPL-H features (from src/data/amass_to_smplh.py).")
-    p.add_argument("--text_root", type=str, default=None,
-                   help="Where texts/ and text_emb/ live (default: --data_root). For smplh, point at "
-                        "the processed HumanML3D dir (e.g. data/HumanML3D/HumanML3D).")
+                        "features; 'smplh' = 135-d SMPL-H features (from src/data/amass_to_smplh.py). "
+                        "Both read features from data_root/new_joint_vecs/ and texts from "
+                        "data_root/texts/.")
     p.add_argument("--smplh_model_path", type=str,
                    default="data/motionfix/data/body_models/smplh",
                    help="SMPLHLayer dir (smplh mode geometric losses). Needs SMPLH_NEUTRAL.npz.")
@@ -233,7 +232,7 @@ def train_one_epoch(
 
     n = len(loader)
     geo_epoch = {}
-    if hml3d_stats is not None:
+    if geo_fn is not None:
         geo_epoch = {
             "train/geo_pos_epoch":  total_geo["pos"]  / n,
             "train/geo_vel_epoch":  total_geo["vel"]  / n,
@@ -347,7 +346,6 @@ def main():
         max_frames=args.max_frames,
         num_workers=args.num_workers,
         feature_mode=args.feature_mode,
-        text_root=args.text_root,
     )
     train_loader = build_dataloader(args.data_root, split="train", **loader_kwargs)
     print(f"Training on {len(train_loader.dataset)} clips")

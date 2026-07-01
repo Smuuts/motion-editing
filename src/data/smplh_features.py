@@ -23,6 +23,15 @@ from smplx.lbs import batch_rodrigues, batch_rigid_transform
 _MIRROR_PERM = np.array([0, 2, 1, 3, 5, 4, 6, 8, 7, 9, 11, 10,
                          12, 14, 13, 15, 17, 16, 19, 18, 21, 20])
 
+# AMASS/SMPL world joints come out Z-up (head high +Z, feet low -Z), but the HumanML3D
+# convention — and everything downstream that consumes joints (recover_from_ric,
+# extract_hml3d_features, the animation renderer) — is Y-up. This proper rotation about X
+# (+90°) maps (x, y, z) -> (x, z, -y) so the body stands upright with gravity along -Y.
+# Determinant +1 (no reflection) so chirality is preserved. Applied as `joints @ AMASS_TO_HML3D`.
+AMASS_TO_HML3D = np.array([[1.0, 0.0, 0.0],
+                           [0.0, 0.0, -1.0],
+                           [0.0, 1.0, 0.0]], dtype=np.float32)
+
 
 def aa_to_rotmat(aa: torch.Tensor) -> torch.Tensor:
     """axis-angle (...,3) -> rotation matrix (...,3,3)."""
@@ -106,13 +115,21 @@ def smplh_world_joints(feat: torch.Tensor, J_rest: torch.Tensor, parents: torch.
     return posed.reshape(B, T, 22, 3) + t_world[:, :, None]
 
 
-def smplh_decode_to_joints(feat_raw: np.ndarray, body_model) -> np.ndarray:
-    """RAW (T, 135) features -> (T, 22, 3) world joints (numpy). For decode / visualization."""
+def smplh_decode_to_joints(feat_raw: np.ndarray, body_model, to_hml3d_frame: bool = True) -> np.ndarray:
+    """RAW (T, 135) features -> (T, 22, 3) world joints (numpy). For decode / visualization.
+
+    `to_hml3d_frame=True` rotates the native Z-up SMPL joints into HumanML3D's Y-up frame
+    (via `AMASS_TO_HML3D`), which is what recover_from_ric / extract_hml3d_features / the
+    renderer all expect. Set False only if you need the raw SMPL-frame joints.
+    """
     J_rest, parents = smplh_rest_joints_and_parents(body_model)
     feat = torch.as_tensor(feat_raw, dtype=torch.float32)[None]   # (1,T,135)
     with torch.no_grad():
         joints = smplh_world_joints(feat, J_rest, parents)[0]
-    return joints.cpu().numpy()
+    joints = joints.cpu().numpy()
+    if to_hml3d_frame:
+        joints = joints @ AMASS_TO_HML3D
+    return joints
 
 
 def mirror_smplh(rots, trans):

@@ -49,7 +49,10 @@ from model.sampler import DDPMSampler
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint",     required=True)
-    p.add_argument("--data_root",      required=True)
+    p.add_argument("--data_root",      required=True,
+                   help="Feature root with new_joint_vecs/, texts/ and Mean/Std. "
+                        "smplh: data/HumanML3D/HumanML3D_smplh (135-d); humanml3d: "
+                        "data/HumanML3D/HumanML3D (263-d).")
     p.add_argument("--split",          default="val", choices=["train", "val", "test"])
     p.add_argument("--out_dir",        required=True)
     p.add_argument("--max_clips",      type=int, default=None)
@@ -90,6 +93,8 @@ def load_split(data_root, split, max_frames, min_frames=16, max_clips=None, seed
     with open(os.path.join(data_root, f"{split}.txt")) as f:
         all_ids = [l.strip() for l in f if l.strip()]
 
+    # Both reps share the HumanML3D layout: features in new_joint_vecs/, annotations in
+    # texts/ (and precomputed text_emb/ when present), all under data_root.
     vec_dir      = os.path.join(data_root, "new_joint_vecs")
     text_dir     = os.path.join(data_root, "texts")
     text_emb_dir = os.path.join(data_root, "text_emb")
@@ -145,6 +150,8 @@ def main():
 
     model, config = load_model(args.checkpoint, device, use_ema=not args.no_ema)
     max_frames    = config.get("max_frames", 196)
+    feature_mode  = config.get("feature_mode", "humanml3d")
+    print(f"Feature mode: {feature_mode}")
 
     mean = np.load(os.path.join(args.data_root, "Mean.npy"))
     std  = np.load(os.path.join(args.data_root, "Std.npy"))
@@ -165,6 +172,8 @@ def main():
     manifest = {
         "split":          args.split,
         "checkpoint":     args.checkpoint,
+        "feature_mode":   feature_mode,
+        "data_root":      args.data_root,
         "guidance_scale": args.guidance_scale,
         "num_steps":      args.num_steps,
         "seed":           args.seed,
@@ -191,8 +200,8 @@ def main():
                 skipped += 1
                 continue
 
-            raw_263 = np.load(clip["vec_path"])[:T]
-            gt_norm = (raw_263 - mean) / std
+            raw_feat = np.load(clip["vec_path"])[:T]   # (T, 263) or (T, 135) for smplh
+            gt_norm  = (raw_feat - mean) / std
 
             if clip["context_emb"] is not None:
                 ctx_np = clip["context_emb"]

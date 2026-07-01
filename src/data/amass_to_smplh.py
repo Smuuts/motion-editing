@@ -7,8 +7,10 @@ then featurizes to the 135-d MotionFix/TMR representation `[trans_delta | body_p
 global_orient_6d]` (see smplh_features.py, validated to ~5e-7 against MotionFix's loader). Also
 emits the `M`-prefixed left/right mirror so the ids match HumanML3D's split files.
 
-HumanAct12 clips are skipped (no SMPL params). Reuse your existing `texts/` and
-`train/val/test.txt` unchanged — the clip ids line up. Runs in the `ma` env.
+HumanAct12 clips are skipped (no SMPL params). Features are written to
+`<out_dir>/new_joint_vecs/<id>.npy`, mirroring the processed HumanML3D layout, so the smplh
+dataset dir is self-contained once you copy `texts/` and the `train/val/test.txt` splits over
+(the clip ids line up). Runs in the `ma` env.
 
     python src/data/amass_to_smplh.py \
         --hml3d_root /home/smuuts/Documents/MA/implementation/HumanML3D \
@@ -75,7 +77,10 @@ def main():
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
 
-    os.makedirs(args.out_dir, exist_ok=True)
+    # Mirror the HumanML3D layout: features live in new_joint_vecs/ so the smplh dataset dir
+    # has the same structure as the processed HumanML3D dir (texts/, Mean/Std, splits alongside).
+    vec_dir = os.path.join(args.out_dir, "new_joint_vecs")
+    os.makedirs(vec_dir, exist_ok=True)
     if args.save_raw:
         os.makedirs(os.path.join(args.out_dir, "raw"), exist_ok=True)
     keep = wanted_ids(args.splits)
@@ -96,8 +101,8 @@ def main():
             continue
         npz = os.path.join(args.hml3d_root, "amass_data", src[len("./pose_data/"):-4] + ".npz")
 
-        out_p = os.path.join(args.out_dir, f"{base}.npy")
-        m_out_p = os.path.join(args.out_dir, f"M{base}.npy")
+        out_p = os.path.join(vec_dir, f"{base}.npy")
+        m_out_p = os.path.join(vec_dir, f"M{base}.npy")
         if not args.overwrite and os.path.exists(out_p) and (args.no_mirror or os.path.exists(m_out_p)):
             continue
 
