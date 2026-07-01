@@ -33,8 +33,8 @@ from editing import masking
 @dataclass
 class InversionState:
     """Output of invert(): the noisy trajectory and its edit-friendly noise maps."""
-    xs: torch.Tensor          # (T, 1, F, 263) — x_t for t in [0, T); xs[0] == x0
-    zs: torch.Tensor          # (T, 1, F, 263) — z_t for t in [1, T); zs[0] unused
+    xs: torch.Tensor          # (T, 1, F, D) — x_t for t in [0, T); xs[0] == x0
+    zs: torch.Tensor          # (T, 1, F, D) — z_t for t in [1, T); zs[0] unused
 
 
 class MotionEditor:
@@ -43,22 +43,28 @@ class MotionEditor:
         self.schedule = schedule
         self.device   = device
         self.is_group = is_group
+        # Feature layout is representation-specific: 263 (humanml3d) or 135 (smplh).
+        # GroupDiT exposes both; fall back to 263 for legacy flat MotionDiT.
+        self.feat_dim = getattr(model, "input_dim", 263)
+        self.group_channels = getattr(model, "group_channels", None)
         self.model.eval()
 
     # ── Stage 1 ────────────────────────────────────────────────────────────────
     @torch.no_grad()
     def invert(self, x0: torch.Tensor, show_progress: bool = True) -> InversionState:
         """
-        x0 : (1, F, 263) normalised source motion (same space the model trained in).
+        x0 : (1, F, D) normalised source motion (same space the model trained in),
+             D = 263 (humanml3d) or 135 (smplh).
         Returns the InversionState consumed by collect_masks() and edit().
         """
         s = self.schedule
         T = s.T
         F = x0.shape[1]
+        D = x0.shape[2]
         x0 = x0.to(self.device)
 
         # 1. independent noisy sequence x_t (xs[0] = x0)
-        xs = torch.empty(T, 1, F, 263, device=self.device)
+        xs = torch.empty(T, 1, F, D, device=self.device)
         xs[0] = x0
         for t in range(1, T):
             sqrt_acp   = s.sqrt_alphas_cumprod[t]
@@ -66,7 +72,7 @@ class MotionEditor:
             xs[t] = sqrt_acp * x0 + sqrt_omacp * torch.randn_like(x0)
 
         # 2. edit-friendly noise maps z_t (for t in [1, T))
-        zs = torch.zeros(T, 1, F, 263, device=self.device)
+        zs = torch.zeros(T, 1, F, D, device=self.device)
         it = range(T - 1, 0, -1)
         it = tqdm(it, desc="Inversion", leave=False) if show_progress else it
         for t in it:
@@ -106,11 +112,13 @@ class MotionEditor:
             attn_fg, psi_fg = masking.collect_statistics(
                 self.model, self.schedule, state.xs, ctx, tok,
                 is_group=self.is_group, timesteps=timesteps, need_attn=need_attn,
+                group_channels=self.group_channels,
             )
             masks.append(masking.build_mask(
                 attn_fg, psi_fg, valid_frames.to(self.device), self.is_group,
                 lambda_attn=lambda_attn, lambda_noise=lambda_noise,
                 mask_mode=mask_mode, llm_group_mask=llm_m,
+                group_channels=self.group_channels, feat_dim=self.feat_dim,
             ))
         return masks
 

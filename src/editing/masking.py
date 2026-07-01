@@ -28,11 +28,18 @@ import torch
 from model.body_groups import GROUP_CHANNELS, N_GROUPS
 
 
-def _aggregate_channels_to_groups(per_channel: torch.Tensor, is_group: bool) -> torch.Tensor:
-    """(F, 263) channel quantity → (F, G) per-group mean. G=7 (group) or G=1 (frame)."""
+def _aggregate_channels_to_groups(per_channel: torch.Tensor, is_group: bool,
+                                  group_channels=None) -> torch.Tensor:
+    """(F, D) channel quantity → (F, G) per-group mean. G=7 (group) or G=1 (frame).
+
+    group_channels selects the representation's channel partition (263-d humanml3d by
+    default, or the 135-d smplh partition passed by the editor); D must match it.
+    """
     if not is_group:
         return per_channel.mean(dim=-1, keepdim=True)            # (F, 1)
-    cols = [per_channel[:, ch].mean(dim=-1) for ch in GROUP_CHANNELS]
+    if group_channels is None:
+        group_channels = GROUP_CHANNELS
+    cols = [per_channel[:, ch].mean(dim=-1) for ch in group_channels]
     return torch.stack(cols, dim=-1)                              # (F, G)
 
 
@@ -51,7 +58,8 @@ def _percentile_threshold(values: torch.Tensor, valid_frames: torch.Tensor,
 
 @torch.no_grad()
 def collect_statistics(model, schedule, xs, context_edit, token_idxs,
-                       is_group, num_groups=None, timesteps=None, need_attn=True):
+                       is_group, num_groups=None, timesteps=None, need_attn=True,
+                       group_channels=None):
     """
     Sweep the stored inversion sequence and accumulate the raw quantities for M1/M2.
 
@@ -101,8 +109,8 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
 
         # ψ = ε_θ(x_t, c_edit) − ε_θ(x_t, ∅) → M2 contribution
         eps_u = model(x_t, t_b, null_context)
-        psi = (eps_c - eps_u)[0].abs()                        # (F, 263)
-        psi_accum += _aggregate_channels_to_groups(psi, is_group)
+        psi = (eps_c - eps_u)[0].abs()                        # (F, D)
+        psi_accum += _aggregate_channels_to_groups(psi, is_group, group_channels)
         n += 1
 
     return attn_accum / max(n, 1), psi_accum / max(n, 1)
@@ -110,7 +118,8 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
 
 def build_mask(attn_fg, psi_fg, valid_frames, is_group,
                lambda_attn=70.0, lambda_noise=70.0,
-               mask_mode="m2_only", llm_group_mask=None):
+               mask_mode="m2_only", llm_group_mask=None,
+               group_channels=None, feat_dim=263):
     """
     Build the per-edit (F, G) mask according to `mask_mode`.
 
@@ -131,9 +140,12 @@ def build_mask(attn_fg, psi_fg, valid_frames, is_group,
     llm_group_mask  : (F, G) or (G,) bool — required for mask_mode="llm"; the groups
                       an instruction targets. A (G,) vector is broadcast over frames.
 
+    group_channels  : representation channel partition (263-d default, or 135-d smplh)
+    feat_dim        : total feature width D matching group_channels (263 or 135)
+
     Returns dict with:
       m_group   : (F, G) bool   — final mask, padding frames forced False
-      m_channel : (F, 263) float — group mask scattered to feature channels (for Eq. 1)
+      m_channel : (F, D) float  — group mask scattered to feature channels (for Eq. 1)
       edited    : (F,) bool      — frame has any active group (drives hard inpainting)
     """
     valid = valid_frames[:, None]
@@ -164,17 +176,24 @@ def build_mask(attn_fg, psi_fg, valid_frames, is_group,
 
     return {
         "m_group":   m_group,
-        "m_channel": group_mask_to_channels(m_group, is_group),
+        "m_channel": group_mask_to_channels(m_group, is_group, group_channels, feat_dim),
         "edited":    m_group.any(dim=-1),
     }
 
 
-def group_mask_to_channels(m_group: torch.Tensor, is_group: bool) -> torch.Tensor:
-    """(F, G) bool group mask → (F, 263) float channel mask via GROUP_CHANNELS."""
+def group_mask_to_channels(m_group: torch.Tensor, is_group: bool,
+                           group_channels=None, feat_dim=263) -> torch.Tensor:
+    """(F, G) bool group mask → (F, D) float channel mask via the channel partition.
+
+    Defaults to the 263-d humanml3d partition; the editor passes the model's own
+    group_channels + feat_dim (e.g. 135-d smplh).
+    """
     F = m_group.shape[0]
     if not is_group:
-        return m_group.float().expand(F, 263)                # G=1 → broadcast
-    out = torch.zeros(F, 263, device=m_group.device)
-    for g, ch in enumerate(GROUP_CHANNELS):
+        return m_group.float().expand(F, feat_dim)           # G=1 → broadcast
+    if group_channels is None:
+        group_channels = GROUP_CHANNELS
+    out = torch.zeros(F, feat_dim, device=m_group.device)
+    for g, ch in enumerate(group_channels):
         out[:, ch] = m_group[:, g : g + 1].float()
     return out

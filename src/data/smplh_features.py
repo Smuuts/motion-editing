@@ -132,6 +132,71 @@ def smplh_decode_to_joints(feat_raw: np.ndarray, body_model, to_hml3d_frame: boo
     return joints
 
 
+def features_to_smpl(feat_raw: np.ndarray):
+    """RAW (T,135) features -> (rots (T,66) axis-angle, trans (T,3) absolute).
+
+    Inverse of `smplh_to_features` up to a constant translation offset (the pelvis-frame
+    `trans_delta` integrates to a world trajectory anchored at trans[0]=0). MotionFix's TMR
+    re-derives `trans_delta` from (global_orient, trans), so that offset is irrelevant. Used
+    to decode the editor's output back to raw SMPL for fps resampling + the gen layout.
+    """
+    from scipy.spatial.transform import Rotation
+
+    feat = torch.as_tensor(np.asarray(feat_raw), dtype=torch.float32)[None]   # (1,T,135)
+    rotmats, trans_delta = features_to_rotmats(feat)                          # (1,T,22,3,3),(1,T,3)
+    go = rotmats[:, :, 0]                                                     # (1,T,3,3)
+    # invert change_for: world velocity v_i = R_{i-1} @ trans_delta_i, then integrate.
+    v = torch.zeros_like(trans_delta)
+    v[:, 1:] = torch.einsum("btij,btj->bti", go[:, :-1], trans_delta[:, 1:])
+    trans = torch.cumsum(v, dim=1)[0].numpy().astype(np.float32)             # (T,3)
+    T = rotmats.shape[1]
+    aa = Rotation.from_matrix(rotmats[0].reshape(-1, 3, 3).numpy()).as_rotvec()
+    rots = aa.reshape(T, 66).astype(np.float32)
+    return rots, trans
+
+
+def resample_motion(rots, trans, src_fps: float, dst_fps: float):
+    """Resample raw SMPL-H (rots (T,66) axis-angle, trans (T,3)) from src_fps to dst_fps.
+
+    Rotations via quaternion Slerp (per joint), translation via linear interpolation, over
+    the same clip duration. The editor runs at 20 fps (HumanML3D) but MotionFix/TMR is native
+    30 fps, so sources are 30->20 on input and edits 20->30 on output for comparable scoring.
+    """
+    from scipy.spatial.transform import Rotation, Slerp
+
+    rots = np.asarray(rots, dtype=np.float32)
+    trans = np.asarray(trans, dtype=np.float32)
+    T = rots.shape[0]
+    if src_fps == dst_fps or T < 2:
+        return rots.copy(), trans.copy()
+    T_dst = max(2, int(round(T * dst_fps / src_fps)))
+    t_src = np.arange(T) / src_fps
+    t_dst = np.linspace(0.0, t_src[-1], T_dst)
+
+    r = rots.reshape(T, 22, 3)
+    out = np.empty((T_dst, 22, 3), dtype=np.float32)
+    for j in range(22):
+        out[:, j] = Slerp(t_src, Rotation.from_rotvec(r[:, j]))(t_dst).as_rotvec()
+    rots_dst = out.reshape(T_dst, 66)
+    trans_dst = np.stack([np.interp(t_dst, t_src, trans[:, a]) for a in range(3)], axis=-1)
+    return rots_dst.astype(np.float32), trans_dst.astype(np.float32)
+
+
+def smpl_to_gen_layout(rots, trans) -> np.ndarray:
+    """Raw SMPL-H (rots (T,66) aa, trans (T,3)) -> MotionFix gen layout (T,135):
+    [trans(3) | global_orient_6d(6) | body_pose_6d(126)].
+
+    This is the layout `tmr_evaluator.collect_gen_samples` expects (it re-derives trans_delta
+    and reorders internally) — NOT the training `smplh_to_features` layout.
+    """
+    rots = torch.as_tensor(np.asarray(rots), dtype=torch.float32)
+    trans = torch.as_tensor(np.asarray(trans), dtype=torch.float32)
+    T = rots.shape[0]
+    go6d = aa_to_6d(rots[:, :3])                            # (T,6)
+    bp6d = aa_to_6d(rots[:, 3:66].reshape(T, 21, 3)).reshape(T, 126)
+    return torch.cat([trans, go6d, bp6d], dim=-1).numpy().astype(np.float32)
+
+
 def mirror_smplh(rots, trans):
     """Sagittal (left<->right) mirror of raw SMPL-H, matching HumanML3D's `M`-clips.
 
