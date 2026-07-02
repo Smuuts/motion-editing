@@ -140,6 +140,15 @@ def train_one_epoch(
             torch.cuda.empty_cache()
             continue
 
+    # The caching allocator never shrinks its reservation back down on its own between
+    # steps — only an explicit empty_cache() does that. Without this, a transient peak
+    # (e.g. one step's OOM-triggered retry needing a bigger segment) permanently
+    # ratchets the reserved high-water-mark up for the rest of the run, epoch after
+    # epoch, until there's no slack left and every batch starts failing for good.
+    # Cheap relative to an epoch; do it every time, not just after an OOM.
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
     n = len(loader)
     geo_epoch = {}
     if geo_fn is not None:
@@ -200,5 +209,8 @@ def validate_one_epoch(
             gc.collect()
             torch.cuda.empty_cache()
             continue
+
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     return total_loss / len(loader)

@@ -263,6 +263,8 @@ def main():
     # training loop
     print(f"\nStarting training from epoch {start_epoch}")
     for epoch in range(start_epoch, args.epochs):
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         avg_loss, geo_epoch, n_oom = train_one_epoch(
             model, ema, text_encoder, schedule, optimizer, scaler,
             train_loader, device, args.cfg_dropout,
@@ -293,12 +295,23 @@ def main():
         # epoch-over-epoch; a one-off crash from GPU contention instead shows a flat
         # trend right up to the point something else on the machine spiked. Cheap
         # enough to log unconditionally so this is available after the fact.
+        #
+        # end-of-epoch memory_allocated/reserved() is a resting-state snapshot, not
+        # what actually happened during the epoch — a step that peaked at 33 GiB and
+        # freed back down to 1.4 GiB reads identically to a step that never went above
+        # 2 GiB. max_memory_allocated/reserved() (reset per epoch above) capture the
+        # real high-water mark, which is what actually determines whether a batch OOMs.
         if device.type == "cuda":
-            mem_alloc    = torch.cuda.memory_allocated(device) / 1e9
-            mem_reserved = torch.cuda.memory_reserved(device) / 1e9
-            log_line += f" | gpu {mem_alloc:.2f}/{mem_reserved:.2f} GiB"
+            mem_alloc     = torch.cuda.memory_allocated(device) / 1e9
+            mem_reserved  = torch.cuda.memory_reserved(device) / 1e9
+            peak_alloc    = torch.cuda.max_memory_allocated(device) / 1e9
+            peak_reserved = torch.cuda.max_memory_reserved(device) / 1e9
+            log_line += (f" | gpu {mem_alloc:.2f}/{mem_reserved:.2f} GiB"
+                         f" | peak {peak_alloc:.2f}/{peak_reserved:.2f} GiB")
             logger.log({"train/gpu_mem_allocated_gb": mem_alloc,
                        "train/gpu_mem_reserved_gb": mem_reserved,
+                       "train/gpu_mem_peak_allocated_gb": peak_alloc,
+                       "train/gpu_mem_peak_reserved_gb": peak_reserved,
                        "train/n_oom": n_oom, "train/epoch": epoch})
 
         if val_loader is not None and (epoch + 1) % args.val_every == 0:
