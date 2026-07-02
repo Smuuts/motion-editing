@@ -6,6 +6,8 @@ enabled, the same MDM-style geometric losses — factored into _diffusion_loss a
 _add_geo_losses so the train/val objectives can't silently drift apart.
 """
 
+import gc
+
 import torch
 import torch.nn as nn
 from torch.amp import autocast
@@ -130,15 +132,11 @@ def train_one_epoch(
                 logger.log({"train/loss": loss.item(), "train/step": epoch * len(loader) + step, **geo_log})
 
         except torch.cuda.OutOfMemoryError as e:
-            # An overnight unattended run must survive a transient OOM (fragmentation,
-            # a co-tenant process on a shared GPU, an unusually large batch) rather than
-            # crash and lose everything since the last checkpoint. Drop this batch, free
-            # what we can, and keep going; ema/optimizer state are untouched since we
-            # never reached the step().
             n_oom += 1
             print(f"\n[OOM] epoch {epoch} step {step}: skipping batch "
                  f"({n_oom} so far this epoch). {e}", flush=True)
             optimizer.zero_grad(set_to_none=True)
+            gc.collect()
             torch.cuda.empty_cache()
             continue
 
@@ -198,6 +196,8 @@ def validate_one_epoch(
 
         except torch.cuda.OutOfMemoryError as e:
             print(f"\n[OOM] val epoch {epoch}: skipping batch. {e}", flush=True)
+            del e
+            gc.collect()
             torch.cuda.empty_cache()
             continue
 
