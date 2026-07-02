@@ -117,10 +117,7 @@ def main():
     if args.config:
         with open(args.config) as f:
             config.update(json.load(f))
-
-    # On resume, treat the saved config in --output_dir as the base so model
-    # architecture etc. need not be re-specified. Explicit CLI args still win,
-    # and resume/output_dir are kept so the resume itself isn't clobbered.
+            
     if args.resume:
         saved_path = os.path.join(args.output_dir, "config.json")
         if os.path.exists(saved_path):
@@ -225,8 +222,6 @@ def main():
     }, device=device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.1f}M")
 
-    # LEDITS++ uses the EMA model for all inference passes (inversion + editing).
-    # Load from checkpoint_latest/ema.pt, not model.pt.
     ema      = EMA(model, decay=args.ema_decay)
     schedule = NoiseSchedule(timesteps=args.timesteps, device=device)
     scaler   = GradScaler(device=device.type, enabled=device.type == "cuda")
@@ -291,16 +286,6 @@ def main():
         if n_oom:
             log_line += f" | OOM {n_oom}"
 
-        # Track allocator usage over the run: a genuine leak shows up as a slow climb
-        # epoch-over-epoch; a one-off crash from GPU contention instead shows a flat
-        # trend right up to the point something else on the machine spiked. Cheap
-        # enough to log unconditionally so this is available after the fact.
-        #
-        # end-of-epoch memory_allocated/reserved() is a resting-state snapshot, not
-        # what actually happened during the epoch — a step that peaked at 33 GiB and
-        # freed back down to 1.4 GiB reads identically to a step that never went above
-        # 2 GiB. max_memory_allocated/reserved() (reset per epoch above) capture the
-        # real high-water mark, which is what actually determines whether a batch OOMs.
         if device.type == "cuda":
             mem_alloc     = torch.cuda.memory_allocated(device) / 1e9
             mem_reserved  = torch.cuda.memory_reserved(device) / 1e9
