@@ -6,8 +6,6 @@ enabled, the same MDM-style geometric losses — factored into _diffusion_loss a
 _add_geo_losses so the train/val objectives can't silently drift apart.
 """
 
-import gc
-
 import torch
 import torch.nn as nn
 from torch.amp import autocast
@@ -71,83 +69,63 @@ def train_one_epoch(
     total_loss = 0.0
     total_geo  = {"pos": 0.0, "vel": 0.0, "foot": 0.0}
     geo_weights = {"pos": hml3d_pos_weight, "vel": hml3d_vel_weight, "foot": hml3d_foot_weight}
-    n_oom = 0
 
     pbar = tqdm(loader, desc=f"Epoch {epoch}", leave=False)
     for step, batch in enumerate(pbar):
-        try:
-            motion = batch["motion"].to(device)
-            B = motion.shape[0]
+        motion = batch["motion"].to(device)
+        B = motion.shape[0]
 
-            t = torch.randint(0, schedule.T, (B,), device=device)
-            x_t, noise = schedule.q_sample(motion, t)
+        t = torch.randint(0, schedule.T, (B,), device=device)
+        x_t, noise = schedule.q_sample(motion, t)
 
-            if "context" in batch:
-                context = batch["context"].to(device)
-            else:
-                with torch.no_grad():
-                    context = text_encoder.encode(batch["text"])
-            if cfg_dropout > 0.0:
-                drop_mask = (torch.rand(B, device=device) < cfg_dropout)[:, None, None]
-                # null_text_emb must keep its gradient so CFG scale > 1 works at inference.
-                # CFG dropout also trains the unconditional branch used by LEDITS++ Stage 1
-                # inversion (context=None) and the ε_θ(x_t, ∅) term in Stage 3 Eq. 1.
-                null_emb  = model.null_text_emb.expand(B, -1, -1)
-                context   = torch.where(drop_mask, null_emb, context)
+        if "context" in batch:
+            context = batch["context"].to(device)
+        else:
+            with torch.no_grad():
+                context = text_encoder.encode(batch["text"])
+        if cfg_dropout > 0.0:
+            drop_mask = (torch.rand(B, device=device) < cfg_dropout)[:, None, None]
+            # null_text_emb must keep its gradient so CFG scale > 1 works at inference.
+            # CFG dropout also trains the unconditional branch used by LEDITS++ Stage 1
+            # inversion (context=None) and the ε_θ(x_t, ∅) term in Stage 3 Eq. 1.
+            null_emb  = model.null_text_emb.expand(B, -1, -1)
+            context   = torch.where(drop_mask, null_emb, context)
 
-            attn_mask = length_to_mask(_batch_lengths(batch, device), motion.shape[1])
+        attn_mask = length_to_mask(_batch_lengths(batch, device), motion.shape[1])
 
-            with autocast(device_type=device.type):
-                prediction = model(x_t, t, context, mask=attn_mask)
-                loss = _diffusion_loss(noise, prediction, attn_mask, schedule, t, snr_gamma)
+        with autocast(device_type=device.type):
+            prediction = model(x_t, t, context, mask=attn_mask)
+            loss = _diffusion_loss(noise, prediction, attn_mask, schedule, t, snr_gamma)
 
-            geo_log = {}
-            if geo_fn is not None:
-                x0_pred = schedule.predict_x0_from_eps(x_t, t, prediction.float())
-                loss, geo_contrib = _add_geo_losses(
-                    loss, x0_pred, motion.float(), attn_mask, geo_fn, geo_weights)
-                # geo_contrib holds RAW (unweighted) magnitudes for readability — what
-                # actually reaches `loss` is geo_weights[key] * geo_contrib[key], which
-                # is why e.g. "pos_raw" can be numerically larger than the total loss.
-                for key, value in geo_contrib.items():
-                    geo_log[f"train/geo_{key}_raw"] = value
-                    total_geo[key] += value
+        geo_log = {}
+        if geo_fn is not None:
+            x0_pred = schedule.predict_x0_from_eps(x_t, t, prediction.float())
+            loss, geo_contrib = _add_geo_losses(
+                loss, x0_pred, motion.float(), attn_mask, geo_fn, geo_weights)
+            # geo_contrib holds RAW (unweighted) magnitudes for readability — what
+            # actually reaches `loss` is geo_weights[key] * geo_contrib[key], which
+            # is why e.g. "pos_raw" can be numerically larger than the total loss.
+            for key, value in geo_contrib.items():
+                geo_log[f"train/geo_{key}_raw"] = value
+                total_geo[key] += value
 
-            if not torch.isfinite(loss):
-                optimizer.zero_grad(set_to_none=True)
-                continue
-
+        if not torch.isfinite(loss):
             optimizer.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            ema.update_from(model)  # per-step update so decay=0.9999 accumulates correctly
-
-            total_loss += loss.item()
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
-
-            if (step + 1) % log_every == 0:
-                logger.log({"train/loss": loss.item(), "train/step": epoch * len(loader) + step, **geo_log})
-
-        except torch.cuda.OutOfMemoryError as e:
-            n_oom += 1
-            print(f"\n[OOM] epoch {epoch} step {step}: skipping batch "
-                 f"({n_oom} so far this epoch). {e}", flush=True)
-            optimizer.zero_grad(set_to_none=True)
-            gc.collect()
-            torch.cuda.empty_cache()
             continue
 
-    # The caching allocator never shrinks its reservation back down on its own between
-    # steps — only an explicit empty_cache() does that. Without this, a transient peak
-    # (e.g. one step's OOM-triggered retry needing a bigger segment) permanently
-    # ratchets the reserved high-water-mark up for the rest of the run, epoch after
-    # epoch, until there's no slack left and every batch starts failing for good.
-    # Cheap relative to an epoch; do it every time, not just after an OOM.
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+        optimizer.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        ema.update_from(model)  # per-step update so decay=0.9999 accumulates correctly
+
+        total_loss += loss.item()
+        pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+        if (step + 1) % log_every == 0:
+            logger.log({"train/loss": loss.item(), "train/step": epoch * len(loader) + step, **geo_log})
 
     n = len(loader)
     geo_epoch = {}
@@ -159,7 +137,7 @@ def train_one_epoch(
             "train/geo_vel_raw_epoch":  total_geo["vel"]  / n,
             "train/geo_foot_raw_epoch": total_geo["foot"] / n,
         }
-    return total_loss / n, geo_epoch, n_oom
+    return total_loss / n, geo_epoch
 
 
 @torch.no_grad()
@@ -175,42 +153,31 @@ def validate_one_epoch(
 
     pbar = tqdm(loader, desc=f"Val {epoch}", leave=False)
     for batch in pbar:
-        try:
-            motion = batch["motion"].to(device)
-            B = motion.shape[0]
+        motion = batch["motion"].to(device)
+        B = motion.shape[0]
 
-            t = torch.randint(0, schedule.T, (B,), device=device)
-            x_t, noise = schedule.q_sample(motion, t)
+        t = torch.randint(0, schedule.T, (B,), device=device)
+        x_t, noise = schedule.q_sample(motion, t)
 
-            if "context" in batch:
-                context = batch["context"].to(device)
-            else:
-                context = text_encoder.encode(batch["text"])
+        if "context" in batch:
+            context = batch["context"].to(device)
+        else:
+            context = text_encoder.encode(batch["text"])
 
-            attn_mask = length_to_mask(_batch_lengths(batch, device), motion.shape[1])
+        attn_mask = length_to_mask(_batch_lengths(batch, device), motion.shape[1])
 
-            with autocast(device_type=device.type):
-                prediction = ema_model(x_t, t, context, mask=attn_mask)
-                # Mirror train_one_epoch's objective so the train/val curves are the
-                # same quantity and can be overlaid in training_loss.png.
-                loss = _diffusion_loss(noise, prediction, attn_mask, schedule, t, snr_gamma)
+        with autocast(device_type=device.type):
+            prediction = ema_model(x_t, t, context, mask=attn_mask)
+            # Mirror train_one_epoch's objective so the train/val curves are the
+            # same quantity and can be overlaid in training_loss.png.
+            loss = _diffusion_loss(noise, prediction, attn_mask, schedule, t, snr_gamma)
 
-            if geo_fn is not None:
-                x0_pred = schedule.predict_x0_from_eps(x_t, t, prediction.float())
-                loss, _ = _add_geo_losses(
-                    loss, x0_pred, motion.float(), attn_mask, geo_fn, geo_weights)
+        if geo_fn is not None:
+            x0_pred = schedule.predict_x0_from_eps(x_t, t, prediction.float())
+            loss, _ = _add_geo_losses(
+                loss, x0_pred, motion.float(), attn_mask, geo_fn, geo_weights)
 
-            total_loss += loss.item()
-            pbar.set_postfix(val_loss=f"{loss.item():.4f}")
-
-        except torch.cuda.OutOfMemoryError as e:
-            print(f"\n[OOM] val epoch {epoch}: skipping batch. {e}", flush=True)
-            del e
-            gc.collect()
-            torch.cuda.empty_cache()
-            continue
-
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+        total_loss += loss.item()
+        pbar.set_postfix(val_loss=f"{loss.item():.4f}")
 
     return total_loss / len(loader)
