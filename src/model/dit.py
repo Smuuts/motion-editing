@@ -24,11 +24,41 @@ from model.body_groups import (
     N_GROUPS as _N_GROUPS,
     GROUP_NAMES,
     group_layout as _group_layout,
+    is_grouped_mode as _is_grouped_mode,
 )
 
 
 class _MotionDiTBase(nn.Module):
-    """Shared weight init and attention-map accessor for MotionDiT / GroupDiT."""
+    """Shared transformer scaffolding, weight init, and attention-map accessor
+    for MotionDiT / GroupDiT. Subclasses add their own tokeniser layers
+    (joint_proj/output_proj vs. in_projs/out_projs/group_emb) and must call
+    self._init_weights() once those are in place."""
+
+    def __init__(
+        self,
+        latent_dim:   int,
+        context_dim:  int,
+        num_heads:    int,
+        num_layers:   int,
+        max_frames:   int,
+        ff_mult:      int,
+        dropout:      float,
+        text_seq_len: int,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.pos_emb     = FramePositionalEmbedding(max_frames, latent_dim)
+        self.time_emb    = TimestepEmbedding(latent_dim)
+        self.blocks = nn.ModuleList([
+            DiTBlock(latent_dim, context_dim, num_heads, ff_mult, dropout)
+            for _ in range(num_layers)
+        ])
+        self.final_norm = nn.LayerNorm(latent_dim)
+
+        # null_text_emb length matches the text encoder's fixed output length (77 for CLIP,
+        # configurable for T5). For LEDITS++ inversion (Stage 1): pass context=None so the
+        # model uses this — inversion is unconditional.
+        self.null_text_emb = nn.Parameter(torch.randn(1, text_seq_len, context_dim) * 0.02)
 
     def _init_weights(self):
         for m in self.modules():
@@ -79,26 +109,12 @@ class MotionDiT(_MotionDiTBase):
         dropout:      float = 0.1,
         text_seq_len: int   = 77,
     ):
-        super().__init__()
-        self.latent_dim = latent_dim
-        self.max_frames = max_frames
-        self.input_dim  = input_dim
+        super().__init__(latent_dim, context_dim, num_heads, num_layers,
+                          max_frames, ff_mult, dropout, text_seq_len)
+        self.input_dim = input_dim
 
         self.joint_proj  = nn.Linear(input_dim, latent_dim)
         self.output_proj = nn.Linear(latent_dim, input_dim)
-        self.pos_emb     = FramePositionalEmbedding(max_frames, latent_dim)
-        self.time_emb    = TimestepEmbedding(latent_dim)
-
-        self.blocks = nn.ModuleList([
-            DiTBlock(latent_dim, context_dim, num_heads, ff_mult, dropout)
-            for _ in range(num_layers)
-        ])
-        self.final_norm = nn.LayerNorm(latent_dim)
-
-        # null_text_emb length matches the text encoder's fixed output length (77 for CLIP,
-        # configurable for T5). For LEDITS++ inversion (Stage 1): pass context=None so the
-        # model uses this — inversion is unconditional.
-        self.null_text_emb = nn.Parameter(torch.randn(1, text_seq_len, context_dim) * 0.02)
         self._init_weights()
 
     def forward(
@@ -156,27 +172,30 @@ class GroupDiT(_MotionDiTBase):
         dropout:      float = 0.1,
         text_seq_len: int   = 77,
     ):
-        super().__init__()
-        self.latent_dim = latent_dim
-        self.max_frames = max_frames
+        super().__init__(latent_dim, context_dim, num_heads, num_layers,
+                          max_frames, ff_mult, dropout, text_seq_len)
         # Representation-specific channel partition: 'humanml3d' (263) or 'smplh' (135).
         # The body-part grouping (N_GROUPS, GROUP_NAMES) is shared across both.
-        self.feature_mode = feature_mode
         self.group_channels, group_dims, self.input_dim = _group_layout(feature_mode)
+        self._group_dims = group_dims
 
         self.in_projs  = nn.ModuleList([nn.Linear(d, latent_dim) for d in group_dims])
         self.out_projs = nn.ModuleList([nn.Linear(latent_dim, d) for d in group_dims])
-
         self.group_emb = nn.Embedding(_N_GROUPS, latent_dim)
-        self.pos_emb   = FramePositionalEmbedding(max_frames, latent_dim)
-        self.time_emb  = TimestepEmbedding(latent_dim)
 
-        self.blocks = nn.ModuleList([
-            DiTBlock(latent_dim, context_dim, num_heads, ff_mult, dropout)
-            for _ in range(num_layers)
-        ])
-        self.final_norm    = nn.LayerNorm(latent_dim)
-        self.null_text_emb = nn.Parameter(torch.randn(1, text_seq_len, context_dim) * 0.02)
+        # Precomputed index tensors (not learned params, hence persistent=False so
+        # they never appear in — or are expected from — a checkpoint's state_dict):
+        #   _group_idx: group-embedding lookup, avoids a fresh torch.arange per forward.
+        #   _perm_idx:  channel order -> grouped order, so tokenising the feature
+        #               vector is one gather (+ free split) instead of G fancy-indexes.
+        #   _inv_perm_idx: grouped order -> channel order, for the symmetric regather
+        #               on reconstruction instead of a zero-alloc + G scatter writes.
+        perm = torch.cat([torch.as_tensor(ch, dtype=torch.long) for ch in self.group_channels])
+        inv_perm = torch.empty_like(perm)
+        inv_perm[perm] = torch.arange(perm.numel())
+        self.register_buffer("_group_idx", torch.arange(_N_GROUPS), persistent=False)
+        self.register_buffer("_perm_idx", perm, persistent=False)
+        self.register_buffer("_inv_perm_idx", inv_perm, persistent=False)
 
         self._init_weights()
 
@@ -195,8 +214,11 @@ class GroupDiT(_MotionDiTBase):
             context = self.null_text_emb.expand(B, -1, -1)
 
         # ── tokenise ──────────────────────────────────────────────────────────
-        # Slice each group's channels from the full feature vector (263 or 135).
-        group_feats = [motion[..., ch] for ch in self.group_channels]
+        # Single gather into group order, then a free (view-only) split per group,
+        # instead of one fancy-index slice per group.
+        group_feats = torch.split(
+            motion.index_select(-1, self._perm_idx), self._group_dims, dim=-1
+        )
 
         # project each group → latent_dim, stack → (B, F, G, latent_dim)
         tokens = torch.stack(
@@ -204,7 +226,7 @@ class GroupDiT(_MotionDiTBase):
         )
 
         # ── positional embeddings ─────────────────────────────────────────────
-        tokens = tokens + self.group_emb(torch.arange(G, device=motion.device))[None, None]
+        tokens = tokens + self.group_emb(self._group_idx)[None, None]
         tokens = tokens + self.pos_emb(F, motion.device)[None, :, None]
 
         # ── transformer blocks ────────────────────────────────────────────────
@@ -223,13 +245,11 @@ class GroupDiT(_MotionDiTBase):
         tokens = self.final_norm(tokens).reshape(B, F, G, self.latent_dim)
 
         # ── reconstruct (B, F, input_dim) ─────────────────────────────────────
-        # Compute projections first so we know the actual dtype (AMP may differ
-        # from tokens.dtype when LayerNorm upcasts to float32 internally).
+        # Concat back into grouped order, then a single gather via the inverse
+        # permutation restores original channel order — one op instead of a
+        # zero-alloc + one scatter write per group.
         group_outs = [self.out_projs[g](tokens[:, :, g]) for g in range(len(self.group_channels))]
-        out = torch.zeros(B, F, self.input_dim, device=tokens.device, dtype=group_outs[0].dtype)
-        for g, ch in enumerate(self.group_channels):
-            out[..., ch] = group_outs[g]
-        return out
+        return torch.cat(group_outs, dim=-1).index_select(-1, self._inv_perm_idx)
 
 
 def build_model(config: dict, device="cpu") -> _MotionDiTBase:
@@ -244,9 +264,7 @@ def build_model(config: dict, device="cpu") -> _MotionDiTBase:
         text_seq_len = config.get("text_seq_len",  77),
     )
     feature_mode = config.get("feature_mode", "humanml3d")
-    # Both supported modes are body-part-grouped: 'humanml3d' (263) and 'smplh' (135).
-    # Legacy 'group' checkpoints are GroupDiT-263 → identical to 'humanml3d'.
-    if feature_mode in ("humanml3d", "smplh", "group"):
+    if _is_grouped_mode(feature_mode):
         model = GroupDiT(feature_mode=feature_mode, **kwargs)
     else:
         # Legacy flat MotionDiT (deprecated) — kept only for loading old flat checkpoints.

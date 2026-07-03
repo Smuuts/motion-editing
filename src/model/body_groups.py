@@ -113,6 +113,16 @@ GROUP_CHANNELS_SMPL: list[list[int]] = build_group_channels_smpl()
 GROUP_DIMS_SMPL:     list[int]       = [len(ch) for ch in GROUP_CHANNELS_SMPL]
 
 
+# feature_mode strings that select body-part-grouped tokenisation (GroupDiT).
+# 'group' is a legacy alias for 'humanml3d' kept for old checkpoint configs.
+GROUPED_FEATURE_MODES = ("humanml3d", "smplh", "group")
+
+
+def is_grouped_mode(feature_mode: str) -> bool:
+    """True if feature_mode selects GroupDiT (vs. legacy flat MotionDiT)."""
+    return feature_mode in GROUPED_FEATURE_MODES
+
+
 def group_layout(feature_mode: str) -> tuple[list[list[int]], list[int], int]:
     """(group_channels, group_dims, total_feature_dim) for a grouped feature_mode.
 

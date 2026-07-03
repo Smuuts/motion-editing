@@ -43,6 +43,17 @@ def _aggregate_channels_to_groups(per_channel: torch.Tensor, is_group: bool,
     return torch.stack(cols, dim=-1)                              # (F, G)
 
 
+def _group_aggregation_matrix(group_channels, device) -> torch.Tensor:
+    """(D, G) matrix such that `per_channel @ matrix == per-group mean` for each
+    group's channels — lets collect_statistics's hot loop replace one Python-level
+    list comprehension per timestep with a single matmul."""
+    D = sum(len(ch) for ch in group_channels)
+    mat = torch.zeros(D, len(group_channels), device=device)
+    for g, ch in enumerate(group_channels):
+        mat[ch, g] = 1.0 / len(ch)
+    return mat
+
+
 def _percentile_threshold(values: torch.Tensor, valid_frames: torch.Tensor,
                           percentile: float) -> torch.Tensor:
     """
@@ -93,6 +104,10 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
 
     tok = (torch.as_tensor(token_idxs, device=device, dtype=torch.long)
            if need_attn else None)
+    # Precompute the channel->group aggregation once (it's invariant across the
+    # sweep) instead of rebuilding it from group_channels every iteration.
+    agg_matrix = (_group_aggregation_matrix(group_channels or GROUP_CHANNELS, device)
+                  if is_group else None)
     for t in timesteps:
         x_t = xs[t].to(device)
         t_b = torch.full((1,), t, device=device, dtype=torch.long)
@@ -110,10 +125,22 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
         # ψ = ε_θ(x_t, c_edit) − ε_θ(x_t, ∅) → M2 contribution
         eps_u = model(x_t, t_b, null_context)
         psi = (eps_c - eps_u)[0].abs()                        # (F, D)
-        psi_accum += _aggregate_channels_to_groups(psi, is_group, group_channels)
+        psi_accum += psi @ agg_matrix if is_group else psi.mean(dim=-1, keepdim=True)
         n += 1
 
     return attn_accum / max(n, 1), psi_accum / max(n, 1)
+
+
+# mask_mode -> (semantic source | None, use_m2). The two mask components are
+# independent axes; encoding them as a lookup keeps adding/auditing a mode a
+# one-line change instead of touching two parallel if/elif chains.
+_MASK_MODE_COMPONENTS = {
+    "none":    (None,     False),
+    "m2_only": (None,     True),
+    "m1_only": ("attn",   False),
+    "attn":    ("attn",   True),
+    "groups":  ("groups", False),
+}
 
 
 def build_mask(attn_fg, psi_fg, valid_frames, is_group,
@@ -151,25 +178,26 @@ def build_mask(attn_fg, psi_fg, valid_frames, is_group,
       m_channel : (F, D) float  — group mask scattered to feature channels (for Eq. 1)
       edited    : (F,) bool      — frame has any active group (drives hard inpainting)
     """
+    if mask_mode not in _MASK_MODE_COMPONENTS:
+        raise ValueError(f"unknown mask_mode {mask_mode!r}")
+    semantic_source, use_m2 = _MASK_MODE_COMPONENTS[mask_mode]
+
     valid = valid_frames[:, None]
 
-    # semantic component (M1 / M_llm); absent for "none", "m2_only"
-    if mask_mode in ("none", "m2_only"):
+    # semantic component (M1 / M_llm); absent when semantic_source is None
+    if semantic_source is None:
         m_sem = None
-    elif mask_mode in ("attn", "m1_only"):
+    elif semantic_source == "attn":
         m_sem = _percentile_threshold(attn_fg, valid_frames, lambda_attn)
-    elif mask_mode == "groups":
+    else:  # "groups"
         if llm_group_mask is None:
             raise ValueError(f"mask_mode={mask_mode!r} requires llm_group_mask (F, G) or (G,).")
         m_sem = llm_group_mask.to(valid.device, dtype=torch.bool)
         if m_sem.dim() == 1:
             m_sem = m_sem[None, :].expand(valid_frames.shape[0], -1)
-    else:
-        raise ValueError(f"unknown mask_mode {mask_mode!r}")
 
-    # noise component (M2); absent for "none", "m1_only", "groups" (full-frame coverage)
-    m2 = (None if mask_mode in ("none", "m1_only", "groups")
-          else _percentile_threshold(psi_fg, valid_frames, lambda_noise))
+    # noise component (M2)
+    m2 = _percentile_threshold(psi_fg, valid_frames, lambda_noise) if use_m2 else None
 
     m_group = valid.expand(-1, attn_fg.shape[1]).clone()
     if m_sem is not None:

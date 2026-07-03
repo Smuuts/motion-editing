@@ -54,7 +54,7 @@ from scipy.ndimage import gaussian_filter1d
 
 from model.schedule import NoiseSchedule
 from model.text_encoder import build_text_encoder
-from model.body_groups import GROUP_NAMES
+from model.body_groups import GROUP_NAMES, is_grouped_mode
 from editing import MotionEditor
 from utils.visualise import recover_from_ric, save_comparison_animation
 from utils.model_io import load_model
@@ -134,6 +134,20 @@ def parse_group_mask(spec, is_group):
     return mask
 
 
+def per_edit_lookup(values, edits, name):
+    """Resolve a CLI list that names either one value (applied to all edits) or
+    exactly one value per edit, into a `edit -> value` lookup function.
+    Used for --scales and --target_groups, which both take this shape."""
+    if values is None:
+        return None
+    if len(values) == 1:
+        return lambda e: values[0]
+    if len(values) == len(edits):
+        vmap = dict(zip(edits, values))
+        return lambda e: vmap[e]
+    raise SystemExit(f"--{name} must be 1 value or {len(edits)} (got {len(values)}).")
+
+
 def load_source(source, data_root, split, max_frames):
     """
     Return (raw_feat (T,263) float32, clip_id, length, caption).
@@ -168,8 +182,7 @@ def main():
 
     # ── load model, schedule, encoder, normalisation stats ──────────────────────
     model, config = load_model(args.checkpoint, device=device, use_ema=not args.no_ema)
-    # Both 'humanml3d' and 'smplh' are body-part-grouped (GroupDiT); legacy 'group' too.
-    is_group = config.get("feature_mode", "humanml3d") in ("humanml3d", "smplh", "group")
+    is_group = is_grouped_mode(config.get("feature_mode", "humanml3d"))
     print(f"feature_mode={config.get('feature_mode')}  is_group={is_group}")
 
     mean = np.load(os.path.join(args.data_root, "Mean.npy"))   # (263,)
@@ -196,26 +209,13 @@ def main():
     # ── group instructions into render jobs ─────────────────────────────────────
     # compose → all edits in one video; else → one video per instruction (variety).
     edits = args.instructions
-    if args.scales is None:
-        scale_of = lambda e: 5.0
-    elif len(args.scales) == 1:
-        scale_of = lambda e: args.scales[0]
-    elif len(args.scales) == len(edits):
-        smap = dict(zip(edits, args.scales)); scale_of = lambda e: smap[e]
-    else:
-        raise SystemExit(f"--scales must be 1 value or {len(edits)} (got {len(args.scales)}).")
+    scale_of = per_edit_lookup(args.scales, edits, "scales") or (lambda e: 5.0)
 
     if args.mask_mode == "groups":
         if not args.target_groups:
             raise SystemExit("--mask_mode groups requires --target_groups (one per "
                               "--instruction, or a single value applied to all).")
-        if len(args.target_groups) == 1:
-            group_spec_of = lambda e: args.target_groups[0]
-        elif len(args.target_groups) == len(edits):
-            gmap = dict(zip(edits, args.target_groups)); group_spec_of = lambda e: gmap[e]
-        else:
-            raise SystemExit(f"--target_groups must be 1 value or {len(edits)} "
-                             f"(got {len(args.target_groups)}).")
+        group_spec_of = per_edit_lookup(args.target_groups, edits, "target_groups")
 
     jobs = [edits] if args.compose else [[e] for e in edits]
 
@@ -223,7 +223,10 @@ def main():
         scales = [scale_of(e) for e in job]
         print(f"\nEdit job: {job}  scales={scales}  mask_mode={args.mask_mode}")
         with torch.no_grad():
-            ctxs = [text_encoder.encode([e]) for e in job]
+            # One batched encode() call for the whole job instead of N single-text
+            # calls — same per-text embeddings (encoder attention is intra-sequence
+            # only), fewer transformer forward passes when --compose has N>1 edits.
+            ctxs = list(text_encoder.encode(job).split(1, dim=0))
             toks = [text_encoder.token_info(e)[0] for e in job]
         mask_ts = (torch.linspace(1, schedule.T - 1, args.mask_timesteps).long().tolist()
                    if args.mask_timesteps else None)
