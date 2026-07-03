@@ -5,9 +5,9 @@ Loads a trained (EMA) MotionDiT/GroupDiT checkpoint, runs the three-stage
 training-free editor on a single source clip + one or more edit instructions, and
 renders a source-vs-edited comparison video plus a mask heatmap for inspection.
 
-By default it uses the **M2-only** mask (mask_mode="m2_only"): no semantic M1 and no
-LLM mask. The implicit attention M1 path (mask_mode="attn") and the LLM path
-(mask_mode="llm") are one flag away — see src/editing/masking.py.
+By default it uses the **M2-only** mask (mask_mode="m2_only"): no semantic mask. The
+implicit attention M1 path (mask_mode="attn") and the user-supplied path
+(mask_mode="groups") are one flag away — see src/editing/masking.py.
 
 Examples
 --------
@@ -27,6 +27,13 @@ Examples
     python src/edit_motion.py --checkpoint ... --data_root ... --source 0 \
         --instruction "raise the right arm" --instruction "crouch lower" \
         --scales 5.0 7.5
+
+    # User-supplied mask: tell the editor which body-part groups each
+    # instruction targets instead of relying on M1/LLM to find them.
+    python src/edit_motion.py --checkpoint ... --data_root ... --source 0 \
+        --instruction "raise the right arm" --instruction "crouch lower" \
+        --mask_mode groups \
+        --target_groups "right_arm" --target_groups "left_leg right_leg spine"
 """
 
 import os
@@ -73,9 +80,17 @@ def parse_args():
                    help="Guidance scale s_e: one value (applied to all) or one per "
                         "instruction (default 5.0 each).")
     p.add_argument("--mask_mode", default="m2_only",
-                   choices=["none", "m2_only", "m1_only", "attn", "llm"],
+                   choices=["none", "m2_only", "m1_only", "attn", "groups"],
                    help="Stage-2 mask source (default m2_only). 'none' = no mask: "
-                        "guidance everywhere, no inpainting (full-edit ablation).")
+                        "guidance everywhere, no inpainting (full-edit ablation). "
+                        "'groups' = user-supplied M_group (see --target_groups), full "
+                        "temporal coverage, no M2 gating.")
+    p.add_argument("--target_groups", action="append", default=None,
+                   help="Only used with --mask_mode groups. Space/comma-separated "
+                        f"body-part group names targeted by an instruction, from: "
+                        f"{GROUP_NAMES}. Repeat once per --instruction, or pass once "
+                        "to apply the same groups to all instructions. "
+                        "Example: --target_groups \"right_arm head\".")
     p.add_argument("--lambda_noise", type=float, default=70.0,
                    help="M2 percentile threshold (higher = sparser mask).")
     p.add_argument("--lambda_attn", type=float, default=70.0,
@@ -95,6 +110,28 @@ def parse_args():
                    help="Load model.pt instead of ema.pt.")
     p.add_argument("--device", default=None)
     return p.parse_args()
+
+
+def parse_group_mask(spec, is_group):
+    """
+    "left_arm,right_arm" / "left_arm right_arm" → (G,) bool tensor over GROUP_NAMES.
+    Used for --mask_mode groups, where the user names the body-part groups an
+    instruction targets instead of relying on M1 (attention) or an LLM to find them.
+    """
+    if not is_group:
+        raise SystemExit("--mask_mode groups requires a body-part-grouped model "
+                          "(feature_mode humanml3d/smplh/group); this checkpoint has G=1.")
+    names = [n.strip() for n in spec.replace(",", " ").split() if n.strip()]
+    if not names:
+        raise SystemExit(f"--target_groups {spec!r} named no groups.")
+    unknown = [n for n in names if n not in GROUP_NAMES]
+    if unknown:
+        raise SystemExit(f"Unknown body-part group(s) {unknown} in {spec!r}; "
+                          f"choices: {GROUP_NAMES}")
+    mask = torch.zeros(len(GROUP_NAMES), dtype=torch.bool)
+    for n in names:
+        mask[GROUP_NAMES.index(n)] = True
+    return mask
 
 
 def load_source(source, data_root, split, max_frames):
@@ -167,6 +204,19 @@ def main():
         smap = dict(zip(edits, args.scales)); scale_of = lambda e: smap[e]
     else:
         raise SystemExit(f"--scales must be 1 value or {len(edits)} (got {len(args.scales)}).")
+
+    if args.mask_mode == "groups":
+        if not args.target_groups:
+            raise SystemExit("--mask_mode groups requires --target_groups (one per "
+                              "--instruction, or a single value applied to all).")
+        if len(args.target_groups) == 1:
+            group_spec_of = lambda e: args.target_groups[0]
+        elif len(args.target_groups) == len(edits):
+            gmap = dict(zip(edits, args.target_groups)); group_spec_of = lambda e: gmap[e]
+        else:
+            raise SystemExit(f"--target_groups must be 1 value or {len(edits)} "
+                             f"(got {len(args.target_groups)}).")
+
     jobs = [edits] if args.compose else [[e] for e in edits]
 
     for job in jobs:
@@ -177,11 +227,22 @@ def main():
             toks = [text_encoder.token_info(e)[0] for e in job]
         mask_ts = (torch.linspace(1, schedule.T - 1, args.mask_timesteps).long().tolist()
                    if args.mask_timesteps else None)
-        masks = editor.collect_masks(
-            state, ctxs, toks, valid_frames,
-            lambda_attn=args.lambda_attn, lambda_noise=args.lambda_noise,
-            mask_mode=args.mask_mode, timesteps=mask_ts,
-        )
+        if args.mask_mode == "groups":
+            group_masks = [parse_group_mask(group_spec_of(e), is_group) for e in job]
+            for e, gm in zip(job, group_masks):
+                targeted = [GROUP_NAMES[g] for g in gm.nonzero().flatten().tolist()]
+                print(f"  target_groups {e!r}: {targeted}")
+            masks = editor.collect_masks(
+                state, ctxs, toks, valid_frames,
+                lambda_attn=args.lambda_attn, lambda_noise=args.lambda_noise,
+                mask_mode="groups", llm_group_masks=group_masks, timesteps=mask_ts,
+            )
+        else:
+            masks = editor.collect_masks(
+                state, ctxs, toks, valid_frames,
+                lambda_attn=args.lambda_attn, lambda_noise=args.lambda_noise,
+                mask_mode=args.mask_mode, timesteps=mask_ts,
+            )
         x_edit = editor.edit(state, ctxs, masks, scales=scales,
                              guidance_alpha_floor=args.guidance_alpha_floor)   # (1,F,263)
         for i, m in enumerate(masks):

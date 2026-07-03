@@ -135,10 +135,13 @@ def build_mask(attn_fg, psi_fg, valid_frames, is_group,
                                   Useful to test whether attention targets a body part
                                   the source isn't already moving (M2 can't add that).
                       "attn"    — M1 ∩ M2 (implicit cross-attention semantic mask).
-                      "llm"     — M_llm ∩ M2, where M_llm is an explicit (F, G) group
-                                  mask supplied via `llm_group_mask` (see Phase B).
-    llm_group_mask  : (F, G) or (G,) bool — required for mask_mode="llm"; the groups
-                      an instruction targets. A (G,) vector is broadcast over frames.
+                      "groups"  — M_user alone (no M2 gating): the user-specified
+                                  body-part groups (supplied via `llm_group_mask`) are
+                                  edited in every valid frame — full temporal coverage
+                                  of the named groups rather than restricting to frames
+                                  M2 judges as already changing.
+    llm_group_mask  : (F, G) or (G,) bool — required for mask_mode="groups"; the
+                      groups an instruction targets. A (G,) vector is broadcast over frames.
 
     group_channels  : representation channel partition (263-d default, or 135-d smplh)
     feat_dim        : total feature width D matching group_channels (263 or 135)
@@ -155,17 +158,17 @@ def build_mask(attn_fg, psi_fg, valid_frames, is_group,
         m_sem = None
     elif mask_mode in ("attn", "m1_only"):
         m_sem = _percentile_threshold(attn_fg, valid_frames, lambda_attn)
-    elif mask_mode == "llm":
+    elif mask_mode == "groups":
         if llm_group_mask is None:
-            raise ValueError("mask_mode='llm' requires llm_group_mask (F, G) or (G,).")
+            raise ValueError(f"mask_mode={mask_mode!r} requires llm_group_mask (F, G) or (G,).")
         m_sem = llm_group_mask.to(valid.device, dtype=torch.bool)
         if m_sem.dim() == 1:
             m_sem = m_sem[None, :].expand(valid_frames.shape[0], -1)
     else:
         raise ValueError(f"unknown mask_mode {mask_mode!r}")
 
-    # noise component (M2); absent for "none", "m1_only"
-    m2 = (None if mask_mode in ("none", "m1_only")
+    # noise component (M2); absent for "none", "m1_only", "groups" (full-frame coverage)
+    m2 = (None if mask_mode in ("none", "m1_only", "groups")
           else _percentile_threshold(psi_fg, valid_frames, lambda_noise))
 
     m_group = valid.expand(-1, attn_fg.shape[1]).clone()

@@ -97,9 +97,9 @@ class MotionEditor:
         token_idxs_per_edit  : list of content-token index lists (text_encoder.token_info).
                                Only consumed when mask_mode="attn"; may be None otherwise.
         valid_frames         : (F,) bool — real (non-padding) frames
-        mask_mode            : "m2_only" (default) | "attn" | "llm" (see build_mask).
+        mask_mode            : "m2_only" (default) | "attn" | "groups" (see build_mask).
         llm_group_masks      : list of (F, G)/(G,) bool group masks, one per edit
-                               (required for mask_mode="llm").
+                               (required for mask_mode="groups").
         """
         need_attn = mask_mode in ("attn", "m1_only")
         if token_idxs_per_edit is None:
