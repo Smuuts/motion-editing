@@ -90,6 +90,16 @@ class NoiseSchedule:
         sqrt_omacp = self.sqrt_one_minus_alphas_cumprod[t][:, None, None]
         return (x_t - sqrt_omacp * eps) / sqrt_acp
 
+    def min_snr_weight(self, t, gamma):
+        """Per-sample Min-SNR weight: min(SNR(t), γ) / SNR(t) (Hang et al. 2023).
+
+        Shared by the diffusion eps-MSE and the geometric (FK) losses so both are
+        down-weighted the same way at high-noise timesteps, where x0_pred (recovered
+        from eps via division by sqrt(ᾱ_t)) is least reliable.
+        """
+        snr_t = self.snr[t]  # (B,)
+        return snr_t.clamp(max=gamma) / snr_t
+
     def posterior_mean(self, x0, x_t, t):
         """DDPM posterior mean μ̃_t(x0, x_t) = E[x_{t-1} | x_t, x0].
 

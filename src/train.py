@@ -7,6 +7,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import argparse
 import json
 import glob
+import sys
 
 import numpy as np
 
@@ -22,7 +23,7 @@ from model.schedule import NoiseSchedule
 from utils.checkpoint import save_checkpoint, load_checkpoint
 from utils.ema import EMA
 from utils.logger import Logger
-from utils.skeleton import hml3d_geometric_losses, smplh_geometric_losses
+from utils.skeleton import build_geo_fn
 from training.epoch import train_one_epoch, validate_one_epoch
 from training.plotting import save_loss_graph
 
@@ -102,28 +103,27 @@ def parse_args():
     return build_parser().parse_args()
 
 
-def explicit_cli_keys():
+def explicit_cli_keys(parser):
     """Return the set of arg dest names that were explicitly passed on the CLI."""
-    p = build_parser()
-    for action in p._actions:
-        action.default = argparse.SUPPRESS
-    return set(vars(p.parse_args()).keys())
+    argv = sys.argv[1:]
+    return {a.dest for a in parser._actions if any(o in argv for o in a.option_strings)}
 
 
 def main():
-    args = parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
 
     config = vars(args)
     if args.config:
         with open(args.config) as f:
             config.update(json.load(f))
-            
+
     if args.resume:
         saved_path = os.path.join(args.output_dir, "config.json")
         if os.path.exists(saved_path):
             with open(saved_path) as f:
                 saved = json.load(f)
-            cli_keys = explicit_cli_keys()
+            cli_keys = explicit_cli_keys(parser)
             preserved = cli_keys | {"resume", "output_dir"}
             for k, v in saved.items():
                 if k not in preserved:
@@ -163,47 +163,36 @@ def main():
     mean_t = torch.from_numpy(ds.mean).float().to(device)
     std_t  = torch.from_numpy(ds.std).float().to(device)
 
-    # Geometric losses: route to the rep-specific implementation. Built as a closure
-    # geo_fn(x0_pred, motion, mask) -> {"pos","vel","foot"} so run/validate stay rep-agnostic.
-    geo_fn = None
-    if any([args.hml3d_pos_weight, args.hml3d_vel_weight, args.hml3d_foot_weight]):
-        if args.feature_mode == "smplh":
-            import smplx
-            from data.smplh_features import smplh_rest_joints_and_parents
-            body_model = smplx.SMPLHLayer(model_path=args.smplh_model_path,
-                                          gender="neutral", ext="npz").to(device).eval()
-            for p in body_model.parameters():
-                p.requires_grad_(False)
-            J_rest, parents = smplh_rest_joints_and_parents(body_model)
-            J_rest, parents = J_rest.to(device), parents.to(device)
-
-            def geo_fn(x0, m, mask):
-                return smplh_geometric_losses(x0, m, mean_t, std_t, J_rest, parents, mask=mask)
-            geo_label = "SMPL-FK"
-        else:
-            def geo_fn(x0, m, mask):
-                return hml3d_geometric_losses(x0, m, mean_t, std_t, mask=mask)
-            geo_label = "HumanML3D"
-        parts = [f"pos={args.hml3d_pos_weight}", f"vel={args.hml3d_vel_weight}", f"foot={args.hml3d_foot_weight}"]
-        print(f"{geo_label} geometric losses enabled ({', '.join(p for p in parts if not p.endswith('=0.0'))})")
+    # Geometric losses: route to the rep-specific implementation. geo_fn is a closure
+    # (x0_pred, motion, mask) -> {"pos","vel","foot"} so run/validate stay rep-agnostic.
+    geo_fn, geo_label = build_geo_fn(
+        args.feature_mode, mean_t, std_t, device,
+        pos_weight=args.hml3d_pos_weight, vel_weight=args.hml3d_vel_weight,
+        foot_weight=args.hml3d_foot_weight, smplh_model_path=args.smplh_model_path,
+    )
+    if geo_fn is not None:
+        weights = (("pos", args.hml3d_pos_weight), ("vel", args.hml3d_vel_weight),
+                   ("foot", args.hml3d_foot_weight))
+        parts = [f"{name}={w}" for name, w in weights if w]
+        print(f"{geo_label} geometric losses enabled ({', '.join(parts)})")
 
     # text encoder
     context_dim, text_seq_len = get_encoder_dims(config)
     if train_loader.dataset.text_emb_dir is not None:
-        sample_files = glob.glob(os.path.join(train_loader.dataset.text_emb_dir, "*.npy"))[:1]
-        if sample_files:
-            sample_emb = np.load(sample_files[0])  # (num_ann, L, dim)
+        sample_file = next(glob.iglob(os.path.join(train_loader.dataset.text_emb_dir, "*.npy")), None)
+        if sample_file:
+            sample_emb = np.load(sample_file)  # (num_ann, L, dim)
             emb_seq_len, emb_dim = int(sample_emb.shape[1]), int(sample_emb.shape[2])
             if emb_seq_len != text_seq_len or emb_dim != context_dim:
                 raise ValueError(
                     f"Precomputed embeddings in '{train_loader.dataset.text_emb_dir}' have shape "
                     f"(*, {emb_seq_len}, {emb_dim}), but the configured encoder "
-                    f"(--text_encoder {config.get('text_encoder', 'clip')}) expects "
+                    f"(--text_encoder {config['text_encoder']}) expects "
                     f"(*, {text_seq_len}, {context_dim}). "
                     f"Re-run precompute_text.py with matching encoder settings, or "
                     f"point --data_root to a directory without a stale text_emb/ folder."
                 )
-        print(f"Precomputed text embeddings found — skipping {config.get('text_encoder', 'clip').upper()} model load.")
+        print(f"Precomputed text embeddings found — skipping {config['text_encoder'].upper()} model load.")
         text_encoder = None
     else:
         text_encoder = build_text_encoder(config, device=device)
@@ -283,19 +272,15 @@ def main():
                          f" | foot_raw {geo_epoch['train/geo_foot_raw_epoch']:.4f}")
 
         if val_loader is not None and (epoch + 1) % args.val_every == 0:
-            rng_cpu = torch.get_rng_state()
-            rng_gpu = torch.cuda.get_rng_state(device) if device.type == "cuda" else None
-            val_loss = validate_one_epoch(
-                ema.ema_model, text_encoder, schedule, val_loader, device, epoch,
-                snr_gamma=args.snr_gamma,
-                geo_fn=geo_fn,
-                hml3d_pos_weight=args.hml3d_pos_weight,
-                hml3d_vel_weight=args.hml3d_vel_weight,
-                hml3d_foot_weight=args.hml3d_foot_weight,
-            )
-            torch.set_rng_state(rng_cpu)
-            if rng_gpu is not None:
-                torch.cuda.set_rng_state(rng_gpu, device)
+            with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
+                val_loss = validate_one_epoch(
+                    ema.ema_model, text_encoder, schedule, val_loader, device, epoch,
+                    snr_gamma=args.snr_gamma,
+                    geo_fn=geo_fn,
+                    hml3d_pos_weight=args.hml3d_pos_weight,
+                    hml3d_vel_weight=args.hml3d_vel_weight,
+                    hml3d_foot_weight=args.hml3d_foot_weight,
+                )
             val_losses.append((epoch, val_loss))
             logger.log({"val/epoch_loss": val_loss, "val/epoch": epoch})
             log_line += f" | val {val_loss:.4f}"

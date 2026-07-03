@@ -32,25 +32,32 @@ def _diffusion_loss(noise, prediction, attn_mask, schedule, t, snr_gamma):
         # Per-sample mean MSE over valid (T, D) elements.
         valid_elems = (attn_mask.float().sum(dim=1) * noise.shape[-1]).clamp(min=1)
         per_sample  = per_elem.sum(dim=(1, 2)) / valid_elems        # (B,)
-        # Min-SNR weight: min(SNR(t), γ) / SNR(t)
-        snr_t      = schedule.snr[t]                                # (B,)
-        snr_weight = snr_t.clamp(max=snr_gamma) / snr_t             # (B,)
+        snr_weight  = schedule.min_snr_weight(t, snr_gamma)         # (B,)
         return (per_sample * snr_weight).mean()
     return per_elem.sum() / (loss_mask.sum() * noise.shape[-1]).clamp(min=1)
 
 
-def _add_geo_losses(loss, x0_pred, motion, attn_mask, geo_fn, weights):
+def _add_geo_losses(loss, x0_pred, motion, attn_mask, geo_fn, weights, sample_weight=None):
     """Add each active, finite MDM-style geometric loss term to `loss`.
 
     weights : {"pos": w, "vel": w, "foot": w} — a term is added only if its weight
               is > 0 and geo_fn returns a finite value for it (guards against NaN/Inf
               spikes at high noise timesteps).
+    sample_weight : (B,) optional — ᾱ_t (schedule.alphas_cumprod[t]), NOT the Min-SNR
+              weight used for the diffusion loss (Min-SNR only suppresses low-noise/
+              low-t samples and stays ≈1 for t≳500 — it does not protect against
+              high-noise instability). x0_pred = (x_t - sqrt(1-ᾱ_t)·eps_pred)/sqrt(ᾱ_t)
+              is recovered by dividing by sqrt(ᾱ_t), which →0 as t→T, so any eps
+              prediction error is amplified without bound at high t; smplh's FK then
+              composes that error multiplicatively down the kinematic chain. Weighting
+              by ᾱ_t (≈1 at low noise, →0 at high noise) fades the geo loss out
+              exactly where x0_pred stops being a meaningful clean-signal estimate.
     Returns (loss, contributions), where contributions holds the raw (unweighted)
     scalar values of the terms that were actually added, for epoch-level logging.
     """
     if geo_fn is None:
         return loss, {}
-    geo = geo_fn(x0_pred, motion, attn_mask)
+    geo = geo_fn(x0_pred, motion, attn_mask, sample_weight=sample_weight)
     contributions = {}
     for key, weight in weights.items():
         if weight > 0.0 and torch.isfinite(geo[key]):
@@ -100,8 +107,10 @@ def train_one_epoch(
         geo_log = {}
         if geo_fn is not None:
             x0_pred = schedule.predict_x0_from_eps(x_t, t, prediction.float())
+            sample_weight = schedule.alphas_cumprod[t]
             loss, geo_contrib = _add_geo_losses(
-                loss, x0_pred, motion.float(), attn_mask, geo_fn, geo_weights)
+                loss, x0_pred, motion.float(), attn_mask, geo_fn, geo_weights,
+                sample_weight=sample_weight)
             # geo_contrib holds RAW (unweighted) magnitudes for readability — what
             # actually reaches `loss` is geo_weights[key] * geo_contrib[key], which
             # is why e.g. "pos_raw" can be numerically larger than the total loss.
@@ -174,8 +183,10 @@ def validate_one_epoch(
 
         if geo_fn is not None:
             x0_pred = schedule.predict_x0_from_eps(x_t, t, prediction.float())
+            sample_weight = schedule.alphas_cumprod[t]
             loss, _ = _add_geo_losses(
-                loss, x0_pred, motion.float(), attn_mask, geo_fn, geo_weights)
+                loss, x0_pred, motion.float(), attn_mask, geo_fn, geo_weights,
+                sample_weight=sample_weight)
 
         total_loss += loss.item()
         pbar.set_postfix(val_loss=f"{loss.item():.4f}")

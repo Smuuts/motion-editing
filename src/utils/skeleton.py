@@ -27,12 +27,42 @@ PARENTS = [-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18,
 _HML3D_FOOT_JOINTS = [6, 9, 7, 10]  # L_Ankle=7, L_Foot=10, R_Ankle=8, R_Foot=11
 
 
+def _weighted_reduce(sq_err: torch.Tensor, frame_mask: torch.Tensor | None,
+                      sample_weight: torch.Tensor | None) -> torch.Tensor:
+    """Reduce a (B, T, ...) squared-error tensor to a scalar.
+
+    Without sample_weight: global sum/count mean (original behaviour, exact — every
+    valid element weighted equally regardless of which sample it came from).
+
+    With sample_weight (B,): per-sample mean first, then a weight-averaged mean over
+    the batch — mirrors `_diffusion_loss`'s Min-SNR branch (training/epoch.py) so the
+    geometric losses are down-weighted at high-noise timesteps the same way the
+    diffusion eps-MSE already is (x0_pred is least reliable there).
+    """
+    n_dims = sq_err.dim() - 2  # trailing (J, 3) or similar dims
+    if frame_mask is not None:
+        w = frame_mask.float()
+        sq_err = sq_err * w.reshape(*w.shape, *([1] * n_dims))
+    trailing = sq_err.shape[2:].numel()
+    if sample_weight is None:
+        if frame_mask is not None:
+            return sq_err.sum() / (frame_mask.float().sum() * trailing).clamp(min=1)
+        return sq_err.mean()
+    if frame_mask is not None:
+        denom = (frame_mask.float().sum(dim=1) * trailing).clamp(min=1)
+    else:
+        denom = max(sq_err.shape[1] * trailing, 1)
+    per_sample = sq_err.sum(dim=tuple(range(1, sq_err.dim()))) / denom
+    return (per_sample * sample_weight).mean()
+
+
 def hml3d_geometric_losses(
     x_pred_norm: torch.Tensor,          # (B, T, 263) predicted clean features, normalised
     x_gt_norm:   torch.Tensor,          # (B, T, 263) ground-truth clean features, normalised
     mean:        torch.Tensor,          # (263,)
     std:         torch.Tensor,          # (263,)
     mask:        torch.Tensor | None = None,  # (B, T) True = real frame
+    sample_weight: torch.Tensor | None = None,  # (B,) e.g. Min-SNR weight
 ) -> dict[str, torch.Tensor]:
     """
     MDM-style geometric losses (Eqs. 3-5) for HumanML3D (263-dim) features.
@@ -44,7 +74,8 @@ def hml3d_geometric_losses(
 
     Returns a dict {\"pos\": ..., \"vel\": ..., \"foot\": ...} of scalar tensors.
     x_pred_norm is clamped to ±5 before denormalisation to avoid gradient blow-up
-    at high noise timesteps.
+    at high noise timesteps. `sample_weight`, if given, further down-weights
+    per-sample contributions (see `_weighted_reduce`).
     """
     x_pred = x_pred_norm.clamp(-5, 5) * std + mean
     x_gt   = x_gt_norm              * std + mean
@@ -55,22 +86,14 @@ def hml3d_geometric_losses(
 
     # L_pos: per-joint position MSE
     sq_err = (pos_pred - pos_gt) ** 2
-    if mask is not None:
-        sq_err = sq_err * mask[:, :, None, None].float()
-        l_pos  = sq_err.sum() / (mask.float().sum() * 21 * 3).clamp(min=1)
-    else:
-        l_pos = sq_err.mean()
+    l_pos  = _weighted_reduce(sq_err, mask, sample_weight)
 
     # L_vel: frame-to-frame position-difference MSE (MDM Eq. 5)
     vel_pred   = pos_pred[:, 1:] - pos_pred[:, :-1]   # (B, T-1, 21, 3)
     vel_gt     = pos_gt[:,   1:] - pos_gt[:,   :-1]
     vel_sq_err = (vel_pred - vel_gt) ** 2
-    if mask is not None:
-        vel_mask   = (mask[:, :-1] & mask[:, 1:]).float()  # both frames must be real
-        vel_sq_err = vel_sq_err * vel_mask[:, :, None, None]
-        l_vel      = vel_sq_err.sum() / (vel_mask.sum() * 21 * 3).clamp(min=1)
-    else:
-        l_vel = vel_sq_err.mean()
+    vel_mask   = (mask[:, :-1] & mask[:, 1:]) if mask is not None else None  # both frames must be real
+    l_vel      = _weighted_reduce(vel_sq_err, vel_mask, sample_weight)
 
     # L_foot: penalise foot velocity when GT contact label is active (MDM Eq. 4)
     # Contact channels [259:263]: L_Ankle, L_Foot, R_Ankle, R_Foot (binary in GT),
@@ -80,12 +103,7 @@ def hml3d_geometric_losses(
     foot_vel_pred = foot_pos_pred[:, 1:] - foot_pos_pred[:, :-1]  # (B, T-1, 4, 3)
     f_i           = foot_contact[:, :-1, :, None]                  # (B, T-1, 4, 1)
     foot_sq_err   = (foot_vel_pred * f_i) ** 2
-    if mask is not None:
-        vel_mask    = (mask[:, :-1] & mask[:, 1:]).float()
-        foot_sq_err = foot_sq_err * vel_mask[:, :, None, None]
-        l_foot      = foot_sq_err.sum() / (vel_mask.sum() * 4 * 3).clamp(min=1)
-    else:
-        l_foot = foot_sq_err.mean()
+    l_foot        = _weighted_reduce(foot_sq_err, vel_mask, sample_weight)
 
     return {"pos": l_pos, "vel": l_vel, "foot": l_foot}
 
@@ -103,11 +121,18 @@ def smplh_geometric_losses(
     parents:     torch.Tensor,          # (22,)   kinematic-tree parents
     mask:        torch.Tensor | None = None,  # (B, T) True = real frame
     foot_thre:   float = 0.01,          # world foot speed (m/frame) below which GT foot = in contact
+    sample_weight: torch.Tensor | None = None,  # (B,) e.g. Min-SNR weight
 ) -> dict[str, torch.Tensor]:
     """
     MDM-style geometric losses for the SMPL-H (135-d) rep, on world-space joints obtained by forward
     kinematics (`smplh_world_joints`). Mirrors `hml3d_geometric_losses`, but the foot-contact label
     is derived from GT foot velocity (the SMPL-H rep has no explicit contact channels).
+
+    Unlike hml3d's direct per-joint readout, FK composes rotation errors multiplicatively down the
+    kinematic chain, so a bad x0_pred at a high-noise timestep produces much larger joint-position
+    errors here than in hml3d_geometric_losses. `sample_weight` (typically the same Min-SNR weight
+    already applied to the diffusion eps-MSE) down-weights those samples instead of letting them
+    dominate the batch loss — see `_weighted_reduce`.
     """
     from data.smplh_features import smplh_world_joints
 
@@ -118,21 +143,13 @@ def smplh_geometric_losses(
 
     # L_pos: per-joint position MSE
     sq_err = (Jp - Jg) ** 2
-    if mask is not None:
-        sq_err = sq_err * mask[:, :, None, None].float()
-        l_pos  = sq_err.sum() / (mask.float().sum() * 22 * 3).clamp(min=1)
-    else:
-        l_pos = sq_err.mean()
+    l_pos  = _weighted_reduce(sq_err, mask, sample_weight)
 
     # L_vel: frame-to-frame position-difference MSE
     vel_pred, vel_gt = Jp[:, 1:] - Jp[:, :-1], Jg[:, 1:] - Jg[:, :-1]
     vel_sq_err = (vel_pred - vel_gt) ** 2
-    if mask is not None:
-        vel_mask   = (mask[:, :-1] & mask[:, 1:]).float()
-        vel_sq_err = vel_sq_err * vel_mask[:, :, None, None]
-        l_vel      = vel_sq_err.sum() / (vel_mask.sum() * 22 * 3).clamp(min=1)
-    else:
-        l_vel = vel_sq_err.mean()
+    vel_mask   = (mask[:, :-1] & mask[:, 1:]) if mask is not None else None
+    l_vel      = _weighted_reduce(vel_sq_err, vel_mask, sample_weight)
 
     # L_foot: penalise predicted foot velocity where the GT foot is in contact
     foot_pred = Jp[:, :, _SMPLH_FOOT_JOINTS, :]
@@ -141,14 +158,50 @@ def smplh_geometric_losses(
     fvel_gt   = foot_gt[:, 1:]   - foot_gt[:, :-1]
     contact   = (fvel_gt.norm(dim=-1) < foot_thre).float()[..., None]  # (B, T-1, 4, 1)
     foot_sq_err = (fvel_pred * contact) ** 2
-    if mask is not None:
-        vel_mask    = (mask[:, :-1] & mask[:, 1:]).float()
-        foot_sq_err = foot_sq_err * vel_mask[:, :, None, None]
-        l_foot      = foot_sq_err.sum() / (vel_mask.sum() * 4 * 3).clamp(min=1)
-    else:
-        l_foot = foot_sq_err.mean()
+    l_foot      = _weighted_reduce(foot_sq_err, vel_mask, sample_weight)
 
     return {"pos": l_pos, "vel": l_vel, "foot": l_foot}
+
+
+def build_geo_fn(feature_mode: str, mean: torch.Tensor, std: torch.Tensor, device,
+                 pos_weight: float = 0.0, vel_weight: float = 0.0, foot_weight: float = 0.0,
+                 smplh_model_path: str | None = None):
+    """Factory for the rep-specific geometric-loss closure used by
+    train_one_epoch/validate_one_epoch (src/training/epoch.py).
+
+    Returns (geo_fn, label), or (None, None) if all three weights are 0
+    (geometric losses disabled) — callers should skip calling geo_fn in that case.
+
+    geo_fn(x0_pred, motion, mask, sample_weight=None) -> {"pos","vel","foot"}, routing to
+    smplh_geometric_losses (needs a SMPL-H body model for FK) or
+    hml3d_geometric_losses (reads joint positions directly from the 263-d
+    feature vector) so the epoch loop stays rep-agnostic. `sample_weight` (B,), if
+    given, down-weights each sample's contribution — pass the same Min-SNR weight
+    used for the diffusion loss so x0_pred at high-noise timesteps (least reliable,
+    and most damaging for smplh's FK-composed errors) doesn't dominate the batch.
+    """
+    if not any([pos_weight, vel_weight, foot_weight]):
+        return None, None
+
+    if feature_mode == "smplh":
+        import smplx
+        from data.smplh_features import smplh_rest_joints_and_parents
+
+        body_model = smplx.SMPLHLayer(model_path=smplh_model_path,
+                                      gender="neutral", ext="npz").to(device).eval()
+        for p in body_model.parameters():
+            p.requires_grad_(False)
+        J_rest, parents = smplh_rest_joints_and_parents(body_model)
+        J_rest, parents = J_rest.to(device), parents.to(device)
+
+        def geo_fn(x0, m, mask, sample_weight=None):
+            return smplh_geometric_losses(x0, m, mean, std, J_rest, parents, mask=mask,
+                                          sample_weight=sample_weight)
+        return geo_fn, "SMPL-FK"
+
+    def geo_fn(x0, m, mask, sample_weight=None):
+        return hml3d_geometric_losses(x0, m, mean, std, mask=mask, sample_weight=sample_weight)
+    return geo_fn, "HumanML3D"
 
 
 def _joint_positions_humanml3d(x: torch.Tensor) -> torch.Tensor:
