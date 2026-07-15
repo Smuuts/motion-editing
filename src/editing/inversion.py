@@ -89,7 +89,9 @@ class MotionEditor:
     @torch.no_grad()
     def collect_masks(self, state, edit_contexts, token_idxs_per_edit, valid_frames,
                       lambda_attn=70.0, lambda_noise=70.0, timesteps=None,
-                      mask_mode="m2_only", llm_group_masks=None):
+                      mask_mode="m2_only", llm_group_masks=None,
+                      context_source=None, m2_group_norm=False,
+                      attn_readout="raw", semantic_idxs_per_edit=None):
         """
         Build one mask dict per edit instruction (see masking.build_mask).
 
@@ -100,22 +102,39 @@ class MotionEditor:
         mask_mode            : "m2_only" (default) | "attn" | "groups" (see build_mask).
         llm_group_masks      : list of (F, G)/(G,) bool group masks, one per edit
                                (required for mask_mode="groups").
+        context_source       : (1, L, dim) SOURCE caption embedding used as the ψ
+                               reference instead of the null embedding (DiffEdit-style;
+                               see masking.collect_statistics). None → null reference.
+        m2_group_norm        : normalise ψ per group by source motion energy.
+        attn_readout         : M1 per-cell readout of the attention maps — "raw"
+                               (original) | "renorm" | "spatial" | "renorm_spatial"
+                               (see masking.collect_statistics).
+        semantic_idxs_per_edit : stop-word-filtered token index lists (one per edit,
+                               masking.semantic_token_subset); used by the non-"raw"
+                               readouts. Defaults to token_idxs_per_edit.
         """
         need_attn = mask_mode in ("attn", "m1_only")
         if token_idxs_per_edit is None:
             token_idxs_per_edit = [None] * len(edit_contexts)
         if llm_group_masks is None:
             llm_group_masks = [None] * len(edit_contexts)
+        if semantic_idxs_per_edit is None:
+            semantic_idxs_per_edit = [None] * len(edit_contexts)
 
+        valid_frames = valid_frames.to(self.device)
         masks = []
-        for ctx, tok, llm_m in zip(edit_contexts, token_idxs_per_edit, llm_group_masks):
+        for ctx, tok, llm_m, sem in zip(edit_contexts, token_idxs_per_edit,
+                                        llm_group_masks, semantic_idxs_per_edit):
             attn_fg, psi_fg = masking.collect_statistics(
                 self.model, self.schedule, state.xs, ctx, tok,
                 is_group=self.is_group, timesteps=timesteps, need_attn=need_attn,
                 group_channels=self.group_channels,
+                context_ref=context_source, psi_group_norm=m2_group_norm,
+                valid_frames=valid_frames,
+                attn_readout=attn_readout, semantic_idxs=sem,
             )
             masks.append(masking.build_mask(
-                attn_fg, psi_fg, valid_frames.to(self.device), self.is_group,
+                attn_fg, psi_fg, valid_frames, self.is_group,
                 lambda_attn=lambda_attn, lambda_noise=lambda_noise,
                 mask_mode=mask_mode, llm_group_mask=llm_m,
                 group_channels=self.group_channels, feat_dim=self.feat_dim,

@@ -35,23 +35,20 @@ def _weighted_reduce(sq_err: torch.Tensor, frame_mask: torch.Tensor | None,
     valid element weighted equally regardless of which sample it came from).
 
     With sample_weight (B,): per-sample mean first, then a weight-averaged mean over
-    the batch — mirrors `_diffusion_loss`'s Min-SNR branch (training/epoch.py) so the
-    geometric losses are down-weighted at high-noise timesteps the same way the
-    diffusion eps-MSE already is (x0_pred is least reliable there).
+    the batch — see `NoiseSchedule.x0_confidence_weight` (model/schedule.py) for what
+    this is used for: fading geo losses out at high-noise timesteps, where x0_pred
+    stops being a reliable estimate of the clean signal.
     """
     n_dims = sq_err.dim() - 2  # trailing (J, 3) or similar dims
-    if frame_mask is not None:
-        w = frame_mask.float()
-        sq_err = sq_err * w.reshape(*w.shape, *([1] * n_dims))
     trailing = sq_err.shape[2:].numel()
+    w = frame_mask.float() if frame_mask is not None else None
+    if w is not None:
+        sq_err = sq_err * w.reshape(*w.shape, *([1] * n_dims))
     if sample_weight is None:
-        if frame_mask is not None:
-            return sq_err.sum() / (frame_mask.float().sum() * trailing).clamp(min=1)
+        if w is not None:
+            return sq_err.sum() / (w.sum() * trailing).clamp(min=1)
         return sq_err.mean()
-    if frame_mask is not None:
-        denom = (frame_mask.float().sum(dim=1) * trailing).clamp(min=1)
-    else:
-        denom = max(sq_err.shape[1] * trailing, 1)
+    denom = (w.sum(dim=1) * trailing).clamp(min=1) if w is not None else max(sq_err.shape[1] * trailing, 1)
     per_sample = sq_err.sum(dim=tuple(range(1, sq_err.dim()))) / denom
     return (per_sample * sample_weight).mean()
 
@@ -62,7 +59,7 @@ def hml3d_geometric_losses(
     mean:        torch.Tensor,          # (263,)
     std:         torch.Tensor,          # (263,)
     mask:        torch.Tensor | None = None,  # (B, T) True = real frame
-    sample_weight: torch.Tensor | None = None,  # (B,) e.g. Min-SNR weight
+    sample_weight: torch.Tensor | None = None,  # (B,) e.g. NoiseSchedule.x0_confidence_weight(t)
 ) -> dict[str, torch.Tensor]:
     """
     MDM-style geometric losses (Eqs. 3-5) for HumanML3D (263-dim) features.
@@ -121,7 +118,7 @@ def smplh_geometric_losses(
     parents:     torch.Tensor,          # (22,)   kinematic-tree parents
     mask:        torch.Tensor | None = None,  # (B, T) True = real frame
     foot_thre:   float = 0.01,          # world foot speed (m/frame) below which GT foot = in contact
-    sample_weight: torch.Tensor | None = None,  # (B,) e.g. Min-SNR weight
+    sample_weight: torch.Tensor | None = None,  # (B,) e.g. NoiseSchedule.x0_confidence_weight(t)
 ) -> dict[str, torch.Tensor]:
     """
     MDM-style geometric losses for the SMPL-H (135-d) rep, on world-space joints obtained by forward
@@ -130,8 +127,8 @@ def smplh_geometric_losses(
 
     Unlike hml3d's direct per-joint readout, FK composes rotation errors multiplicatively down the
     kinematic chain, so a bad x0_pred at a high-noise timestep produces much larger joint-position
-    errors here than in hml3d_geometric_losses. `sample_weight` (typically the same Min-SNR weight
-    already applied to the diffusion eps-MSE) down-weights those samples instead of letting them
+    errors here than in hml3d_geometric_losses. `sample_weight` (typically
+    `NoiseSchedule.x0_confidence_weight(t)`) down-weights those samples instead of letting them
     dominate the batch loss — see `_weighted_reduce`.
     """
     from data.smplh_features import smplh_world_joints
@@ -176,9 +173,9 @@ def build_geo_fn(feature_mode: str, mean: torch.Tensor, std: torch.Tensor, devic
     smplh_geometric_losses (needs a SMPL-H body model for FK) or
     hml3d_geometric_losses (reads joint positions directly from the 263-d
     feature vector) so the epoch loop stays rep-agnostic. `sample_weight` (B,), if
-    given, down-weights each sample's contribution — pass the same Min-SNR weight
-    used for the diffusion loss so x0_pred at high-noise timesteps (least reliable,
-    and most damaging for smplh's FK-composed errors) doesn't dominate the batch.
+    given, down-weights each sample's contribution — pass
+    `NoiseSchedule.x0_confidence_weight(t)` so x0_pred at high-noise timesteps (least
+    reliable, and most damaging for smplh's FK-composed errors) doesn't dominate the batch.
     """
     if not any([pos_weight, vel_weight, foot_weight]):
         return None, None

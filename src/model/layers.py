@@ -62,9 +62,16 @@ class CrossAttention(nn.Module):
         self.last_attn_map = None
 
     def forward(self, x: torch.Tensor, context: torch.Tensor,
-                store_attn: bool = False) -> torch.Tensor:
+                store_attn: bool = False,
+                context_mask: torch.Tensor | None = None) -> torch.Tensor:
         # store_attn=True is passed during Stage 1 inversion and Stage 3 denoising
         # to collect A^{t,l} maps. Must be False during training to avoid memory growth.
+        # context_mask: (B, L) bool, False = padding key. Without it, every padding
+        # column competes in the softmax with key logit exactly 0 (zeroed T5 pad
+        # embedding × bias-free W_k) and absorbs ~93% of the mass for short texts,
+        # attenuating the (zero-value) cross-attention output ~14× — see
+        # docs/FINDINGS.md "padding sink". Old checkpoints trained unmasked; the
+        # model only passes a mask when built with ctx_pad_mask=True.
         B, N, _ = x.shape
         _, L, _ = context.shape
 
@@ -74,13 +81,20 @@ class CrossAttention(nn.Module):
 
         if store_attn:
             # Materialize for attention map capture (inference only — not training).
-            attn = torch.softmax(q @ k.transpose(-2, -1) * self.scale, dim=-1)
+            logits = q @ k.transpose(-2, -1) * self.scale
+            if context_mask is not None:
+                logits = logits.masked_fill(~context_mask[:, None, None, :],
+                                            torch.finfo(logits.dtype).min)
+            attn = torch.softmax(logits, dim=-1)
             attn = self.dropout(attn)
             self.last_attn_map = attn.detach()
             out = (attn @ v).transpose(1, 2).reshape(B, N, -1)
         else:
+            attn_mask = (context_mask[:, None, None, :]
+                         if context_mask is not None else None)
             dropout_p = self.dropout.p if self.training else 0.0
-            out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask,
+                                                 dropout_p=dropout_p)
             out = out.transpose(1, 2).reshape(B, N, -1)
 
         return self.out(out)
@@ -147,7 +161,8 @@ class DiTBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor,
                 context: torch.Tensor, store_attn: bool = False,
-                mask: torch.Tensor | None = None):
+                mask: torch.Tensor | None = None,
+                context_mask: torch.Tensor | None = None):
         mods = self.adaLN_modulation(t_emb)
         s1, b1, g1, s2, b2, g2, s3, b3, g3 = mods.chunk(9, dim=-1)
         s1, b1, g1 = s1[:, None], b1[:, None], g1[:, None]
@@ -157,6 +172,7 @@ class DiTBlock(nn.Module):
         # adaLN-zero: gate (g) is zero-initialised so each block is an identity
         # map at the start of training (DiT §3.2).
         x = x + g1 * self.self_attn(self.norm1(x) * (1 + s1) + b1, mask=mask)
-        x = x + g2 * self.cross_attn(self.norm2(x) * (1 + s2) + b2, context, store_attn=store_attn)
+        x = x + g2 * self.cross_attn(self.norm2(x) * (1 + s2) + b2, context,
+                                     store_attn=store_attn, context_mask=context_mask)
         x = x + g3 * self.ff(self.norm3(x) * (1 + s3) + b3)
         return x

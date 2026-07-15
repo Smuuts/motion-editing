@@ -44,6 +44,7 @@ class _MotionDiTBase(nn.Module):
         ff_mult:      int,
         dropout:      float,
         text_seq_len: int,
+        ctx_pad_mask: bool = False,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -55,10 +56,37 @@ class _MotionDiTBase(nn.Module):
         ])
         self.final_norm = nn.LayerNorm(latent_dim)
 
+        # Mask padding keys in cross-attention. Padding positions are detected as
+        # all-zero context columns — the convention T5TextEncoder enforces (CLIP
+        # does not zero its pads, so with CLIP this flag is a no-op). Without the
+        # mask, the ~L−|words| zero-logit pad columns absorb ~93% of the softmax
+        # mass and attenuate the cross-attention output ~14× (docs/FINDINGS.md
+        # "padding sink"). Config-gated (default off) because checkpoints trained
+        # unmasked equilibrated to the attenuated regime — enabling it on an old
+        # checkpoint at inference rescales cross-attention out of distribution.
+        self.ctx_pad_mask = ctx_pad_mask
+
         # null_text_emb length matches the text encoder's fixed output length (77 for CLIP,
         # configurable for T5). For LEDITS++ inversion (Stage 1): pass context=None so the
         # model uses this — inversion is unconditional.
         self.null_text_emb = nn.Parameter(torch.randn(1, text_seq_len, context_dim) * 0.02)
+
+    def _context_and_mask(self, context, B):
+        """Resolve the (context, context_mask) pair for a forward pass.
+
+        context=None → the learned null embedding, never masked (all its columns
+        are real). With ctx_pad_mask, all-zero columns are treated as padding —
+        this also holds sample-wise for CFG-dropout batches where torch.where
+        mixed null_text_emb rows (nonzero everywhere) into an encoded batch.
+        """
+        if context is None:
+            return self.null_text_emb.expand(B, -1, -1), None
+        if not self.ctx_pad_mask:
+            return context, None
+        ctx_mask = context.abs().sum(dim=-1) > 0                 # (B, L)
+        if ctx_mask.all():
+            ctx_mask = None  # keep the fused SDPA fast path when nothing is padded
+        return context, ctx_mask
 
     def _init_weights(self):
         for m in self.modules():
@@ -108,9 +136,10 @@ class MotionDiT(_MotionDiTBase):
         ff_mult:      int   = 4,
         dropout:      float = 0.1,
         text_seq_len: int   = 77,
+        ctx_pad_mask: bool  = False,
     ):
         super().__init__(latent_dim, context_dim, num_heads, num_layers,
-                          max_frames, ff_mult, dropout, text_seq_len)
+                          max_frames, ff_mult, dropout, text_seq_len, ctx_pad_mask)
         self.input_dim = input_dim
 
         self.joint_proj  = nn.Linear(input_dim, latent_dim)
@@ -126,14 +155,14 @@ class MotionDiT(_MotionDiTBase):
         mask:       torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, F, _ = motion.shape
-        if context is None:
-            context = self.null_text_emb.expand(B, -1, -1)
+        context, ctx_mask = self._context_and_mask(context, B)
 
         x = self.joint_proj(motion) + self.pos_emb(F, motion.device)
         t_emb = self.time_emb(t)
 
         for block in self.blocks:
-            x = block(x, t_emb, context, store_attn=store_attn, mask=mask)
+            x = block(x, t_emb, context, store_attn=store_attn, mask=mask,
+                      context_mask=ctx_mask)
 
         return self.output_proj(self.final_norm(x))
 
@@ -171,9 +200,10 @@ class GroupDiT(_MotionDiTBase):
         ff_mult:      int   = 4,
         dropout:      float = 0.1,
         text_seq_len: int   = 77,
+        ctx_pad_mask: bool  = False,
     ):
         super().__init__(latent_dim, context_dim, num_heads, num_layers,
-                          max_frames, ff_mult, dropout, text_seq_len)
+                          max_frames, ff_mult, dropout, text_seq_len, ctx_pad_mask)
         # Representation-specific channel partition: 'humanml3d' (263) or 'smplh' (135).
         # The body-part grouping (N_GROUPS, GROUP_NAMES) is shared across both.
         self.group_channels, group_dims, self.input_dim = _group_layout(feature_mode)
@@ -210,8 +240,7 @@ class GroupDiT(_MotionDiTBase):
         B, F, _ = motion.shape
         G = _N_GROUPS  # 7
 
-        if context is None:
-            context = self.null_text_emb.expand(B, -1, -1)
+        context, ctx_mask = self._context_and_mask(context, B)
 
         # ── tokenise ──────────────────────────────────────────────────────────
         # Single gather into group order, then a free (view-only) split per group,
@@ -240,7 +269,8 @@ class GroupDiT(_MotionDiTBase):
 
         t_emb = self.time_emb(t)
         for block in self.blocks:
-            tokens = block(tokens, t_emb, context, store_attn=store_attn, mask=mask)
+            tokens = block(tokens, t_emb, context, store_attn=store_attn, mask=mask,
+                           context_mask=ctx_mask)
 
         tokens = self.final_norm(tokens).reshape(B, F, G, self.latent_dim)
 
@@ -262,6 +292,9 @@ def build_model(config: dict, device="cpu") -> _MotionDiTBase:
         ff_mult      = config.get("ff_mult",       4),
         dropout      = config.get("dropout",       0.1),
         text_seq_len = config.get("text_seq_len",  77),
+        # Default False: checkpoints saved before 2026-07-15 trained without the
+        # pad mask and must be rebuilt exactly as trained (see _MotionDiTBase).
+        ctx_pad_mask = config.get("ctx_pad_mask", False),
     )
     feature_mode = config.get("feature_mode", "humanml3d")
     if _is_grouped_mode(feature_mode):

@@ -48,6 +48,14 @@ def build_parser():
                    help="T5 model name (e.g. t5-base, t5-large). Used when --text_encoder=t5.")
     p.add_argument("--t5_max_length", type=int,  default=128,
                    help="Fixed token sequence length for T5 output. Used when --text_encoder=t5.")
+    p.add_argument("--ctx_pad_mask", action=argparse.BooleanOptionalAction, default=True,
+                   help="Mask padding keys in cross-attention (default on for new runs). "
+                        "Without it, zero-embedding pad columns absorb ~93%% of attention "
+                        "mass and attenuate text conditioning ~14x (see docs/FINDINGS.md "
+                        "'padding sink'). Detected via all-zero context columns, which "
+                        "T5TextEncoder guarantees; a no-op with --text_encoder clip (CLIP "
+                        "does not zero pads). Checkpoints trained before this flag existed "
+                        "load with it off automatically (missing config key).")
 
     # diffusion
     p.add_argument("--timesteps",    type=int,   default=1000)
@@ -128,6 +136,12 @@ def main():
             for k, v in saved.items():
                 if k not in preserved:
                     config[k] = v
+            # A pre-fix run's config has no ctx_pad_mask key; the CLI default (True)
+            # must not silently flip the attention regime mid-training.
+            if "ctx_pad_mask" not in saved and "ctx_pad_mask" not in cli_keys:
+                config["ctx_pad_mask"] = False
+                print("Resume: saved config predates ctx_pad_mask — keeping it OFF to "
+                      "match how this run trained (pass --ctx_pad_mask to override).")
             print(f"Resume: loaded config from {saved_path} "
                   f"(overridden by CLI args: {sorted(cli_keys - {'resume', 'output_dir'})})")
         else:
@@ -198,6 +212,9 @@ def main():
         text_encoder = build_text_encoder(config, device=device)
 
     # model
+    if config["ctx_pad_mask"] and config["text_encoder"] == "clip":
+        print("NOTE: --ctx_pad_mask is a no-op with the CLIP encoder (CLIP does not "
+              "zero its padding embeddings, so no context column is all-zero).")
     model = build_model({
         "feature_mode": args.feature_mode,
         "input_dim":    train_loader.dataset.feature_dim,
@@ -208,6 +225,7 @@ def main():
         "num_layers":   args.num_layers,
         "max_frames":   args.max_frames,
         "dropout":      args.dropout,
+        "ctx_pad_mask": config["ctx_pad_mask"],
     }, device=device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.1f}M")
 

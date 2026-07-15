@@ -56,6 +56,7 @@ from model.schedule import NoiseSchedule
 from model.text_encoder import build_text_encoder
 from model.body_groups import GROUP_NAMES, is_grouped_mode
 from editing import MotionEditor
+from editing.masking import semantic_token_subset
 from utils.visualise import recover_from_ric, save_comparison_animation
 from utils.model_io import load_model
 
@@ -93,8 +94,25 @@ def parse_args():
                         "Example: --target_groups \"right_arm head\".")
     p.add_argument("--lambda_noise", type=float, default=70.0,
                    help="M2 percentile threshold (higher = sparser mask).")
+    p.add_argument("--m2_ref", default="null", choices=["null", "source"],
+                   help="Reference conditioning for the M2 contrast psi = eps(c_edit) "
+                        "- eps(ref). 'null' = learned null embedding (original "
+                        "LEDITS++ form). 'source' = the source clip's own caption "
+                        "(DiffEdit-style reference text) — cancels source-dynamics-"
+                        "driven psi. Falls back to null if the clip has no caption.")
+    p.add_argument("--m2_group_norm", action="store_true",
+                   help="Normalise psi per body-part group by the source's per-group "
+                        "motion energy before thresholding, so already-moving groups "
+                        "don't monopolise the M2 mask.")
     p.add_argument("--lambda_attn", type=float, default=70.0,
                    help="M1 percentile threshold (only used when --mask_mode attn).")
+    p.add_argument("--m1_readout", default="raw",
+                   choices=["raw", "renorm", "spatial", "renorm_spatial"],
+                   help="M1 per-cell attention readout. 'raw' = mean mass on content "
+                        "tokens (original, sink-dominated). 'renorm' = semantic share "
+                        "of content-token mass (drops the pad/EOS sink, Attend-and-"
+                        "Excite-style). 'spatial' = per-token spatial profile, "
+                        "averaged (DAAM-style). 'renorm_spatial' = both.")
     p.add_argument("--mask_timesteps", type=int, default=None,
                    help="Use this many evenly-spaced timesteps for mask collection "
                         "(default: all 1000). Small values (e.g. 40) greatly speed up "
@@ -206,6 +224,16 @@ def main():
     print("Stage 1: inversion …")
     state = editor.invert(x0)
 
+    # ψ reference for M2: the source caption's embedding when requested + available.
+    ctx_src = None
+    if args.m2_ref == "source":
+        if src_caption:
+            with torch.no_grad():
+                ctx_src = text_encoder.encode([src_caption])
+        else:
+            print("WARNING: --m2_ref source but the clip has no caption; "
+                  "falling back to the null reference.")
+
     # ── group instructions into render jobs ─────────────────────────────────────
     # compose → all edits in one video; else → one video per instruction (variety).
     edits = args.instructions
@@ -227,7 +255,9 @@ def main():
             # calls — same per-text embeddings (encoder attention is intra-sequence
             # only), fewer transformer forward passes when --compose has N>1 edits.
             ctxs = list(text_encoder.encode(job).split(1, dim=0))
-            toks = [text_encoder.token_info(e)[0] for e in job]
+            tok_info = [text_encoder.token_info(e) for e in job]
+            toks = [ti[0] for ti in tok_info]
+            sems = [semantic_token_subset(*ti) for ti in tok_info]
         mask_ts = (torch.linspace(1, schedule.T - 1, args.mask_timesteps).long().tolist()
                    if args.mask_timesteps else None)
         if args.mask_mode == "groups":
@@ -239,12 +269,16 @@ def main():
                 state, ctxs, toks, valid_frames,
                 lambda_attn=args.lambda_attn, lambda_noise=args.lambda_noise,
                 mask_mode="groups", llm_group_masks=group_masks, timesteps=mask_ts,
+                context_source=ctx_src, m2_group_norm=args.m2_group_norm,
+                attn_readout=args.m1_readout, semantic_idxs_per_edit=sems,
             )
         else:
             masks = editor.collect_masks(
                 state, ctxs, toks, valid_frames,
                 lambda_attn=args.lambda_attn, lambda_noise=args.lambda_noise,
                 mask_mode=args.mask_mode, timesteps=mask_ts,
+                context_source=ctx_src, m2_group_norm=args.m2_group_norm,
+                attn_readout=args.m1_readout, semantic_idxs_per_edit=sems,
             )
         x_edit = editor.edit(state, ctxs, masks, scales=scales,
                              guidance_alpha_floor=args.guidance_alpha_floor)   # (1,F,263)

@@ -198,8 +198,7 @@ def main():
             if args.snr_gamma > 0.0:
                 valid_elems = (attn_mask.float().sum(dim=1) * noise.shape[-1]).clamp(min=1)
                 per_sample  = per_elem.sum(dim=(1, 2)) / valid_elems
-                snr_t      = schedule.snr[t]
-                snr_weight = snr_t.clamp(max=args.snr_gamma) / snr_t
+                snr_weight  = schedule.min_snr_weight(t, args.snr_gamma)
                 loss = (per_sample * snr_weight).mean()
             else:
                 loss = per_elem.sum() / (loss_mask.sum() * noise.shape[-1]).clamp(min=1)

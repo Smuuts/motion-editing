@@ -43,15 +43,8 @@ def _add_geo_losses(loss, x0_pred, motion, attn_mask, geo_fn, weights, sample_we
     weights : {"pos": w, "vel": w, "foot": w} — a term is added only if its weight
               is > 0 and geo_fn returns a finite value for it (guards against NaN/Inf
               spikes at high noise timesteps).
-    sample_weight : (B,) optional — ᾱ_t (schedule.alphas_cumprod[t]), NOT the Min-SNR
-              weight used for the diffusion loss (Min-SNR only suppresses low-noise/
-              low-t samples and stays ≈1 for t≳500 — it does not protect against
-              high-noise instability). x0_pred = (x_t - sqrt(1-ᾱ_t)·eps_pred)/sqrt(ᾱ_t)
-              is recovered by dividing by sqrt(ᾱ_t), which →0 as t→T, so any eps
-              prediction error is amplified without bound at high t; smplh's FK then
-              composes that error multiplicatively down the kinematic chain. Weighting
-              by ᾱ_t (≈1 at low noise, →0 at high noise) fades the geo loss out
-              exactly where x0_pred stops being a meaningful clean-signal estimate.
+    sample_weight : (B,) optional — see `NoiseSchedule.x0_confidence_weight`. Down-weights
+              samples where x0_pred is an unreliable estimate of the clean signal.
     Returns (loss, contributions), where contributions holds the raw (unweighted)
     scalar values of the terms that were actually added, for epoch-level logging.
     """
@@ -107,7 +100,7 @@ def train_one_epoch(
         geo_log = {}
         if geo_fn is not None:
             x0_pred = schedule.predict_x0_from_eps(x_t, t, prediction.float())
-            sample_weight = schedule.alphas_cumprod[t]
+            sample_weight = schedule.x0_confidence_weight(t)
             loss, geo_contrib = _add_geo_losses(
                 loss, x0_pred, motion.float(), attn_mask, geo_fn, geo_weights,
                 sample_weight=sample_weight)
@@ -183,7 +176,7 @@ def validate_one_epoch(
 
         if geo_fn is not None:
             x0_pred = schedule.predict_x0_from_eps(x_t, t, prediction.float())
-            sample_weight = schedule.alphas_cumprod[t]
+            sample_weight = schedule.x0_confidence_weight(t)
             loss, _ = _add_geo_losses(
                 loss, x0_pred, motion.float(), attn_mask, geo_fn, geo_weights,
                 sample_weight=sample_weight)

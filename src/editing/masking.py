@@ -6,10 +6,26 @@ Builds, per edit instruction, a binary mask M = M1 ∩ M2 in (frame × group) sp
   M1 (semantic)        — averaged cross-attention over the instruction's content
                          tokens, layers and timesteps; thresholded at a percentile.
                          "Which body-part group at which frame does the edit text
-                         attend to?"
-  M2 (noise-estimate)  — magnitude of the guidance vector ψ = ε_θ(x_t, c) − ε_θ(x_t, ∅),
+                         attend to?" The raw readout is known to be sink-dominated:
+                         CrossAttention has no key-padding mask, so the ~L−|words|
+                         padding columns (zero T5 embeddings → zero logits) plus EOS
+                         absorb most softmax mass, and the per-cell content readout
+                         is modulated by that sink denominator. `attn_readout`
+                         selects sink-corrected readouts (see collect_statistics):
+                         "renorm" (drop sink columns, renormalise — Attend-and-
+                         Excite, Chefer et al. 2023) and/or "spatial" (per-token
+                         spatial profile — DAAM, Tang et al. 2023).
+  M2 (noise-estimate)  — magnitude of the guidance vector ψ = ε_θ(x_t, c) − ε_θ(x_t, ref),
                          aggregated per group and thresholded. "Where does the edit
-                         actually change the prediction?"
+                         actually change the prediction?" The reference ref is the
+                         learned null embedding by default; passing the SOURCE
+                         caption's embedding instead (DiffEdit's "reference text",
+                         Couairon et al., ICLR 2023) cancels the part of ψ both
+                         conditionings agree on — i.e. the source's own dynamics —
+                         which is the known failure mode of the null-referenced mask
+                         (it fires on whatever the source already moves). Optionally
+                         ψ is additionally normalised per group by the source's own
+                         motion energy (psi_group_norm) for the same reason.
 
 Both masks are accumulated over the stored inversion timesteps x_t, so the mask is
 averaged over the whole trajectory rather than read off a single noise level.
@@ -26,6 +42,26 @@ for the Stage-3 hard inpainting.
 import torch
 
 from model.body_groups import GROUP_CHANNELS, N_GROUPS
+
+# Same set as analyse_attention.py's _STOP_WORDS: function words + generic caption
+# vocabulary that carry no body-part/action semantics for mask purposes.
+_STOP_WORDS = {
+    "a", "an", "the",
+    "person", "man", "woman", "human", "someone",
+    "their", "they", "them", "his", "her", "its",
+    "is", "are", "was", "were",
+    "to", "of", "in", "on", "at", "by", "for", "with",
+    "and", "or", "but",
+    "up", "down", "forward", "backward", "side", "out",
+    "slowly", "quickly", "slightly",
+}
+
+
+def semantic_token_subset(idxs: list[int], labels: list[str]) -> list[int]:
+    """Stop-word-filtered subset of content-token positions (falls back to all
+    content tokens if the filter would remove everything)."""
+    sem = [i for i, lbl in zip(idxs, labels) if lbl.lower() not in _STOP_WORDS]
+    return sem or list(idxs)
 
 
 def _aggregate_channels_to_groups(per_channel: torch.Tensor, is_group: bool,
@@ -54,6 +90,50 @@ def _group_aggregation_matrix(group_channels, device) -> torch.Tensor:
     return mat
 
 
+def _group_motion_energy(x0: torch.Tensor, valid_frames, agg_matrix: torch.Tensor,
+                         floor_frac: float = 0.25) -> torch.Tensor:
+    """
+    (G,) mean |Δx0| per group over valid frames — how much each body-part group
+    already moves in the source. Used to discount ψ for groups whose large noise
+    difference is explained by source dynamics rather than by the instruction.
+
+    Floored at floor_frac·mean(energy) so a truly static group doesn't blow up
+    to an unbounded ψ boost (dividing by ~0 would hand the mask to *any* static
+    group regardless of the instruction).
+    """
+    if valid_frames is not None:
+        x0 = x0[valid_frames]
+    diff = (x0[1:] - x0[:-1]).abs().mean(dim=0)      # (D,) per-channel motion energy
+    energy = diff @ agg_matrix                        # (G,) per-group mean
+    return energy.clamp(min=floor_frac * energy.mean())
+
+
+def _attn_readout_value(avg: torch.Tensor, tok: torch.Tensor, sem: torch.Tensor,
+                        readout: str) -> torch.Tensor:
+    """
+    (N, L) layer/head-averaged attention map → (N,) per-cell M1 value.
+
+    tok — all content-token columns (words; excludes BOS/EOS/padding).
+    sem — stop-word-filtered subset of tok.
+    See collect_statistics's docstring for the readout definitions. Note "renorm"
+    is only informative when sem ⊊ tok (otherwise the ratio is constant 1 — the
+    semantic_token_subset fallback guarantees sem is never empty, not proper).
+    """
+    if readout == "raw":
+        return avg[:, tok].mean(dim=-1)
+    if readout == "renorm":
+        return avg[:, sem].sum(dim=-1) / avg[:, tok].sum(dim=-1).clamp_min(1e-12)
+    if readout == "spatial":
+        cols = avg[:, sem]                                       # (N, S)
+        cols = cols / cols.sum(dim=0, keepdim=True).clamp_min(1e-12)
+        return cols.mean(dim=-1)
+    if readout == "renorm_spatial":
+        rows = avg[:, sem] / avg[:, tok].sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        rows = rows / rows.sum(dim=0, keepdim=True).clamp_min(1e-12)
+        return rows.mean(dim=-1)
+    raise ValueError(f"unknown attn_readout {readout!r}")
+
+
 def _percentile_threshold(values: torch.Tensor, valid_frames: torch.Tensor,
                           percentile: float) -> torch.Tensor:
     """
@@ -70,7 +150,8 @@ def _percentile_threshold(values: torch.Tensor, valid_frames: torch.Tensor,
 @torch.no_grad()
 def collect_statistics(model, schedule, xs, context_edit, token_idxs,
                        is_group, num_groups=None, timesteps=None, need_attn=True,
-                       group_channels=None):
+                       group_channels=None, context_ref=None, psi_group_norm=False,
+                       valid_frames=None, attn_readout="raw", semantic_idxs=None):
     """
     Sweep the stored inversion sequence and accumulate the raw quantities for M1/M2.
 
@@ -85,10 +166,31 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
     timesteps     : iterable of t to sweep (default: every t in [1, T))
     need_attn     : capture cross-attention for M1. False (e.g. m2_only / llm modes)
                     skips the attention pass entirely and returns attn_fg = zeros.
+    context_ref   : (1, L, dim) reference embedding for the ψ contrast, or None for
+                    the model's learned null embedding (the original LEDITS++/SEGA
+                    form). Pass the SOURCE caption's embedding to cancel
+                    source-dynamics-driven ψ (DiffEdit-style reference text).
+    psi_group_norm: divide ψ per group by the source's per-group motion energy
+                    (see _group_motion_energy) before returning. No-op for G=1.
+    valid_frames  : (F,) bool — only consulted by psi_group_norm's energy estimate.
+    attn_readout  : how the per-cell M1 value is read off the (N, L) attention map
+                    (softmax rows include the padding/EOS sink columns — see module
+                    docstring):
+                    "raw"     — mean attention mass on the content tokens (original).
+                    "renorm"  — semantic tokens' share of the *content-token* mass
+                                per cell: drops the pad/EOS sink from the denominator
+                                (Attend-and-Excite-style re-softmax).
+                    "spatial" — each semantic token's map normalised over cells
+                                first (its spatial profile, DAAM-style), then
+                                averaged: a token holding little total mass still
+                                votes with its full spatial distribution.
+                    "renorm_spatial" — renorm rows, then spatial-normalise columns.
+    semantic_idxs : stop-word-filtered subset of token_idxs (semantic_token_subset).
+                    Required for the non-"raw" readouts; defaults to token_idxs.
 
     Returns (attn_fg, psi_fg), both (F, G):
       attn_fg — mean semantic cross-attention per (frame, group) (zeros if need_attn=False)
-      psi_fg  — mean |ε_c − ε_∅| per (frame, group)
+      psi_fg  — mean |ε_c − ε_ref| per (frame, group)
     """
     T = schedule.T
     F = xs.shape[2]
@@ -97,12 +199,16 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
         timesteps = range(1, T)
 
     device = context_edit.device
-    null_context = None  # model uses its learned null_text_emb
+    # ψ reference: source-caption embedding if given, else None → the model falls
+    # back to its learned null_text_emb (original behaviour).
     attn_accum = torch.zeros(F, G, device=device)
     psi_accum  = torch.zeros(F, G, device=device)
     n = 0
 
     tok = (torch.as_tensor(token_idxs, device=device, dtype=torch.long)
+           if need_attn else None)
+    sem = (torch.as_tensor(semantic_idxs if semantic_idxs else token_idxs,
+                           device=device, dtype=torch.long)
            if need_attn else None)
     # Precompute the channel->group aggregation once (it's invariant across the
     # sweep) instead of rebuilding it from group_channels every iteration.
@@ -119,16 +225,19 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
             layer_maps = model.get_attn_maps()                # list of (1, h, N, L)
             stacked = torch.stack(layer_maps, dim=0).float()  # (Lyr, 1, h, N, L)
             avg = stacked.mean(dim=(0, 1, 2))                 # (N, L)
-            avg = avg[:, tok].mean(dim=-1)                    # (N,) over content tokens
-            attn_accum += avg.reshape(F, G)
+            attn_accum += _attn_readout_value(avg, tok, sem, attn_readout).reshape(F, G)
 
-        # ψ = ε_θ(x_t, c_edit) − ε_θ(x_t, ∅) → M2 contribution
-        eps_u = model(x_t, t_b, null_context)
-        psi = (eps_c - eps_u)[0].abs()                        # (F, D)
+        # ψ = ε_θ(x_t, c_edit) − ε_θ(x_t, ref) → M2 contribution
+        eps_r = model(x_t, t_b, context_ref)
+        psi = (eps_c - eps_r)[0].abs()                        # (F, D)
         psi_accum += psi @ agg_matrix if is_group else psi.mean(dim=-1, keepdim=True)
         n += 1
 
-    return attn_accum / max(n, 1), psi_accum / max(n, 1)
+    psi_fg = psi_accum / max(n, 1)
+    if psi_group_norm and is_group:
+        energy = _group_motion_energy(xs[0][0].to(device), valid_frames, agg_matrix)
+        psi_fg = psi_fg / energy[None, :]
+    return attn_accum / max(n, 1), psi_fg
 
 
 # mask_mode -> (semantic source | None, use_m2). The two mask components are

@@ -93,12 +93,25 @@ class NoiseSchedule:
     def min_snr_weight(self, t, gamma):
         """Per-sample Min-SNR weight: min(SNR(t), γ) / SNR(t) (Hang et al. 2023).
 
-        Shared by the diffusion eps-MSE and the geometric (FK) losses so both are
-        down-weighted the same way at high-noise timesteps, where x0_pred (recovered
-        from eps via division by sqrt(ᾱ_t)) is least reliable.
+        Used by the diffusion eps-MSE. Only suppresses low-noise/low-t samples
+        (SNR(t) ≫ γ there); it stays ≈1 for t roughly ≳500, so it does NOT protect
+        against high-noise instability — see `x0_confidence_weight` for that.
         """
         snr_t = self.snr[t]  # (B,)
         return snr_t.clamp(max=gamma) / snr_t
+
+    def x0_confidence_weight(self, t):
+        """Per-sample weight reflecting how reliable x0_pred is at timestep t: ᾱ_t.
+
+        `predict_x0_from_eps` divides by sqrt(ᾱ_t), which →0 as t→T, so any eps
+        prediction error is amplified without bound at high noise — and FK-based
+        losses (smplh_geometric_losses) compose that error multiplicatively down
+        the kinematic chain, making it worse still. ᾱ_t ≈1 at low noise (x0_pred
+        reliable) and →0 at high noise (x0_pred meaningless), so weighting by it
+        fades out any loss computed on x0_pred exactly where that loss stops being
+        meaningful. NOT the same as `min_snr_weight` (see there for why).
+        """
+        return self.alphas_cumprod[t]  # (B,)
 
     def posterior_mean(self, x0, x_t, t):
         """DDPM posterior mean μ̃_t(x0, x_t) = E[x_{t-1} | x_t, x0].
