@@ -48,6 +48,22 @@ def build_parser():
                    help="T5 model name (e.g. t5-base, t5-large). Used when --text_encoder=t5.")
     p.add_argument("--t5_max_length", type=int,  default=128,
                    help="Fixed token sequence length for T5 output. Used when --text_encoder=t5.")
+    p.add_argument("--attn_sink", action=argparse.BooleanOptionalAction, default=True,
+                   help="Learnable per-head zero-value sink logit in every cross-attention "
+                        "(GPT-OSS-style sink attention; default on for new runs). Gives "
+                        "queries that don't need text a principled dump site instead of "
+                        "hijacking EOS (~90%% of mass on the pad-masked checkpoint), so "
+                        "stored attention maps become sink-free by construction. Adds "
+                        "parameters -> config-gated; old checkpoints load with it off. "
+                        "NOTE: forces the explicit (non-fused) attention path during "
+                        "training, which costs memory (~the materialised B*h*N*L maps).")
+    p.add_argument("--attn_entropy_weight", type=float, default=0.0,
+                   help="Weight of the cross-attention entropy regulariser: loss -= w * "
+                        "H(attn), where H is the mean normalised row entropy of the "
+                        "real-token attention distribution (in [0,1], sink/pad mass "
+                        "excluded by renormalisation). Encourages queries to spread over "
+                        "words instead of collapsing onto one key. 0 disables (default); "
+                        "try 0.01. Also forces the explicit attention path when > 0.")
     p.add_argument("--ctx_pad_mask", action=argparse.BooleanOptionalAction, default=True,
                    help="Mask padding keys in cross-attention (default on for new runs). "
                         "Without it, zero-embedding pad columns absorb ~93%% of attention "
@@ -136,12 +152,14 @@ def main():
             for k, v in saved.items():
                 if k not in preserved:
                     config[k] = v
-            # A pre-fix run's config has no ctx_pad_mask key; the CLI default (True)
-            # must not silently flip the attention regime mid-training.
-            if "ctx_pad_mask" not in saved and "ctx_pad_mask" not in cli_keys:
-                config["ctx_pad_mask"] = False
-                print("Resume: saved config predates ctx_pad_mask — keeping it OFF to "
-                      "match how this run trained (pass --ctx_pad_mask to override).")
+            # A pre-fix run's config lacks these keys; the CLI defaults (True) must
+            # not silently flip the attention regime mid-training. (attn_sink would
+            # additionally fail the checkpoint load — missing sink_logit params.)
+            for regime_key in ("ctx_pad_mask", "attn_sink"):
+                if regime_key not in saved and regime_key not in cli_keys:
+                    config[regime_key] = False
+                    print(f"Resume: saved config predates {regime_key} — keeping it OFF "
+                          f"to match how this run trained (pass --{regime_key} to override).")
             print(f"Resume: loaded config from {saved_path} "
                   f"(overridden by CLI args: {sorted(cli_keys - {'resume', 'output_dir'})})")
         else:
@@ -215,17 +233,14 @@ def main():
     if config["ctx_pad_mask"] and config["text_encoder"] == "clip":
         print("NOTE: --ctx_pad_mask is a no-op with the CLIP encoder (CLIP does not "
               "zero its padding embeddings, so no context column is all-zero).")
+    # Full config + derived values, so new model-defining keys (e.g. the
+    # attention-regime flags) never need to be hand-copied here — see the same
+    # pattern and rationale in utils/model_io.load_model.
     model = build_model({
-        "feature_mode": args.feature_mode,
+        **config,
         "input_dim":    train_loader.dataset.feature_dim,
-        "latent_dim":   args.latent_dim,
         "context_dim":  context_dim,
         "text_seq_len": text_seq_len,
-        "num_heads":    args.num_heads,
-        "num_layers":   args.num_layers,
-        "max_frames":   args.max_frames,
-        "dropout":      args.dropout,
-        "ctx_pad_mask": config["ctx_pad_mask"],
     }, device=device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.1f}M")
 
@@ -274,6 +289,7 @@ def main():
             hml3d_pos_weight=args.hml3d_pos_weight,
             hml3d_vel_weight=args.hml3d_vel_weight,
             hml3d_foot_weight=args.hml3d_foot_weight,
+            attn_entropy_weight=config["attn_entropy_weight"],
         )
         # Read the LR used for the epoch that just ran before advancing the
         # scheduler — get_last_lr() after step() would report next epoch's LR.

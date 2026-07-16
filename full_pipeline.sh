@@ -17,8 +17,13 @@ TEXT_ENCODER="t5"
 NUM_HEADS=8
 NUM_LAYERS=8
 LATENT_DIM=512
-EPOCHS=3000
+EPOCHS=500
+# NOTE: attn_sink forces the explicit (non-fused) attention path during training —
+# costs GPU memory vs SDPA (bs 20 OOMs on a 12 GB card where SDPA fit; bs 16 OK).
+# Re-check the batch size on the training machine before a long run.
 BATCH_SIZE=128
+ATTN_SINK="--attn_sink"          # "--no-attn_sink" to disable (see ARCHITECTURE.md)
+ATTN_ENTROPY_WEIGHT=0.0          # 0 disables; try 0.01 (experiment knob, keep runs attributable)
 EMA_DECAY=0.9999
 SAVE_EVERY=250
 VAL_EVERY=1
@@ -64,7 +69,9 @@ python src/train.py \
   --save_every    "${SAVE_EVERY}" \
   --val_every     "${VAL_EVERY}" \
   --feature_mode  "${FEATURE_MODE}" \
-  --text_encoder  "${TEXT_ENCODER}"
+  --text_encoder  "${TEXT_ENCODER}" \
+  ${ATTN_SINK} \
+  --attn_entropy_weight "${ATTN_ENTROPY_WEIGHT}"
 
 # ----------------------------------------------------------------------
 # 2. Generate

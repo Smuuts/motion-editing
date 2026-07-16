@@ -42,7 +42,7 @@ class FramePositionalEmbedding(nn.Module):
 
 class CrossAttention(nn.Module):
     def __init__(self, dim: int, context_dim: int, num_heads: int,
-                 dropout: float = 0.0):
+                 dropout: float = 0.0, use_sink: bool = False):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
@@ -55,15 +55,31 @@ class CrossAttention(nn.Module):
         self.out = nn.Linear(dim, dim)
         self.dropout = nn.Dropout(dropout)
 
-        # Shape when stored: (B, heads, N_motion, L_text).
+        # Learnable attention sink (GPT-OSS-style "sink attention" / softmax-off-by-one
+        # with a learnable per-head offset): one extra logit per head participates in the
+        # softmax denominator but carries a zero VALUE vector, so mass routed to it simply
+        # vanishes from the output. Gives queries that don't need text a principled dump
+        # site — instead of hijacking EOS (or, pre-ctx_pad_mask, the zero-value padding
+        # columns; see docs/FINDINGS.md "padding sink"). Init 0 = exactly one synthetic
+        # pad-like column, learnable from there. Config-gated (attn_sink) because it adds
+        # a parameter: old checkpoints don't have it and must load without it.
+        self.sink_logit = nn.Parameter(torch.zeros(num_heads)) if use_sink else None
+
+        # Shape when stored: (B, heads, N_motion, L_text) — real-token columns only.
+        # With the sink enabled rows sum to <= 1; the missing mass went to the sink.
         # N_motion = F for MotionDiT, F*G for GroupDiT (G=7 body-part groups).
         # For Stage 2 mask M1: accumulate these across ALL inversion timesteps and layers,
         # then average over heads, timesteps, and layers before thresholding.
         self.last_attn_map = None
 
+        # Mean normalised row entropy of the last forward's real-token attention,
+        # kept WITH graph when compute_entropy=True (training regulariser); see forward.
+        self.last_entropy = None
+
     def forward(self, x: torch.Tensor, context: torch.Tensor,
                 store_attn: bool = False,
-                context_mask: torch.Tensor | None = None) -> torch.Tensor:
+                context_mask: torch.Tensor | None = None,
+                compute_entropy: bool = False) -> torch.Tensor:
         # store_attn=True is passed during Stage 1 inversion and Stage 3 denoising
         # to collect A^{t,l} maps. Must be False during training to avoid memory growth.
         # context_mask: (B, L) bool, False = padding key. Without it, every padding
@@ -72,6 +88,9 @@ class CrossAttention(nn.Module):
         # attenuating the (zero-value) cross-attention output ~14× — see
         # docs/FINDINGS.md "padding sink". Old checkpoints trained unmasked; the
         # model only passes a mask when built with ctx_pad_mask=True.
+        # compute_entropy=True additionally stashes the mean normalised row entropy
+        # of the real-token attention in self.last_entropy (graph kept) for the
+        # training-time entropy regulariser.
         B, N, _ = x.shape
         _, L, _ = context.shape
 
@@ -79,15 +98,41 @@ class CrossAttention(nn.Module):
         k = self.k(context).reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v(context).reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
 
-        if store_attn:
-            # Materialize for attention map capture (inference only — not training).
-            logits = q @ k.transpose(-2, -1) * self.scale
+        # The fused SDPA kernel can't express the sink column or return probabilities,
+        # so any of these features forces the explicit-softmax path (costs the
+        # materialised (B, h, N, L) attention tensor — during training too, when the
+        # sink or the entropy regulariser is enabled).
+        explicit = store_attn or compute_entropy or self.sink_logit is not None
+
+        if explicit:
+            logits = q @ k.transpose(-2, -1) * self.scale        # (B, h, N, L)
             if context_mask is not None:
                 logits = logits.masked_fill(~context_mask[:, None, None, :],
                                             torch.finfo(logits.dtype).min)
             attn = torch.softmax(logits, dim=-1)
+            if self.sink_logit is not None:
+                # softmax([logits, sink])[..., :L] == softmax(logits) * Z/(Z + e^sink)
+                # == softmax(logits) * sigmoid(logsumexp(logits) − sink): same result
+                # as concatenating a sink column, without materialising the extra
+                # (B, h, N, L+1) tensors in the memory-critical explicit path.
+                lse = torch.logsumexp(logits, dim=-1, keepdim=True)
+                attn = attn * torch.sigmoid(lse - self.sink_logit.view(1, -1, 1, 1))
+                # rows now sum to <= 1; the missing mass went to the sink
+
+            if compute_entropy:
+                # Entropy of the REAL-token distribution, renormalised per row: measures
+                # how spread attention is over the words themselves, independent of how
+                # much total mass the sink/padding absorbed. Normalised by log(#valid
+                # keys) so it lives in [0, 1] and the loss weight is scale-free.
+                p = attn / attn.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+                h_row = -(p * (p.clamp_min(1e-12)).log()).sum(dim=-1)     # (B, h, N)
+                log_n = (context_mask.sum(dim=-1).clamp(min=2).float().log()[:, None, None]
+                         if context_mask is not None else math.log(L))
+                self.last_entropy = (h_row / log_n).mean()
+
             attn = self.dropout(attn)
-            self.last_attn_map = attn.detach()
+            if store_attn:
+                self.last_attn_map = attn.detach()
             out = (attn @ v).transpose(1, 2).reshape(B, N, -1)
         else:
             attn_mask = (context_mask[:, None, None, :]
@@ -149,12 +194,13 @@ class FeedForward(nn.Module):
 
 class DiTBlock(nn.Module):
     def __init__(self, dim: int, context_dim: int, num_heads: int,
-                 ff_mult: int = 4, dropout: float = 0.0):
+                 ff_mult: int = 4, dropout: float = 0.0, attn_sink: bool = False):
         super().__init__()
         self.norm1      = nn.LayerNorm(dim)
         self.self_attn  = SelfAttention(dim, num_heads, dropout)
         self.norm2      = nn.LayerNorm(dim)
-        self.cross_attn = CrossAttention(dim, context_dim, num_heads, dropout)
+        self.cross_attn = CrossAttention(dim, context_dim, num_heads, dropout,
+                                         use_sink=attn_sink)
         self.norm3      = nn.LayerNorm(dim)
         self.ff         = FeedForward(dim, ff_mult, dropout)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 9 * dim))
@@ -162,7 +208,8 @@ class DiTBlock(nn.Module):
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor,
                 context: torch.Tensor, store_attn: bool = False,
                 mask: torch.Tensor | None = None,
-                context_mask: torch.Tensor | None = None):
+                context_mask: torch.Tensor | None = None,
+                compute_entropy: bool = False):
         mods = self.adaLN_modulation(t_emb)
         s1, b1, g1, s2, b2, g2, s3, b3, g3 = mods.chunk(9, dim=-1)
         s1, b1, g1 = s1[:, None], b1[:, None], g1[:, None]
@@ -173,6 +220,7 @@ class DiTBlock(nn.Module):
         # map at the start of training (DiT §3.2).
         x = x + g1 * self.self_attn(self.norm1(x) * (1 + s1) + b1, mask=mask)
         x = x + g2 * self.cross_attn(self.norm2(x) * (1 + s2) + b2, context,
-                                     store_attn=store_attn, context_mask=context_mask)
+                                     store_attn=store_attn, context_mask=context_mask,
+                                     compute_entropy=compute_entropy)
         x = x + g3 * self.ff(self.norm3(x) * (1 + s3) + b3)
         return x

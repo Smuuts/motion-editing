@@ -45,13 +45,18 @@ class _MotionDiTBase(nn.Module):
         dropout:      float,
         text_seq_len: int,
         ctx_pad_mask: bool = False,
+        attn_sink:    bool = False,
     ):
         super().__init__()
         self.latent_dim = latent_dim
         self.pos_emb     = FramePositionalEmbedding(max_frames, latent_dim)
         self.time_emb    = TimestepEmbedding(latent_dim)
+        # attn_sink: learnable per-head zero-value sink logit in every cross-attention
+        # (see CrossAttention). Config-gated like ctx_pad_mask: it adds parameters, so a
+        # checkpoint must be rebuilt exactly as trained.
         self.blocks = nn.ModuleList([
-            DiTBlock(latent_dim, context_dim, num_heads, ff_mult, dropout)
+            DiTBlock(latent_dim, context_dim, num_heads, ff_mult, dropout,
+                     attn_sink=attn_sink)
             for _ in range(num_layers)
         ])
         self.final_norm = nn.LayerNorm(latent_dim)
@@ -113,6 +118,12 @@ class _MotionDiTBase(nn.Module):
         return [b.cross_attn.last_attn_map for b in self.blocks
                 if b.cross_attn.last_attn_map is not None]
 
+    def get_attn_entropy(self, block_idx: int) -> torch.Tensor:
+        """Entropy stashed by the last forward that passed entropy_layer=block_idx
+        (training regulariser; one block per step bounds the materialised-attention
+        memory). Kept with graph — consume it in the same step's loss."""
+        return self.blocks[block_idx].cross_attn.last_entropy
+
 
 class MotionDiT(_MotionDiTBase):
     """
@@ -137,9 +148,11 @@ class MotionDiT(_MotionDiTBase):
         dropout:      float = 0.1,
         text_seq_len: int   = 77,
         ctx_pad_mask: bool  = False,
+        attn_sink:    bool  = False,
     ):
         super().__init__(latent_dim, context_dim, num_heads, num_layers,
-                          max_frames, ff_mult, dropout, text_seq_len, ctx_pad_mask)
+                          max_frames, ff_mult, dropout, text_seq_len, ctx_pad_mask,
+                          attn_sink)
         self.input_dim = input_dim
 
         self.joint_proj  = nn.Linear(input_dim, latent_dim)
@@ -153,6 +166,7 @@ class MotionDiT(_MotionDiTBase):
         context:    torch.Tensor | None,  # (B, L, context_dim) or None → uses null_text_emb
         store_attn: bool = False,
         mask:       torch.Tensor | None = None,
+        entropy_layer: int | None = None,
     ) -> torch.Tensor:
         B, F, _ = motion.shape
         context, ctx_mask = self._context_and_mask(context, B)
@@ -160,9 +174,9 @@ class MotionDiT(_MotionDiTBase):
         x = self.joint_proj(motion) + self.pos_emb(F, motion.device)
         t_emb = self.time_emb(t)
 
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
             x = block(x, t_emb, context, store_attn=store_attn, mask=mask,
-                      context_mask=ctx_mask)
+                      context_mask=ctx_mask, compute_entropy=(i == entropy_layer))
 
         return self.output_proj(self.final_norm(x))
 
@@ -201,9 +215,11 @@ class GroupDiT(_MotionDiTBase):
         dropout:      float = 0.1,
         text_seq_len: int   = 77,
         ctx_pad_mask: bool  = False,
+        attn_sink:    bool  = False,
     ):
         super().__init__(latent_dim, context_dim, num_heads, num_layers,
-                          max_frames, ff_mult, dropout, text_seq_len, ctx_pad_mask)
+                          max_frames, ff_mult, dropout, text_seq_len, ctx_pad_mask,
+                          attn_sink)
         # Representation-specific channel partition: 'humanml3d' (263) or 'smplh' (135).
         # The body-part grouping (N_GROUPS, GROUP_NAMES) is shared across both.
         self.group_channels, group_dims, self.input_dim = _group_layout(feature_mode)
@@ -236,6 +252,7 @@ class GroupDiT(_MotionDiTBase):
         context:    torch.Tensor | None,  # (B, L, context_dim) or None
         store_attn: bool = False,
         mask:       torch.Tensor | None = None,  # (B, F) per-frame
+        entropy_layer: int | None = None,
     ) -> torch.Tensor:
         B, F, _ = motion.shape
         G = _N_GROUPS  # 7
@@ -268,9 +285,9 @@ class GroupDiT(_MotionDiTBase):
             mask = mask[:, :, None].expand(B, F, G).reshape(B, F * G)
 
         t_emb = self.time_emb(t)
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
             tokens = block(tokens, t_emb, context, store_attn=store_attn, mask=mask,
-                           context_mask=ctx_mask)
+                           context_mask=ctx_mask, compute_entropy=(i == entropy_layer))
 
         tokens = self.final_norm(tokens).reshape(B, F, G, self.latent_dim)
 
@@ -295,6 +312,7 @@ def build_model(config: dict, device="cpu") -> _MotionDiTBase:
         # Default False: checkpoints saved before 2026-07-15 trained without the
         # pad mask and must be rebuilt exactly as trained (see _MotionDiTBase).
         ctx_pad_mask = config.get("ctx_pad_mask", False),
+        attn_sink    = config.get("attn_sink", False),
     )
     feature_mode = config.get("feature_mode", "humanml3d")
     if _is_grouped_mode(feature_mode):

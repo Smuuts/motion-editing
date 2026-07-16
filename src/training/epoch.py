@@ -64,11 +64,13 @@ def train_one_epoch(
     loader, device, cfg_dropout, logger, epoch, log_every,
     snr_gamma=5.0,
     geo_fn=None, hml3d_pos_weight=0.0, hml3d_vel_weight=0.0, hml3d_foot_weight=0.0,
+    attn_entropy_weight=0.0,
 ):
     model.train()
     total_loss = 0.0
     total_geo  = {"pos": 0.0, "vel": 0.0, "foot": 0.0}
     geo_weights = {"pos": hml3d_pos_weight, "vel": hml3d_vel_weight, "foot": hml3d_foot_weight}
+    use_entropy = attn_entropy_weight > 0.0
 
     pbar = tqdm(loader, desc=f"Epoch {epoch}", leave=False)
     for step, batch in enumerate(pbar):
@@ -93,9 +95,24 @@ def train_one_epoch(
 
         attn_mask = length_to_mask(_batch_lengths(batch, device), motion.shape[1])
 
+        # Entropy regulariser on ONE random block per step: materialising attention
+        # in all 8 blocks at once OOMs a 12 GB GPU, and in expectation every layer
+        # still receives the same pressure.
+        ent_layer = (int(torch.randint(len(model.blocks), (1,)).item())
+                     if use_entropy else None)
         with autocast(device_type=device.type):
-            prediction = model(x_t, t, context, mask=attn_mask)
+            prediction = model(x_t, t, context, mask=attn_mask,
+                               entropy_layer=ent_layer)
             loss = _diffusion_loss(noise, prediction, attn_mask, schedule, t, snr_gamma)
+
+        entropy_log = {}
+        if ent_layer is not None:
+            # Normalised real-token attention entropy in [0, 1]; MAXIMISED
+            # (subtracted) to discourage queries collapsing onto a single key —
+            # see docs/LEDITSpp_Attention_Sink_Research.md §9.
+            h_attn = model.get_attn_entropy(ent_layer)
+            loss = loss - attn_entropy_weight * h_attn
+            entropy_log["train/attn_entropy"] = h_attn.item()
 
         geo_log = {}
         if geo_fn is not None:
@@ -127,7 +144,8 @@ def train_one_epoch(
         pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         if (step + 1) % log_every == 0:
-            logger.log({"train/loss": loss.item(), "train/step": epoch * len(loader) + step, **geo_log})
+            logger.log({"train/loss": loss.item(), "train/step": epoch * len(loader) + step,
+                        **geo_log, **entropy_log})
 
     n = len(loader)
     geo_epoch = {}

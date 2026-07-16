@@ -31,20 +31,17 @@ def load_model(ckpt_dir: str, device, use_ema: bool = True):
     """
     config = load_config(ckpt_dir)
     context_dim, text_seq_len = get_encoder_dims(config)
+    # Pass the FULL saved config through (build_model reads what it knows and
+    # ignores the rest) so every model-defining key — including attention-regime
+    # flags like ctx_pad_mask/attn_sink — travels with the checkpoint
+    # automatically. Rebuilding from a hand-copied subset is how a mask-trained
+    # checkpoint once ran unmasked (FID 0.65 -> 27.0; see docs/FINDINGS.md).
+    # Only derived/inference-specific values are overridden.
     model = build_model({
-        "feature_mode": config.get("feature_mode", "humanml3d"),
-        "input_dim":    config.get("input_dim", 263),
-        "latent_dim":   config.get("latent_dim", 512),
+        **config,
         "context_dim":  context_dim,
         "text_seq_len": text_seq_len,
-        "num_heads":    config.get("num_heads", 8),
-        "num_layers":   config.get("num_layers", 8),
-        "max_frames":   config.get("max_frames", 196),
         "dropout":      0.0,
-        # Attention regime must match training exactly: mask-trained checkpoints
-        # (ctx_pad_mask: true in their config) are out-of-distribution without it,
-        # and pre-fix checkpoints (no key) are out-of-distribution with it.
-        "ctx_pad_mask": config.get("ctx_pad_mask", False),
     }, device=device)
 
     weights = os.path.join(ckpt_dir, "ema.pt" if use_ema else "model.pt")
