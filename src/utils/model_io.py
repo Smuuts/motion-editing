@@ -41,6 +41,10 @@ def load_model(ckpt_dir: str, device, use_ema: bool = True):
         "num_layers":   config.get("num_layers", 8),
         "max_frames":   config.get("max_frames", 196),
         "dropout":      0.0,
+        # Attention regime must match training exactly: mask-trained checkpoints
+        # (ctx_pad_mask: true in their config) are out-of-distribution without it,
+        # and pre-fix checkpoints (no key) are out-of-distribution with it.
+        "ctx_pad_mask": config.get("ctx_pad_mask", False),
     }, device=device)
 
     weights = os.path.join(ckpt_dir, "ema.pt" if use_ema else "model.pt")
