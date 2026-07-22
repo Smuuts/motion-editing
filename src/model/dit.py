@@ -14,7 +14,9 @@ blocks (per-frame for MotionDiT, per-frame-per-body-part-group for GroupDiT).
 import torch
 import torch.nn as nn
 
-from model.layers import TimestepEmbedding, FramePositionalEmbedding, DiTBlock
+from model.layers import (
+    TimestepEmbedding, FramePositionalEmbedding, DiTBlock, resolve_context_and_mask,
+)
 
 # Body-part group definitions live in their own module because they are also
 # consumed by the LEDITS++ masking code (Stage 2 M1 + LLM-fallback mask) and by
@@ -77,21 +79,9 @@ class _MotionDiTBase(nn.Module):
         self.null_text_emb = nn.Parameter(torch.randn(1, text_seq_len, context_dim) * 0.02)
 
     def _context_and_mask(self, context, B):
-        """Resolve the (context, context_mask) pair for a forward pass.
-
-        context=None → the learned null embedding, never masked (all its columns
-        are real). With ctx_pad_mask, all-zero columns are treated as padding —
-        this also holds sample-wise for CFG-dropout batches where torch.where
-        mixed null_text_emb rows (nonzero everywhere) into an encoded batch.
-        """
-        if context is None:
-            return self.null_text_emb.expand(B, -1, -1), None
-        if not self.ctx_pad_mask:
-            return context, None
-        ctx_mask = context.abs().sum(dim=-1) > 0                 # (B, L)
-        if ctx_mask.all():
-            ctx_mask = None  # keep the fused SDPA fast path when nothing is padded
-        return context, ctx_mask
+        """Thin wrapper over the shared resolver (model.layers) so GroupDiT/MotionDiT
+        and GroupMotionUNet resolve context/pad-mask identically."""
+        return resolve_context_and_mask(context, B, self.null_text_emb, self.ctx_pad_mask)
 
     def _init_weights(self):
         for m in self.modules():
@@ -299,7 +289,7 @@ class GroupDiT(_MotionDiTBase):
         return torch.cat(group_outs, dim=-1).index_select(-1, self._inv_perm_idx)
 
 
-def build_model(config: dict, device="cpu") -> _MotionDiTBase:
+def build_model(config: dict, device="cpu") -> nn.Module:
     kwargs = dict(
         latent_dim   = config.get("latent_dim",   512),
         context_dim  = config.get("context_dim",  512),
@@ -315,7 +305,26 @@ def build_model(config: dict, device="cpu") -> _MotionDiTBase:
         attn_sink    = config.get("attn_sink", False),
     )
     feature_mode = config.get("feature_mode", "humanml3d")
-    if _is_grouped_mode(feature_mode):
+    arch = config.get("arch", "dit")
+    if arch == "unet":
+        # MotionCLR-style temporal U-Net over the same body-part group tokens.
+        # Epsilon-prediction and the full config kwarg set are shared with GroupDiT;
+        # depth comes from unet_levels/unet_blocks_per_level (num_layers is ignored).
+        # Import here to avoid a circular import (unet.py imports from model.layers,
+        # not model.dit, but keeping the import local mirrors the optional-backbone
+        # intent and avoids importing torch-heavy conv code when arch="dit").
+        from model.unet import GroupMotionUNet
+        if not _is_grouped_mode(feature_mode):
+            raise ValueError(
+                f"arch='unet' (GroupMotionUNet) requires a grouped feature_mode "
+                f"(humanml3d/smplh); got {feature_mode!r}.")
+        model = GroupMotionUNet(
+            feature_mode=feature_mode,
+            unet_levels=config.get("unet_levels", 3),
+            unet_blocks_per_level=config.get("unet_blocks_per_level", 2),
+            **kwargs,
+        )
+    elif _is_grouped_mode(feature_mode):
         model = GroupDiT(feature_mode=feature_mode, **kwargs)
     else:
         # Legacy flat MotionDiT (deprecated) — kept only for loading old flat checkpoints.

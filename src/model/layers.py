@@ -40,6 +40,27 @@ class FramePositionalEmbedding(nn.Module):
         return self.emb(torch.arange(num_frames, device=device))
 
 
+def resolve_context_and_mask(context, B, null_text_emb, ctx_pad_mask):
+    """Resolve the (context, context_mask) pair for a forward pass — shared by every
+    backbone (GroupDiT/MotionDiT via _MotionDiTBase, and GroupMotionUNet) so the
+    padding-sink convention lives in exactly one place and can't drift between them.
+
+    context=None → the learned null embedding, never masked (all its columns are real).
+    With ctx_pad_mask, all-zero columns are treated as padding — this also holds
+    sample-wise for CFG-dropout batches where torch.where mixed null_text_emb rows
+    (nonzero everywhere → unmasked, as intended). Returns ctx_mask=None (keeping the
+    fused SDPA fast path) whenever nothing is padded. The pad mask is inference-critical
+    (getting it wrong is FID 0.65 → 27.0; see docs/FINDINGS.md 'padding sink')."""
+    if context is None:
+        return null_text_emb.expand(B, -1, -1), None
+    if not ctx_pad_mask:
+        return context, None
+    ctx_mask = context.abs().sum(dim=-1) > 0                 # (B, L)
+    if ctx_mask.all():
+        ctx_mask = None
+    return context, ctx_mask
+
+
 class CrossAttention(nn.Module):
     def __init__(self, dim: int, context_dim: int, num_heads: int,
                  dropout: float = 0.0, use_sink: bool = False):

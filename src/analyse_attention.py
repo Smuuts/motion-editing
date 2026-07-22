@@ -19,6 +19,17 @@ An alignment score is computed: for prompts with a clear expected body-part
 (e.g., "right arm" → right_arm group), it checks whether the expected group
 achieves the highest attention among non-root groups.
 
+In addition to the conditional readout, a null-subtracted ("differential")
+readout is scored side by side: clip(A_cond − A_null, 0, 1), where A_null is the
+attention under the learned null_text_emb (context=None). Subtracting the
+prompt-independent baseline cancels the common-mode sink and clamping to [0, 1]
+keeps only the positive word-driven excess (so the differential stays a valid
+attention magnitude); the test is whether that isolates body-part grounding the
+conditional grand mean washes out. The null baseline is
+prompt-independent, so it is computed once and reused for every prompt. Both the
+grand-mean and per-(layer, head) alignment are reported for the differential
+readout alongside the conditional one.
+
 Usage:
     python src/analyse_attention.py \\
         --checkpoint runs/exp1/checkpoint_latest \\
@@ -171,13 +182,20 @@ def _plot_group_analysis(
     """One figure per prompt comparing the single-step and averaged attention.
 
     All panels use every content token (BOS/EOS/padding already excluded), not the
-    stop-word-filtered semantic subset.
+    stop-word-filtered semantic subset. The heatmap panels (a)/(b) are min-max
+    normalised per body-part group over all frames (independently per panel);
+    panels (c)/(d) and the alignment scoring use raw attention.
     """
     G = attn_single.shape[1]
 
     def _derive(attn):
-        spatio    = attn[:, :, content_idxs].mean(axis=2)        # (F, G)
-        return spatio[::subsample], spatio.mean(axis=0)          # (F//sub, G), (G,)
+        spatio = attn[:, :, content_idxs].mean(axis=2)           # (F, G)
+        # Per-group min-max over all F frames → each group's temporal profile
+        # spans [0, 1]. Heatmap-only: group profile / token×group / alignment
+        # scoring stay on raw attention so cross-group magnitudes remain valid.
+        lo, hi = spatio.min(axis=0), spatio.max(axis=0)          # (G,), (G,)
+        norm = (spatio - lo) / np.where(hi > lo, hi - lo, 1.0)
+        return norm[::subsample], spatio.mean(axis=0)            # (F//sub, G), (G,)
 
     spatio_s, gprof_s = _derive(attn_single)
     spatio_a, gprof_a = _derive(attn_avg)
@@ -185,25 +203,26 @@ def _plot_group_analysis(
     tok_group = attn_avg[:, :, content_idxs].mean(axis=0).T      # (num_tok, G)
 
     frame_ticks = list(range(0, spatio_s.shape[0], max(1, spatio_s.shape[0] // 10)))
-    hmax = max(spatio_s.max(), spatio_a.max()) or 1.0            # shared scale → fair comparison
 
     fig = plt.figure(figsize=(18, 12))
     gs  = gridspec.GridSpec(3, 2, height_ratios=[1.3, 1.3, 1.1], hspace=0.5, wspace=0.32)
 
     def _heatmap(ax, data, title):
-        im = ax.imshow(data.T, aspect="auto", cmap="hot", origin="upper", vmin=0, vmax=hmax)
+        im = ax.imshow(data.T, aspect="auto", cmap="hot", origin="upper", vmin=0, vmax=1.0)
         ax.set_yticks(range(G)); ax.set_yticklabels(GROUP_NAMES, fontsize=8)
         ax.set_xticks(frame_ticks)
         ax.set_xticklabels([str(i * subsample) for i in frame_ticks], fontsize=7)
         ax.set_xlabel("Frame", fontsize=8); ax.set_ylabel("Group", fontsize=8)
         ax.set_title(title, fontsize=9)
-        plt.colorbar(im, ax=ax, fraction=0.015, pad=0.01)
+        plt.colorbar(im, ax=ax, fraction=0.015, pad=0.01,
+                     label="attention (per-group min-max)")
 
-    # (a) single-step heatmap, (b) averaged heatmap — shared colour scale
+    # (a) single-step heatmap, (b) averaged heatmap — each min-max normalised
+    # per group over all frames, independently per panel
     _heatmap(fig.add_subplot(gs[0, :]),
-             spatio_s, f'(a) Spatiotemporal attention — {single_lbl}  —  "{prompt}"')
+             spatio_s, f'(a) Spatiotemporal attention (per-group norm.) — {single_lbl}  —  "{prompt}"')
     _heatmap(fig.add_subplot(gs[1, :]),
-             spatio_a, f'(b) Spatiotemporal attention — {avg_lbl}  —  "{prompt}"')
+             spatio_a, f'(b) Spatiotemporal attention (per-group norm.) — {avg_lbl}  —  "{prompt}"')
 
     # (c) group profile: single vs averaged overlaid
     ax = fig.add_subplot(gs[2, 0])
@@ -248,6 +267,84 @@ def _peak_group_per_lh(attn_lhfgl: np.ndarray, idxs: list[int]) -> np.ndarray:
     """
     gp = attn_lhfgl[:, :, :, 1:, :][..., idxs].mean(axis=(2, 4))  # (L, H, G-1)
     return gp.argmax(axis=-1) + 1                                  # (L, H)
+
+
+def _peak_group(attn_fgl: np.ndarray, idxs: list[int]) -> str:
+    """Peak body-part group (root excluded) from a grand-mean (F, G, L_text) map,
+    averaging over frames and the given text-token columns. The differential map is
+    clamped to [0, 1] before this is called, so argmax picks the group with the
+    largest positive word-driven excess attention."""
+    gp = attn_fgl[:, 1:, idxs].mean(axis=(0, 2))   # (G-1,)
+    return GROUP_NAMES[int(gp.argmax()) + 1]
+
+
+def _plot_diff_analysis(
+    attn_cond: np.ndarray,          # (F, G, L_text) conditional, grand mean
+    attn_null: np.ndarray,          # (F, G, L_text) null baseline, grand mean
+    content_idxs: list[int],
+    prompt: str,
+    expected_group: str | None,
+    save_path: str,
+    subsample: int,
+):
+    """Null-subtracted ("differential") cross-attention:  A_cond − A_null.
+
+    Isolates the attention that real words at the content positions produce *over
+    and above* the learned null_text_emb baseline at the same positions — a
+    common-mode / sink subtraction in the spirit of Differential Transformer
+    (arXiv 2410.05258) and DiffEdit's reference-text contrast (arXiv 2210.11427).
+    If body-part grounding is present but buried under a prompt-independent sink,
+    it should surface here; if the conditional signal is near-invariant to the
+    instruction (as the M2/ε probe found, r=0.96), the residual is noise and this
+    will not ground either.
+
+    Panels: (a) differential spatiotemporal heatmap (clamped to [0, 1]);
+            (b) group profiles — conditional vs null vs differential.
+    """
+    G = attn_cond.shape[1]
+    diff     = np.clip(attn_cond - attn_null, 0.0, 1.0)         # keep positive excess only
+    spatio_d = diff[:, :, content_idxs].mean(axis=2)            # (F, G) in [0, 1]
+    cond_g   = attn_cond[:, :, content_idxs].mean(axis=(0, 2))  # (G,)
+    null_g   = attn_null[:, :, content_idxs].mean(axis=(0, 2))  # (G,)
+    diff_g   = spatio_d.mean(axis=0)                            # (G,)
+
+    vmax = float(spatio_d.max()) or 1.0
+    sub  = spatio_d[::subsample]
+    frame_ticks = list(range(0, sub.shape[0], max(1, sub.shape[0] // 10)))
+
+    fig = plt.figure(figsize=(16, 8))
+    gs  = gridspec.GridSpec(2, 1, height_ratios=[1.3, 1.0], hspace=0.5)
+
+    ax = fig.add_subplot(gs[0])
+    im = ax.imshow(sub.T, aspect="auto", cmap="hot", origin="upper",
+                   vmin=0.0, vmax=vmax)
+    ax.set_yticks(range(G)); ax.set_yticklabels(GROUP_NAMES, fontsize=8)
+    ax.set_xticks(frame_ticks)
+    ax.set_xticklabels([str(i * subsample) for i in frame_ticks], fontsize=7)
+    ax.set_xlabel("Frame", fontsize=8); ax.set_ylabel("Group", fontsize=8)
+    ax.set_title(f'(a) Differential attention  clip(A_cond − A_null, 0, 1)  —  "{prompt}"', fontsize=9)
+    plt.colorbar(im, ax=ax, fraction=0.015, pad=0.01, label="Δ attention (clamped ≥ 0)")
+
+    ax = fig.add_subplot(gs[1])
+    x = np.arange(G); w = 0.27
+    ax.barh(x - w, cond_g, w, color="steelblue", alpha=0.85, label="conditional")
+    ax.barh(x,     null_g, w, color="gray",       alpha=0.70, label="null baseline")
+    ax.barh(x + w, diff_g, w, color="tab:green",  alpha=0.85, label="differential")
+    for xi, name in enumerate(GROUP_NAMES):
+        if name == expected_group:
+            ax.axhline(xi, color="tab:red", linewidth=1.2, linestyle="--", alpha=0.7)
+    ax.axvline(0, color="k", linewidth=0.6)
+    ax.set_yticks(range(G)); ax.set_yticklabels(GROUP_NAMES, fontsize=8)
+    ax.set_xlabel("Mean attention", fontsize=8)
+    title = "(b) Group profile: conditional vs null vs differential"
+    if expected_group:
+        title += f"\n[expected: {expected_group} — dashed red]"
+    ax.set_title(title, fontsize=9)
+    ax.legend(fontsize=8)
+    ax.grid(True, axis="x", linestyle="--", alpha=0.4)
+
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 
 def _plot_layerhead_alignment(
@@ -411,13 +508,30 @@ def main():
     print(f"Averaged plot: {len(avg_timesteps)} steps t ∈ [{avg_timesteps[0]}, {avg_timesteps[-1]}]")
     print(f"Prompts:       {len(_TEST_PROMPTS)}\n")
 
+    # ── Null-text baseline for the differential readout ─────────────────────────
+    # null_text_emb (context=None) is prompt-independent, so with the same motions
+    # and timesteps the null attention is identical for every prompt — compute it
+    # once and reuse. Subtracting it isolates what real words add over the learned
+    # placeholder at the same content positions (common-mode / sink cancellation).
+    attn_null_np: np.ndarray | None = None
+    attn_lh_null: np.ndarray | None = None
+    if is_group:
+        print("Computing null-text baseline (context=None) for differential readout ...\n")
+        attn_lh_null = extract_per_layer_head(
+            model, x_t, t_batch, None, attn_mask, F=F, G=G
+        )                                              # (L, H, F, G, L_text)
+        attn_null_np = attn_lh_null.mean(axis=(0, 1))  # (F, G, L_text)
+
     alignment_results = []
     n_correct = 0
+    n_correct_diff = 0
     n_evaluable = 0
 
-    # Per-(layer, head) accumulator: counts how often each head's semantic-token
-    # peak group matches the expected group, across the evaluable prompts.
-    lh_correct: np.ndarray | None = None   # (L, H) initialised lazily once shapes known
+    # Per-(layer, head) accumulators: how often each head's semantic-token peak group
+    # matches the expected group, across the evaluable prompts — for the conditional
+    # and the null-subtracted (differential) readout respectively.
+    lh_correct: np.ndarray | None = None        # (L, H) initialised lazily
+    lh_correct_diff: np.ndarray | None = None   # (L, H) initialised lazily
 
     for i, (prompt, expected_group) in enumerate(_TEST_PROMPTS):
         print(f"[{i+1}/{len(_TEST_PROMPTS)}] \"{prompt}\"")
@@ -453,40 +567,62 @@ def main():
         single_lbl = f"single step t={args.noise_level}"
         avg_lbl    = f"avg over {len(avg_timesteps)} steps"
 
+        peak_diff_sem = aligned_diff_sem = None
         if is_group:
             # One figure per prompt: single-step and averaged views combined.
             _plot_group_analysis(attn_np, attn_np_avg, content_idxs, content_labels,
                                  prompt, expected_group, save_path, args.subsample,
                                  single_lbl, avg_lbl)
 
-            def _peak(idxs):
-                gp = attn_np[:, 1:, idxs].mean(axis=(0, 2))  # (G-1,)
-                return GROUP_NAMES[int(gp.argmax()) + 1]
+            peak_all = _peak_group(attn_np, content_idxs)
+            peak_sem = _peak_group(attn_np, sem_idxs)
 
-            peak_all = _peak(content_idxs)
-            peak_sem = _peak(sem_idxs)
+            # Null-subtracted (differential) readout on the same single-step view.
+            # Requires matching text-column counts between the conditional context
+            # and null_text_emb (they should — see dit.GroupDiT.null_text_emb).
+            if attn_null_np.shape[-1] != attn_np.shape[-1]:
+                raise RuntimeError(
+                    f"null baseline L_text={attn_null_np.shape[-1]} != conditional "
+                    f"L_text={attn_np.shape[-1]}; cannot form the differential map. "
+                    "null_text_emb length must match the text encoder output length."
+                )
+            attn_np_diff = np.clip(attn_np - attn_null_np, 0.0, 1.0)  # (F, G, L_text) in [0, 1]
+            peak_diff_all = _peak_group(attn_np_diff, content_idxs)
+            peak_diff_sem = _peak_group(attn_np_diff, sem_idxs)
+
+            diff_path = os.path.join(args.output_dir, f"{i:02d}_{slug}_diff.png")
+            _plot_diff_analysis(attn_np, attn_null_np, content_idxs, prompt,
+                                expected_group, diff_path, args.subsample)
 
             if expected_group is not None:
-                aligned_all = (peak_all == expected_group)
-                aligned_sem = (peak_sem == expected_group)
+                aligned_all      = (peak_all == expected_group)
+                aligned_sem      = (peak_sem == expected_group)
+                aligned_diff_sem = (peak_diff_sem == expected_group)
                 n_evaluable += 1
-                n_correct   += int(aligned_sem)   # score on semantic tokens
-                m_all = "✓" if aligned_all else "✗"
-                m_sem = "✓" if aligned_sem else "✗"
+                n_correct      += int(aligned_sem)        # conditional, semantic tokens
+                n_correct_diff += int(aligned_diff_sem)   # differential, semantic tokens
+                m_all  = "✓" if aligned_all      else "✗"
+                m_sem  = "✓" if aligned_sem      else "✗"
+                m_diff = "✓" if aligned_diff_sem else "✗"
 
                 # Per-(layer, head): does each head's semantic-token peak match?
                 expected_idx = GROUP_NAMES.index(expected_group)
-                peak_lh = _peak_group_per_lh(attn_lh, sem_idxs)   # (L, H)
+                peak_lh      = _peak_group_per_lh(attn_lh, sem_idxs)                 # (L, H)
+                peak_lh_diff = _peak_group_per_lh(
+                    np.clip(attn_lh - attn_lh_null, 0.0, 1.0), sem_idxs)            # (L, H)
                 if lh_correct is None:
-                    lh_correct = np.zeros(peak_lh.shape, dtype=np.int64)
-                lh_correct += (peak_lh == expected_idx).astype(np.int64)
+                    lh_correct      = np.zeros(peak_lh.shape, dtype=np.int64)
+                    lh_correct_diff = np.zeros(peak_lh.shape, dtype=np.int64)
+                lh_correct      += (peak_lh      == expected_idx).astype(np.int64)
+                lh_correct_diff += (peak_lh_diff == expected_idx).astype(np.int64)
             else:
                 aligned_all = aligned_sem = None
-                m_all = m_sem = "—"
+                m_all = m_sem = m_diff = "—"
 
             aligned = aligned_sem
             print(f"  Peak (all tokens):  {peak_all:<12}  {m_all}")
             print(f"  Peak (semantic):    {peak_sem:<12}  expected: {expected_group or 'N/A':<12}  {m_sem}")
+            print(f"  Peak (differential):{peak_diff_sem:<12}  null-subtracted           {m_diff}")
 
         else:
             _plot_frame_analysis(attn_np, attn_np_avg, content_idxs, content_labels,
@@ -499,10 +635,12 @@ def main():
         alignment_results.append({
             "prompt":            prompt,
             "expected_group":    expected_group,
-            "peak_group_all":    peak_all    if is_group else None,
-            "peak_group_sem":    peak_sem    if is_group else None,
-            "aligned_all_toks":  aligned_all if is_group else None,
-            "aligned_sem_toks":  aligned_sem if is_group else None,
+            "peak_group_all":    peak_all      if is_group else None,
+            "peak_group_sem":    peak_sem      if is_group else None,
+            "aligned_all_toks":  aligned_all   if is_group else None,
+            "aligned_sem_toks":  aligned_sem   if is_group else None,
+            "peak_group_diff":   peak_diff_sem if is_group else None,
+            "aligned_diff_toks": aligned_diff_sem if is_group else None,
         })
 
     # ── Summary ───────────────────────────────────────────────────────────────
@@ -511,7 +649,8 @@ def main():
         1 for r in alignment_results
         if r.get("aligned_all_toks") is True
     )
-    score_all = n_correct_all / n_evaluable if n_evaluable > 0 else 0.0
+    score_all  = n_correct_all  / n_evaluable if n_evaluable > 0 else 0.0
+    score_diff = n_correct_diff / n_evaluable if n_evaluable > 0 else 0.0
 
     # ── Per-(layer, head) breakdown ─────────────────────────────────────────────
     # The grand mean averages over all layers and heads; if grounding exists in only
@@ -534,18 +673,38 @@ def main():
             "plot":                 lh_path,
         }
 
+    # Same per-(layer, head) breakdown for the null-subtracted (differential) readout.
+    best_layerhead_diff = None
+    if is_group and lh_correct_diff is not None and n_evaluable > 0:
+        acc_lh_d = lh_correct_diff / n_evaluable   # (L, H)
+        bl, bh   = np.unravel_index(int(acc_lh_d.argmax()), acc_lh_d.shape)
+        lh_path_d = os.path.join(args.output_dir, "per_layer_head_alignment_diff.png")
+        _plot_layerhead_alignment(acc_lh_d, score_diff, lh_path_d)
+        best_layerhead_diff = {
+            "best_layer":           int(bl),
+            "best_head":            int(bh),
+            "best_layerhead_score": float(acc_lh_d[bl, bh]),
+            "best_layer_mean":      float(acc_lh_d.mean(axis=1).max()),
+            "best_head_mean":       float(acc_lh_d.mean(axis=0).max()),
+            "accuracy_matrix":      acc_lh_d.round(4).tolist(),
+            "plot":                 lh_path_d,
+        }
+
     summary = {
         "model_type":              type(model).__name__,
         "feature_mode":            feature_mode,
         "noise_level_t":           args.noise_level,
         "num_motions":             args.num_motions,
-        "alignment_score_all_tok": score_all,
-        "alignment_score_sem_tok": score_sem,
-        "n_evaluable":             n_evaluable,
-        "n_correct_all_tok":       n_correct_all,
-        "n_correct_sem_tok":       n_correct,
-        "per_layer_head":          best_layerhead,
-        "results":                 alignment_results,
+        "alignment_score_all_tok":  score_all,
+        "alignment_score_sem_tok":  score_sem,
+        "alignment_score_diff_tok": score_diff,
+        "n_evaluable":              n_evaluable,
+        "n_correct_all_tok":        n_correct_all,
+        "n_correct_sem_tok":        n_correct,
+        "n_correct_diff_tok":       n_correct_diff,
+        "per_layer_head":           best_layerhead,
+        "per_layer_head_diff":      best_layerhead_diff,
+        "results":                  alignment_results,
     }
     summary_path = os.path.join(args.output_dir, "alignment_summary.json")
     with open(summary_path, "w") as f:
@@ -570,11 +729,17 @@ def main():
     if is_group and n_evaluable > 0:
         print(f"  Alignment (all tokens):   {score_all:.0%}  ({n_correct_all}/{n_evaluable})")
         print(f"  Alignment (semantic tok): {score_sem:.0%}  ({n_correct}/{n_evaluable})  ← decision basis")
+        print(f"  Alignment (differential): {score_diff:.0%}  ({n_correct_diff}/{n_evaluable})  "
+              f"← null-subtracted (A_cond − A_null)")
         if best_layerhead is not None:
             bl, bh = best_layerhead["best_layer"], best_layerhead["best_head"]
             print(f"  Best single (layer,head): L{bl}·h{bh} = "
                   f"{best_layerhead['best_layerhead_score']:.0%}  "
                   f"(vs {score_sem:.0%} grand-mean — gap = grounding hidden by averaging)")
+        if best_layerhead_diff is not None:
+            bl, bh = best_layerhead_diff["best_layer"], best_layerhead_diff["best_head"]
+            print(f"  Best (layer,head) diff:   L{bl}·h{bh} = "
+                  f"{best_layerhead_diff['best_layerhead_score']:.0%}  (differential readout)")
         print(f"  Stop words removed:       {sorted(_STOP_WORDS)}")
     print(f"  Decision:                 {verdict}")
     print(f"  Output:                   {args.output_dir}/")

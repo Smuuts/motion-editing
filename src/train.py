@@ -36,6 +36,18 @@ def build_parser():
                    help="Path to a JSON config file. CLI args override it.")
 
     # model
+    p.add_argument("--arch",         type=str,   default="dit",
+                   choices=["dit", "unet"],
+                   help="Backbone architecture: 'dit' (GroupDiT, default) or 'unet' "
+                        "(GroupMotionUNet — MotionCLR-style temporal U-Net over the same "
+                        "7 body-part group tokens; epsilon-prediction, fully compatible "
+                        "with every other training flag). Depth for 'unet' comes from "
+                        "--unet_levels/--unet_blocks_per_level; --num_layers is ignored.")
+    p.add_argument("--unet_levels",  type=int,   default=3,
+                   help="arch=unet only: number of U-Net down/up resolution levels "
+                        "(frames are padded to a multiple of 2^levels).")
+    p.add_argument("--unet_blocks_per_level", type=int, default=2,
+                   help="arch=unet only: CLR blocks per resolution level (MotionCLR uses 2).")
     p.add_argument("--latent_dim",   type=int,   default=512)
     p.add_argument("--num_layers",   type=int,   default=8)
     p.add_argument("--num_heads",    type=int,   default=8)
@@ -165,7 +177,7 @@ def main():
         else:
             print(f"Resume: no saved config at {saved_path}, using CLI args only.")
 
-    print("Training MotionDiT with config:")
+    print(f"Training {'GroupMotionUNet' if config.get('arch') == 'unet' else 'MotionDiT'} with config:")
     for k, v in config.items():
         print(f"  {k}: {v}")
 
