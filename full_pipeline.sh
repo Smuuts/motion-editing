@@ -14,9 +14,12 @@ HML3D_ROOT="data/HumanML3D/HumanML3D"  # processed HumanML3D (texts/, new_joints
 SMPLH_ROOT="data/HumanML3D/HumanML3D_smplh"  # flat 135-d smplh feats + their Mean/Std
 EVALUATOR_DIR="data/t2m_evaluator"
 TEXT_ENCODER="t5"
+ARCH="dit"                       # dit (GroupDiT) or unet (GroupMotionUNet, MotionCLR-style)
 NUM_HEADS=8
-NUM_LAYERS=8
+NUM_LAYERS=8                     # DiT depth; ignored when ARCH=unet (see below)
 LATENT_DIM=512
+UNET_LEVELS=3
+UNET_BLOCKS_PER_LEVEL=2
 EPOCHS=500
 # NOTE: attn_sink forces the explicit (non-fused) attention path during training —
 # costs GPU memory vs SDPA (bs 20 OOMs on a 12 GB card where SDPA fit; bs 16 OK).
@@ -52,10 +55,18 @@ EVAL_DIR="eval_results"
 # ----------------------------------------------------------------------
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 
+# ARCH=unet adds the U-Net depth flags; ARCH=dit passes none of them. Either way `arch`
+# (and the unet keys) are saved into the checkpoint's config.json, so generate/evaluate
+# rebuild the right backbone automatically — no arch flag is needed downstream.
+ARCH_ARGS=(--arch "${ARCH}")
+if [[ "${ARCH}" == "unet" ]]; then
+  ARCH_ARGS+=(--unet_levels "${UNET_LEVELS}" --unet_blocks_per_level "${UNET_BLOCKS_PER_LEVEL}")
+fi
+
 # ----------------------------------------------------------------------
 # 1. Train
 # ----------------------------------------------------------------------
-log "Training (lr=${LEARNING_RATE}, out=${OUTPUT_DIR})"
+log "Training (arch=${ARCH}, lr=${LEARNING_RATE}, out=${OUTPUT_DIR})"
 python src/train.py \
   --data_root     "${FEAT_ROOT}" \
   --output_dir    "${OUTPUT_DIR}" \
@@ -70,6 +81,7 @@ python src/train.py \
   --val_every     "${VAL_EVERY}" \
   --feature_mode  "${FEATURE_MODE}" \
   --text_encoder  "${TEXT_ENCODER}" \
+  "${ARCH_ARGS[@]}" \
   ${ATTN_SINK} \
   --attn_entropy_weight "${ATTN_ENTROPY_WEIGHT}"
 
