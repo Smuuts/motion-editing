@@ -15,6 +15,7 @@ SMPLH_ROOT="data/HumanML3D/HumanML3D_smplh"  # flat 135-d smplh feats + their Me
 EVALUATOR_DIR="data/t2m_evaluator"
 TEXT_ENCODER="t5"
 ARCH="dit"                       # dit (GroupDiT) or unet (GroupMotionUNet, MotionCLR-style)
+GROUP_MODE="parts"               # token axis: parts (7 body-part groups) or joints (22 per-joint tokens)
 NUM_HEADS=8
 NUM_LAYERS=8                     # DiT depth; ignored when ARCH=unet (see below)
 LATENT_DIM=512
@@ -80,6 +81,7 @@ python src/train.py \
   --save_every    "${SAVE_EVERY}" \
   --val_every     "${VAL_EVERY}" \
   --feature_mode  "${FEATURE_MODE}" \
+  --group_mode    "${GROUP_MODE}" \
   --text_encoder  "${TEXT_ENCODER}" \
   "${ARCH_ARGS[@]}" \
   ${ATTN_SINK} \

@@ -43,6 +43,13 @@ def build_parser():
                         "7 body-part group tokens; epsilon-prediction, fully compatible "
                         "with every other training flag). Depth for 'unet' comes from "
                         "--unet_levels/--unet_blocks_per_level; --num_layers is ignored.")
+    p.add_argument("--group_mode",   type=str,   default="parts",
+                   choices=["parts", "joints"],
+                   help="Token axis for grouped backbones (dit/unet): 'parts' (default, "
+                        "7 body-part group tokens per frame) or 'joints' (22 per-joint "
+                        "tokens per frame — finer query resolution). Saved into the "
+                        "checkpoint config so generate/evaluate/edit rebuild the right "
+                        "tokeniser automatically. No effect on the legacy flat MotionDiT.")
     p.add_argument("--unet_levels",  type=int,   default=3,
                    help="arch=unet only: number of U-Net down/up resolution levels "
                         "(frames are padded to a multiple of 2^levels).")

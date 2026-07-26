@@ -23,7 +23,6 @@ from model.layers import (
 # analyse_attention.py. GROUP_NAMES is re-exported here for backward compatibility
 # with `from model.dit import GROUP_NAMES`.
 from model.body_groups import (
-    N_GROUPS as _N_GROUPS,
     GROUP_NAMES,
     group_layout as _group_layout,
     is_grouped_mode as _is_grouped_mode,
@@ -206,18 +205,23 @@ class GroupDiT(_MotionDiTBase):
         text_seq_len: int   = 77,
         ctx_pad_mask: bool  = False,
         attn_sink:    bool  = False,
+        group_mode:   str   = "parts",
     ):
         super().__init__(latent_dim, context_dim, num_heads, num_layers,
                           max_frames, ff_mult, dropout, text_seq_len, ctx_pad_mask,
                           attn_sink)
         # Representation-specific channel partition: 'humanml3d' (263) or 'smplh' (135).
-        # The body-part grouping (N_GROUPS, GROUP_NAMES) is shared across both.
-        self.group_channels, group_dims, self.input_dim = _group_layout(feature_mode)
+        # group_mode picks the token axis: 'parts' (7 body-part groups, default) or
+        # 'joints' (22 per-joint tokens). G is derived from the partition — never
+        # assume 7 here, so per-joint checkpoints tokenise correctly.
+        self.group_mode = group_mode
+        self.group_channels, group_dims, self.input_dim = _group_layout(feature_mode, group_mode)
         self._group_dims = group_dims
+        self.G = G = len(self.group_channels)   # cached; forward reads self.G
 
         self.in_projs  = nn.ModuleList([nn.Linear(d, latent_dim) for d in group_dims])
         self.out_projs = nn.ModuleList([nn.Linear(latent_dim, d) for d in group_dims])
-        self.group_emb = nn.Embedding(_N_GROUPS, latent_dim)
+        self.group_emb = nn.Embedding(G, latent_dim)
 
         # Precomputed index tensors (not learned params, hence persistent=False so
         # they never appear in — or are expected from — a checkpoint's state_dict):
@@ -229,7 +233,7 @@ class GroupDiT(_MotionDiTBase):
         perm = torch.cat([torch.as_tensor(ch, dtype=torch.long) for ch in self.group_channels])
         inv_perm = torch.empty_like(perm)
         inv_perm[perm] = torch.arange(perm.numel())
-        self.register_buffer("_group_idx", torch.arange(_N_GROUPS), persistent=False)
+        self.register_buffer("_group_idx", torch.arange(G), persistent=False)
         self.register_buffer("_perm_idx", perm, persistent=False)
         self.register_buffer("_inv_perm_idx", inv_perm, persistent=False)
 
@@ -245,7 +249,7 @@ class GroupDiT(_MotionDiTBase):
         entropy_layer: int | None = None,
     ) -> torch.Tensor:
         B, F, _ = motion.shape
-        G = _N_GROUPS  # 7
+        G = self.G  # 7 (parts) or 22 (joints)
 
         context, ctx_mask = self._context_and_mask(context, B)
 
@@ -285,7 +289,7 @@ class GroupDiT(_MotionDiTBase):
         # Concat back into grouped order, then a single gather via the inverse
         # permutation restores original channel order — one op instead of a
         # zero-alloc + one scatter write per group.
-        group_outs = [self.out_projs[g](tokens[:, :, g]) for g in range(len(self.group_channels))]
+        group_outs = [self.out_projs[g](tokens[:, :, g]) for g in range(G)]
         return torch.cat(group_outs, dim=-1).index_select(-1, self._inv_perm_idx)
 
 
@@ -305,6 +309,10 @@ def build_model(config: dict, device="cpu") -> nn.Module:
         attn_sink    = config.get("attn_sink", False),
     )
     feature_mode = config.get("feature_mode", "humanml3d")
+    # Token axis for grouped backbones: 'parts' (7 body-part groups, default — how
+    # every checkpoint before 2026-07-26 trained) or 'joints' (22 per-joint tokens).
+    # Default 'parts' so old configs (which lack the key) rebuild exactly as trained.
+    group_mode = config.get("group_mode", "parts")
     arch = config.get("arch", "dit")
     if arch == "unet":
         # MotionCLR-style temporal U-Net over the same body-part group tokens.
@@ -320,12 +328,13 @@ def build_model(config: dict, device="cpu") -> nn.Module:
                 f"(humanml3d/smplh); got {feature_mode!r}.")
         model = GroupMotionUNet(
             feature_mode=feature_mode,
+            group_mode=group_mode,
             unet_levels=config.get("unet_levels", 3),
             unet_blocks_per_level=config.get("unet_blocks_per_level", 2),
             **kwargs,
         )
     elif _is_grouped_mode(feature_mode):
-        model = GroupDiT(feature_mode=feature_mode, **kwargs)
+        model = GroupDiT(feature_mode=feature_mode, group_mode=group_mode, **kwargs)
     else:
         # Legacy flat MotionDiT (deprecated) — kept only for loading old flat checkpoints.
         model = MotionDiT(input_dim=config.get("input_dim", 263), **kwargs)

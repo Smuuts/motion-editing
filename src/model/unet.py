@@ -39,7 +39,6 @@ from model.layers import (
     resolve_context_and_mask,
 )
 from model.body_groups import (
-    N_GROUPS as _N_GROUPS,
     group_layout as _group_layout,
 )
 
@@ -168,7 +167,7 @@ class CLRBlock(nn.Module):
 
 
 class GroupMotionUNet(nn.Module):
-    """MotionCLR-style temporal U-Net over body-part group tokens (see module docstring)."""
+    """MotionCLR-style temporal U-Net over body-part group tokens."""
 
     def __init__(
         self,
@@ -176,14 +175,14 @@ class GroupMotionUNet(nn.Module):
         latent_dim:   int = 512,
         context_dim:  int = 512,
         num_heads:    int = 8,
-        num_layers:   int = 8,          # accepted for config compatibility; UNUSED (depth
-                                        # comes from unet_levels / unet_blocks_per_level)
+        num_layers:   int = 8,
         max_frames:   int = 196,
         ff_mult:      int = 4,
         dropout:      float = 0.1,
         text_seq_len: int = 77,
         ctx_pad_mask: bool = False,
         attn_sink:    bool = False,
+        group_mode:   str = "parts",
         unet_levels:  int = 3,
         unet_blocks_per_level: int = 2,
     ):
@@ -191,10 +190,13 @@ class GroupMotionUNet(nn.Module):
         self.latent_dim = latent_dim
         self.ctx_pad_mask = ctx_pad_mask
         self.levels = unet_levels
-        self.G = _N_GROUPS
 
         # ── group tokeniser / detokeniser (identical to GroupDiT) ────────────
-        self.group_channels, group_dims, self.input_dim = _group_layout(feature_mode)
+        # group_mode picks the token axis: 'parts' (7) or 'joints' (22). G is derived
+        # from the partition, never hardcoded — so per-joint checkpoints tokenise right.
+        self.group_mode = group_mode
+        self.group_channels, group_dims, self.input_dim = _group_layout(feature_mode, group_mode)
+        self.G = len(self.group_channels)
         self._group_dims = group_dims
         self.in_projs  = nn.ModuleList([nn.Linear(d, latent_dim) for d in group_dims])
         self.out_projs = nn.ModuleList([nn.Linear(latent_dim, d) for d in group_dims])
@@ -209,8 +211,8 @@ class GroupMotionUNet(nn.Module):
 
         self.time_emb = TimestepEmbedding(latent_dim)
         # No explicit frame positional embedding: the temporal convs encode frame
-        # position (MotionCLR-faithful). group_emb still distinguishes the 7 groups
-        # for the (shared-weight) attention.
+        # position (MotionCLR-faithful). group_emb still distinguishes the G tokens
+        # (7 parts or 22 joints) for the (shared-weight) attention.
 
         C = latent_dim
         blk = lambda in_ch, out_ch: CLRBlock(

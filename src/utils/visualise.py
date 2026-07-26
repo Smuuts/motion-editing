@@ -253,6 +253,7 @@ def save_comparison_animation(
     figsize: tuple = (12, 6),
     gen_label: str = "Generated",
     gt_label: str = None,
+    edit_mask: np.ndarray = None,
 ):
     """
     Side-by-side animation: generated (left) vs ground truth (right).
@@ -261,6 +262,10 @@ def save_comparison_animation(
     mpjpe_per_frame        : (T_common,) root-relative MPJPE in metres.
     total_mpjpe            : mean MPJPE over T_common frames.
     gen_label, gt_label    : panel captions. gt_label defaults to "Ground Truth [clip_id]".
+    edit_mask              : (T,) bool — per-frame edit mask. When given, a timeline strip
+                             (green = edited) with a moving cursor is drawn under the panels
+                             and the per-frame readout shows EDIT / frozen for the current
+                             frame. None → no strip (backward-compatible).
     """
     T_common = len(mpjpe_per_frame)
     T_gen    = len(joints_gen)
@@ -296,6 +301,22 @@ def save_comparison_animation(
     lines_gen = _make_skeleton_lines(ax_gen)
     lines_gt  = _make_skeleton_lines(ax_gt)
 
+    # Optional per-frame edit-mask timeline (green = edited) with a moving cursor,
+    # drawn as a thin strip under the two panels.
+    cursor = None
+    if edit_mask is not None:
+        edit_mask = np.asarray(edit_mask).astype(float).reshape(-1)
+        strip_ax = fig.add_axes((0.15, 0.05, 0.70, 0.03))
+        strip_ax.imshow(edit_mask[None, :], aspect="auto", cmap="Greens",
+                        vmin=0, vmax=1, extent=(0, len(edit_mask), 0, 1))
+        strip_ax.set_yticks([]); strip_ax.set_xticks([])
+        strip_ax.set_xlim(0, len(edit_mask))
+        for sp in strip_ax.spines.values():
+            sp.set_color("gray")
+        strip_ax.text(-0.012, 0.5, "edit mask", transform=strip_ax.transAxes,
+                      ha="right", va="center", color="white", fontsize=7)
+        cursor = strip_ax.axvline(0, color="red", lw=1.5)
+
     def _init():
         _init_3d_axis(ax_gen, z_min, z_max)
         _init_3d_axis(ax_gt,  z_min, z_max)
@@ -307,11 +328,18 @@ def save_comparison_animation(
         if frame < T_gt:
             _update_skeleton(ax_gt, lines_gt, joints_gt, frame, hw, z_min, z_max)
         if frame < T_common:
+            status = ""
+            if edit_mask is not None and frame < len(edit_mask):
+                status = "  |  ● EDIT" if edit_mask[frame] > 0.5 else "  |  ○ frozen"
             mpjpe_txt.set_text(
                 f"Frame {frame:3d}: {mpjpe_per_frame[frame] * 1000:.1f} mm  |  "
-                f"Avg: {total_mpjpe * 1000:.1f} mm"
+                f"Avg: {total_mpjpe * 1000:.1f} mm{status}"
             )
-        return [l for _, l in lines_gen] + [l for _, l in lines_gt] + [mpjpe_txt]
+        extra = []
+        if cursor is not None:
+            cursor.set_xdata([frame, frame])
+            extra = [cursor]
+        return [l for _, l in lines_gen] + [l for _, l in lines_gt] + [mpjpe_txt] + extra
 
     ani = animation.FuncAnimation(
         fig, _update, frames=T,

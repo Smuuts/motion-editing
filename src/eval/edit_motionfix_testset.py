@@ -69,7 +69,7 @@ def parse_args():
     p.add_argument("--scales", type=float, nargs="+", default=[0.0, 2.5, 5.0, 7.5],
                    help="SEGA guidance scales to sweep (one output folder each).")
     p.add_argument("--mask_mode", default="m2_only",
-                   choices=["none", "m2_only", "m1_only", "attn"],
+                   choices=["none", "m2_only", "m1_only", "attn", "temporal"],
                    help="Stage-2 mask source (default m2_only: automated, no LLM/attention).")
     p.add_argument("--lambda_noise", type=float, default=70.0,
                    help="M2 percentile threshold (higher = sparser mask).")

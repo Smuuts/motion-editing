@@ -54,11 +54,14 @@ from scipy.ndimage import gaussian_filter1d
 
 from model.schedule import NoiseSchedule
 from model.text_encoder import build_text_encoder
-from model.body_groups import GROUP_NAMES, is_grouped_mode
+from model.body_groups import GROUP_NAMES, group_names, named_token_indices, resolve_group_context
 from editing import MotionEditor
 from editing.masking import semantic_token_subset
-from utils.visualise import recover_from_ric, save_comparison_animation
+from utils.visualise import save_comparison_animation
 from utils.model_io import load_model
+# recover_joints dispatches the feature_mode-correct decode: RIC for humanml3d (263-d),
+# SMPL-H forward kinematics for smplh (135-d). recover_from_ric alone only handles 263-d.
+from sample_model import recover_joints, _smplh_body_model
 
 
 def parse_args():
@@ -81,7 +84,7 @@ def parse_args():
                    help="Guidance scale s_e: one value (applied to all) or one per "
                         "instruction (default 5.0 each).")
     p.add_argument("--mask_mode", default="m2_only",
-                   choices=["none", "m2_only", "m1_only", "attn", "groups"],
+                   choices=["none", "m2_only", "m1_only", "attn", "groups", "temporal"],
                    help="Stage-2 mask source (default m2_only). 'none' = no mask: "
                         "guidance everywhere, no inpainting (full-edit ablation). "
                         "'groups' = user-supplied M_group (see --target_groups), full "
@@ -91,7 +94,8 @@ def parse_args():
                         f"body-part group names targeted by an instruction, from: "
                         f"{GROUP_NAMES}. Repeat once per --instruction, or pass once "
                         "to apply the same groups to all instructions. "
-                        "Example: --target_groups \"right_arm head\".")
+                        "Example: --target_groups \"right_arm head\". A group_mode=joints "
+                        "checkpoint also accepts individual joint names (e.g. L_Wrist).")
     p.add_argument("--lambda_noise", type=float, default=70.0,
                    help="M2 percentile threshold (higher = sparser mask).")
     p.add_argument("--m2_ref", default="null", choices=["null", "source"],
@@ -122,6 +126,9 @@ def parse_args():
                         "(prevents x0-space divergence at high noise).")
     p.add_argument("--split", default="val")
     p.add_argument("--max_frames", type=int, default=196)
+    p.add_argument("--smplh_model_path", default="data/motionfix/data/body_models/smplh",
+                   help="smplh checkpoints only: SMPLHLayer dir (needs SMPLH_NEUTRAL.npz) "
+                        "used to decode 135-d features to joints for rendering.")
     p.add_argument("--smooth_sigma", type=float, default=1.5)
     p.add_argument("--out_dir", default="eval_results/edit_demo")
     p.add_argument("--no_ema", action="store_true",
@@ -130,11 +137,13 @@ def parse_args():
     return p.parse_args()
 
 
-def parse_group_mask(spec, is_group):
+def parse_group_mask(spec, is_group, group_mode="parts"):
     """
-    "left_arm,right_arm" / "left_arm right_arm" → (G,) bool tensor over GROUP_NAMES.
-    Used for --mask_mode groups, where the user names the body-part groups an
-    instruction targets instead of relying on M1 (attention) or an LLM to find them.
+    "left_arm,right_arm" / "left_arm right_arm" → (G,) bool tensor over the model's
+    token axis (group_names(group_mode)). Used for --mask_mode groups, where the user
+    names the targets an instruction should edit instead of relying on M1 (attention)
+    or an LLM to find them. In 'joints' mode the axis is per-joint, but coarse
+    body-part names are still accepted and expand to their joint tokens.
     """
     if not is_group:
         raise SystemExit("--mask_mode groups requires a body-part-grouped model "
@@ -142,13 +151,12 @@ def parse_group_mask(spec, is_group):
     names = [n.strip() for n in spec.replace(",", " ").split() if n.strip()]
     if not names:
         raise SystemExit(f"--target_groups {spec!r} named no groups.")
-    unknown = [n for n in names if n not in GROUP_NAMES]
-    if unknown:
-        raise SystemExit(f"Unknown body-part group(s) {unknown} in {spec!r}; "
-                          f"choices: {GROUP_NAMES}")
-    mask = torch.zeros(len(GROUP_NAMES), dtype=torch.bool)
-    for n in names:
-        mask[GROUP_NAMES.index(n)] = True
+    try:
+        idxs = named_token_indices(names, group_mode)
+    except ValueError as e:
+        raise SystemExit(str(e))
+    mask = torch.zeros(len(group_names(group_mode)), dtype=torch.bool)
+    mask[idxs] = True
     return mask
 
 
@@ -200,11 +208,16 @@ def main():
 
     # ── load model, schedule, encoder, normalisation stats ──────────────────────
     model, config = load_model(args.checkpoint, device=device, use_ema=not args.no_ema)
-    is_group = is_grouped_mode(config.get("feature_mode", "humanml3d"))
-    print(f"feature_mode={config.get('feature_mode')}  is_group={is_group}")
+    feature_mode, is_group, group_mode, gnames = resolve_group_context(config)
+    print(f"feature_mode={feature_mode}  is_group={is_group}  group_mode={group_mode} (G={len(gnames)})")
 
-    mean = np.load(os.path.join(args.data_root, "Mean.npy"))   # (263,)
-    std  = np.load(os.path.join(args.data_root, "Std.npy"))    # (263,)
+    # Prime the SMPL-H body model with the configured path so recover_joints() decodes
+    # 135-d features correctly (no-op for humanml3d, which uses RIC recovery).
+    if feature_mode == "smplh":
+        _smplh_body_model(args.smplh_model_path)
+
+    mean = np.load(os.path.join(args.data_root, "Mean.npy"))   # (D,) = 263 or 135
+    std  = np.load(os.path.join(args.data_root, "Std.npy"))    # (D,)
     text_encoder = build_text_encoder(config, device=device)
     schedule = NoiseSchedule(timesteps=config.get("timesteps", 1000), device=device)
 
@@ -212,9 +225,9 @@ def main():
     raw_feat, clip_id, length, src_caption = load_source(
         args.source, args.data_root, args.split, args.max_frames)
     F = length
-    x0 = torch.from_numpy((raw_feat - mean) / std).float().unsqueeze(0).to(device)  # (1,F,263)
+    x0 = torch.from_numpy((raw_feat - mean) / std).float().unsqueeze(0).to(device)  # (1,F,D)
     valid_frames = torch.ones(F, dtype=torch.bool, device=device)
-    joints_src = recover_from_ric(raw_feat, joints_num=22)         # (F, 22, 3) shared by all
+    joints_src = recover_joints(raw_feat, feature_mode)            # (F, 22, 3) shared by all
     if args.smooth_sigma > 0:
         joints_src = gaussian_filter1d(joints_src, sigma=args.smooth_sigma, axis=0)
     print(f"Source: {clip_id}  ({F} frames)  original prompt: {src_caption!r}")
@@ -261,9 +274,9 @@ def main():
         mask_ts = (torch.linspace(1, schedule.T - 1, args.mask_timesteps).long().tolist()
                    if args.mask_timesteps else None)
         if args.mask_mode == "groups":
-            group_masks = [parse_group_mask(group_spec_of(e), is_group) for e in job]
+            group_masks = [parse_group_mask(group_spec_of(e), is_group, group_mode) for e in job]
             for e, gm in zip(job, group_masks):
-                targeted = [GROUP_NAMES[g] for g in gm.nonzero().flatten().tolist()]
+                targeted = [gnames[g] for g in gm.nonzero().flatten().tolist()]
                 print(f"  target_groups {e!r}: {targeted}")
             masks = editor.collect_masks(
                 state, ctxs, toks, valid_frames,
@@ -286,11 +299,16 @@ def main():
             print(f"  mask[{i}] {job[i]!r}: {int(m['edited'].sum())}/{F} frames, "
                   f"{int(m['m_group'].sum())} active (frame,group) cells")
 
-        # decode (denorm → FK → smooth)
-        joints_edit = recover_from_ric(x_edit[0].cpu().numpy() * std + mean, joints_num=22)
+        # decode (denorm → FK/RIC → smooth)
+        joints_edit = recover_joints(x_edit[0].cpu().numpy() * std + mean, feature_mode)
         if args.smooth_sigma > 0:
             joints_edit = gaussian_filter1d(joints_edit, sigma=args.smooth_sigma, axis=0)
         per_frame = np.sqrt(((joints_edit - joints_src) ** 2).sum(-1)).mean(-1)   # (F,)
+
+        # per-frame edit mask for the animation strip: a frame is "edited" if ANY of the
+        # job's edits touches it (m["edited"] is (F,) bool per edit).
+        edit_mask = np.logical_or.reduce(
+            [m["edited"].cpu().numpy() for m in masks]) if masks else None
 
         edit_text = " + ".join(job)
         slug = edit_text[:40].replace(" ", "_").replace("/", "_")
@@ -302,14 +320,15 @@ def main():
             clip_id=clip_id,
             gen_label=f"EDIT: {edit_text}",
             gt_label=f"SOURCE: {src_caption}" if src_caption else f"SOURCE [{clip_id}]",
+            edit_mask=edit_mask,
         )
         print(f"Wrote {out_mp4}")
-        save_mask_heatmap(masks, job, is_group,
+        save_mask_heatmap(masks, job, is_group, gnames,
                           os.path.join(args.out_dir, f"{base}_mask.png"))
 
 
-def save_mask_heatmap(masks, edits, is_group, out_path):
-    g_labels = GROUP_NAMES if is_group else ["all"]
+def save_mask_heatmap(masks, edits, is_group, gnames, out_path):
+    g_labels = gnames if is_group else ["all"]
     n = len(masks)
     fig, axes = plt.subplots(1, n, figsize=(max(4, 2.5 * len(g_labels)), 3 * 1), squeeze=False)
     for i, (m, e) in enumerate(zip(masks, edits)):

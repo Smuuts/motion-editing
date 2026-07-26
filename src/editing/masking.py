@@ -149,7 +149,7 @@ def _percentile_threshold(values: torch.Tensor, valid_frames: torch.Tensor,
 
 @torch.no_grad()
 def collect_statistics(model, schedule, xs, context_edit, token_idxs,
-                       is_group, num_groups=None, timesteps=None, need_attn=True,
+                       is_group, timesteps=None, need_attn=True,
                        group_channels=None, context_ref=None, psi_group_norm=False,
                        valid_frames=None, attn_readout="raw", semantic_idxs=None):
     """
@@ -194,7 +194,14 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
     """
     T = schedule.T
     F = xs.shape[2]
-    G = (num_groups or N_GROUPS) if is_group else 1
+    # G = number of token-axis cells. The model's own channel partition is the source
+    # of truth (7 body-part groups OR 22 per-joint tokens); grouped callers always pass
+    # group_channels, so derive G from it. N_GROUPS only backstops a group_channels=None
+    # grouped call, which no current caller makes.
+    if not is_group:
+        G = 1
+    else:
+        G = len(group_channels) if group_channels is not None else N_GROUPS
     if timesteps is None:
         timesteps = range(1, T)
 
@@ -244,11 +251,12 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
 # independent axes; encoding them as a lookup keeps adding/auditing a mode a
 # one-line change instead of touching two parallel if/elif chains.
 _MASK_MODE_COMPONENTS = {
-    "none":    (None,     False),
-    "m2_only": (None,     True),
-    "m1_only": ("attn",   False),
-    "attn":    ("attn",   True),
-    "groups":  ("groups", False),
+    "none":     (None,     False),
+    "m2_only":  (None,     True),
+    "m1_only":  ("attn",   False),
+    "attn":     ("attn",   True),
+    "groups":   ("groups", False),
+    "temporal": (None,     True),   # frame-level "edit these frames"; see build_mask
 }
 
 
@@ -276,8 +284,19 @@ def build_mask(attn_fg, psi_fg, valid_frames, is_group,
                                   edited in every valid frame — full temporal coverage
                                   of the named groups rather than restricting to frames
                                   M2 judges as already changing.
+                      "temporal"— frame-level "edit these frames": threshold ψ
+                                  marginalised over groups to pick the active frames and
+                                  edit EVERY body-part group within them (spatially
+                                  permissive). Rationale: the group axis is not reliably
+                                  instruction-grounded (see docs/FINDINGS.md), so this
+                                  trusts only the temporal signal — which IS reliable —
+                                  and never freezes the body part that should change (a
+                                  wrong (F,G) mask can inpaint the target region back to
+                                  source). Optionally ∩ `llm_group_mask` to also restrict
+                                  WHICH parts. `lambda_noise` sets the frame percentile.
     llm_group_mask  : (F, G) or (G,) bool — required for mask_mode="groups"; the
-                      groups an instruction targets. A (G,) vector is broadcast over frames.
+                      groups an instruction targets (also optionally intersected in
+                      "temporal"). A (G,) vector is broadcast over frames.
 
     group_channels  : representation channel partition (263-d default, or 135-d smplh)
     feat_dim        : total feature width D matching group_channels (263 or 135)
@@ -292,6 +311,26 @@ def build_mask(attn_fg, psi_fg, valid_frames, is_group,
     semantic_source, use_m2 = _MASK_MODE_COMPONENTS[mask_mode]
 
     valid = valid_frames[:, None]
+
+    # Frame-level "edit these frames" mask (spatially permissive). Handled before the
+    # generic (F,G)-cell path because it thresholds a per-FRAME activity score, not
+    # per-cell values. ψ summed over groups is the source's "where is there change"
+    # signal aggregated across the body; the top (100−lambda_noise)% of frames are
+    # edited across ALL groups. See the docstring for why we trust only this axis.
+    if mask_mode == "temporal":
+        activity = psi_fg.sum(dim=1, keepdim=True)                    # (F, 1)
+        active   = _percentile_threshold(activity, valid_frames, lambda_noise)  # (F, 1) bool
+        m_group  = (valid & active).expand(-1, psi_fg.shape[1]).clone()
+        if llm_group_mask is not None:
+            gm = llm_group_mask.to(m_group.device, dtype=torch.bool)
+            if gm.dim() == 1:
+                gm = gm[None, :].expand(m_group.shape[0], -1)
+            m_group = m_group & gm
+        return {
+            "m_group":   m_group,
+            "m_channel": group_mask_to_channels(m_group, is_group, group_channels, feat_dim),
+            "edited":    m_group.any(dim=-1),
+        }
 
     # semantic component (M1 / M_llm); absent when semantic_source is None
     if semantic_source is None:
