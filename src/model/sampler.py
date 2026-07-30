@@ -71,11 +71,14 @@ class DDPMSampler:
         for t in it:
             t_batch = torch.full((B,), t, device=self.device, dtype=torch.long)
 
-            # conditional prediction
-            eps_cond = self.model(x, t_batch, context)
+            # conditional prediction. to_eps is the identity for an eps-head and the
+            # exact x0->eps conversion for an x0-head (Option 5), so CFG and the
+            # reverse step below are unchanged for either parameterisation.
+            eps_cond = self.schedule.to_eps(self.model(x, t_batch, context), x, t_batch)
 
             # unconditional prediction (null context)
-            eps_uncond = self.model(x, t_batch, context=None)
+            eps_uncond = self.schedule.to_eps(
+                self.model(x, t_batch, context=None), x, t_batch)
 
             # Plain CFG — for LEDITS++ Stage 3 this is replaced by Eq. 1:
             #   ε̂_0(x_t, c_e) = ε̂_0(x_t, ∅) + Σ_i s_e · M_i · [ε_θ(x_t, c_e) − ε_θ(x_t, ∅)]

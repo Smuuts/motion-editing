@@ -178,6 +178,29 @@ class SelfAttention(nn.Module):
         self.out  = nn.Linear(dim, dim)
         self.dropout = nn.Dropout(dropout)
 
+        # ── probe-only token↔token attention capture (analyse_self_attention.py) ──
+        # Self-attention is the one attention pathway none of the M1/M2 probes ever
+        # read (they are all cross-attention); Option 7 in
+        # docs/AttentionGrounding_Options.md ports DiffSeg (arXiv 2308.12469) onto it
+        # to look for emergent (frame, body-part) segment structure.
+        #
+        # Enabled by SETTING THE ATTRIBUTE on the module, not by a forward kwarg —
+        # deliberately. Capture is needed identically in GroupDiT (model/dit.py) and
+        # GroupMotionUNet (model/unet.py), and an attribute avoids threading a new
+        # argument through DiTBlock.forward, CLRBlock.forward and both model forwards
+        # for an inference-only diagnostic. Defaults keep the fused SDPA path exactly
+        # as-is for training and for the editor, and no parameter is added, so
+        # checkpoints are completely unaffected.
+        #
+        # last_attn_map is (B, N, N) with store_attn_head_mean=True (the DiffSeg
+        # recipe aggregates over heads anyway) or (B, heads, N, N) without it. The
+        # head-mean matters: N = F*G, so a per-head map is heads× the memory of an
+        # already-quadratic tensor (G=22, F=196 → N=4312 → ~600 MB per layer per
+        # head-full map vs ~74 MB head-meaned).
+        self.store_attn = False
+        self.store_attn_head_mean = True
+        self.last_attn_map = None
+
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         B, N, _ = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
@@ -189,9 +212,21 @@ class SelfAttention(nn.Module):
             # (B, 1, 1, N) bool mask: False positions are padding and get -inf
             attn_mask = mask[:, None, None, :]
 
-        dropout_p = self.dropout.p if self.training else 0.0
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
-        out = out.transpose(1, 2).reshape(B, N, -1)
+        if self.store_attn:
+            # Explicit softmax: SDPA cannot return the probabilities themselves.
+            logits = q @ k.transpose(-2, -1) * self.scale          # (B, h, N, N)
+            if attn_mask is not None:
+                logits = logits.masked_fill(~attn_mask, torch.finfo(logits.dtype).min)
+            attn = torch.softmax(logits, dim=-1)
+            self.last_attn_map = (attn.mean(dim=1) if self.store_attn_head_mean
+                                  else attn).detach()
+            attn = self.dropout(attn)
+            out = (attn @ v).transpose(1, 2).reshape(B, N, -1)
+        else:
+            dropout_p = self.dropout.p if self.training else 0.0
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask,
+                                                 dropout_p=dropout_p)
+            out = out.transpose(1, 2).reshape(B, N, -1)
 
         if mask is not None:
             out = out.masked_fill(~mask[:, :, None], 0.0)

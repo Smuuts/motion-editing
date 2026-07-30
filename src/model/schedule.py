@@ -22,9 +22,31 @@ class NoiseSchedule:
     All tensors are registered on the given device.
     """
 
-    def __init__(self, timesteps: int = 1000, device="cpu"):
+    # Which quantity the network's output head represents. "eps" is the original
+    # (and default) parameterisation; "x0" is Option 5 of
+    # docs/AttentionGrounding_Options.md — see `to_eps` and `min_snr_weight`.
+    PREDICT_TYPES = ("eps", "x0")
+
+    @classmethod
+    def from_config(cls, config: dict, device="cpu"):
+        """Build a schedule from a checkpoint/training config.
+
+        Use this anywhere a config dict is available instead of
+        `NoiseSchedule(timesteps=...)`: it carries `predict_type` across, so an
+        x0-trained checkpoint is interpreted correctly by the sampler, the inversion
+        and the mask statistics. Missing key -> "eps", so every pre-Option-5
+        checkpoint behaves exactly as before.
+        """
+        return cls(timesteps=config.get("timesteps", 1000), device=device,
+                   predict_type=config.get("predict_type", "eps"))
+
+    def __init__(self, timesteps: int = 1000, device="cpu", predict_type: str = "eps"):
+        if predict_type not in self.PREDICT_TYPES:
+            raise ValueError(f"predict_type must be one of {self.PREDICT_TYPES}, "
+                             f"got {predict_type!r}")
         self.T = timesteps
         self.device = device
+        self.predict_type = predict_type
 
         betas = cosine_beta_schedule(timesteps).to(device)
         alphas = 1.0 - betas
@@ -90,14 +112,77 @@ class NoiseSchedule:
         sqrt_omacp = self.sqrt_one_minus_alphas_cumprod[t][:, None, None]
         return (x_t - sqrt_omacp * eps) / sqrt_acp
 
-    def min_snr_weight(self, t, gamma):
-        """Per-sample Min-SNR weight: min(SNR(t), γ) / SNR(t) (Hang et al. 2023).
+    def predict_eps_from_x0(self, x_t, t, x0):
+        """Inverse of `predict_x0_from_eps`: ε = (x_t − √ᾱ_t·x0) / √(1−ᾱ_t).
 
-        Used by the diffusion eps-MSE. Only suppresses low-noise/low-t samples
-        (SNR(t) ≫ γ there); it stays ≈1 for t roughly ≳500, so it does NOT protect
-        against high-noise instability — see `x0_confidence_weight` for that.
+        The conversion shim for an x0-prediction network (Option 5). Exact, and affine
+        in the network output with (x_t, t) held fixed — which is why SEGA guidance and
+        the scale-0 exact-reconstruction property survive the switch unchanged
+        (docs/AttentionGrounding_Options.md §5.3). Ill-conditioned only as t→0, where
+        √(1−ᾱ_t)→0; clamped, and inversion/guidance barely matter there.
+        """
+        sqrt_acp   = self.sqrt_alphas_cumprod[t][:, None, None]
+        sqrt_omacp = self.sqrt_one_minus_alphas_cumprod[t][:, None, None].clamp(min=1e-4)
+        return (x_t - sqrt_acp * x0) / sqrt_omacp
+
+    def to_eps(self, model_out, x_t, t):
+        """Interpret a raw network output as ε, whatever the network predicts.
+
+        THE inference-side boundary for Option 5: every consumer that treats the model
+        output as a noise estimate (sampler, inversion, ψ/M2 in editing/masking.py,
+        verify_backbone) routes through here, so an x0-trained checkpoint runs the
+        entire existing pipeline unchanged. Identity in "eps" mode — the default path
+        is byte-for-byte what it was.
+
+        NOTE this keeps the 1/√ᾱ_t amplification on the guidance term (and hence the
+        need for `guidance_alpha_floor`); the x0-native editing path of §5.3 removes
+        that, and is deliberately NOT what this does.
+        """
+        if self.predict_type == "eps":
+            return model_out
+        return self.predict_eps_from_x0(x_t, t, model_out)
+
+    def to_x0(self, model_out, x_t, t):
+        """Interpret a raw network output as a clean-signal estimate x̂0.
+
+        Mirror of `to_eps` for the training-side geometric losses: an x0-head's output
+        IS x̂0 (no conversion, no 1/√ᾱ_t error amplification), an ε-head's must be
+        converted.
+        """
+        if self.predict_type == "x0":
+            return model_out
+        return self.predict_x0_from_eps(x_t, t, model_out)
+
+    def diffusion_target(self, x0, noise):
+        """The regression target matching `predict_type`: ε or the clean signal x0."""
+        return noise if self.predict_type == "eps" else x0
+
+    def min_snr_weight(self, t, gamma):
+        """Per-sample Min-SNR weight (Hang et al. 2023), in the form matching
+        `predict_type`.
+
+        Min-SNR clamps the *effective* weight on the clean-signal error ‖x̂0 − x0‖² to
+        min(SNR_t, γ). What that costs depends on the parameterisation, because the two
+        objectives are reweightings of one another (docs/AttentionGrounding_Options.md
+        §5.2):
+
+            ‖ε̂ − ε‖² = SNR_t · ‖x̂0 − x0‖²
+
+          eps-head: loss already carries an implicit SNR_t  -> weight min(SNR,γ)/SNR
+          x0-head : loss carries no implicit factor         -> weight min(SNR,γ)
+
+        The two differ by exactly SNR_t. **Leaving the eps form in place under an x0
+        head double-applies the correction and re-suppresses high noise — i.e. undoes
+        the entire point of Option 5**, which is why this is parameterisation-aware
+        rather than a caller's responsibility.
+
+        In eps mode this only suppresses low-noise/low-t samples (SNR ≫ γ there) and
+        stays ≈1 for t ≳ 500, so it does NOT protect against high-noise instability —
+        see `x0_confidence_weight`.
         """
         snr_t = self.snr[t]  # (B,)
+        if self.predict_type == "x0":
+            return snr_t.clamp(max=gamma)
         return snr_t.clamp(max=gamma) / snr_t
 
     def x0_confidence_weight(self, t):
@@ -110,6 +195,12 @@ class NoiseSchedule:
         reliable) and →0 at high noise (x0_pred meaningless), so weighting by it
         fades out any loss computed on x0_pred exactly where that loss stops being
         meaningful. NOT the same as `min_snr_weight` (see there for why).
+
+        **Only meaningful for an eps-head.** With predict_type="x0" the network outputs
+        x̂0 directly, there is no division by √ᾱ_t and so no error amplification to damp
+        — applying this weight would just fade out the geometric losses at high noise
+        for no reason (docs/AttentionGrounding_Options.md §5.4). train.py resolves this
+        automatically; `--geo_conf_weight` overrides it.
         """
         return self.alphas_cumprod[t]  # (B,)
 

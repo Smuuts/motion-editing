@@ -22,6 +22,21 @@ LATENT_DIM=512
 UNET_LEVELS=3
 UNET_BLOCKS_PER_LEVEL=2
 EPOCHS=500
+# Output-head parameterisation: eps (default) or x0 (Option 5, see
+# docs/AttentionGrounding_Options.md §5 and ARCHITECTURE.md "Prediction target").
+# x0 regresses the clean motion directly instead of the noise. Saved into the
+# checkpoint config, so generate/evaluate/edit convert back automatically — nothing
+# downstream needs a flag.
+#   !! Do NOT add --snr_gamma to the train call below when using x0. train.py forces
+#   snr_gamma=0 under x0 *only if the flag was not passed explicitly*, and Min-SNR
+#   under an x0 head reproduces the eps baseline's weighting almost exactly (3% of
+#   training weight on t>=600 vs 40% unweighted), which cancels the whole point.
+PREDICT_TYPE="eps"               # eps | x0
+# Geometric-loss confidence weight (alpha_bar_t damping). "" = AUTO: on for eps, off
+# for x0 (an x0 head outputs x0 directly, so there is no 1/sqrt(alpha_bar_t) error
+# amplification to damp). "--geo_conf_weight" forces on — the escape hatch if an x0
+# run destabilises near t=T; "--no-geo_conf_weight" forces off.
+GEO_CONF_WEIGHT=""
 # NOTE: attn_sink forces the explicit (non-fused) attention path during training —
 # costs GPU memory vs SDPA (bs 20 OOMs on a 12 GB card where SDPA fit; bs 16 OK).
 # Re-check the batch size on the training machine before a long run.
@@ -67,10 +82,11 @@ fi
 # ----------------------------------------------------------------------
 # 1. Train
 # ----------------------------------------------------------------------
-log "Training (arch=${ARCH}, lr=${LEARNING_RATE}, out=${OUTPUT_DIR})"
+log "Training (arch=${ARCH}, predict=${PREDICT_TYPE}, lr=${LEARNING_RATE}, out=${OUTPUT_DIR})"
 python src/train.py \
   --data_root     "${FEAT_ROOT}" \
   --output_dir    "${OUTPUT_DIR}" \
+  --predict_type  "${PREDICT_TYPE}" \
   --lr            "${LEARNING_RATE}" \
   --num_layers    "${NUM_LAYERS}" \
   --num_heads     "${NUM_HEADS}" \
@@ -85,6 +101,7 @@ python src/train.py \
   --text_encoder  "${TEXT_ENCODER}" \
   "${ARCH_ARGS[@]}" \
   ${ATTN_SINK} \
+  ${GEO_CONF_WEIGHT} \
   --attn_entropy_weight "${ATTN_ENTROPY_WEIGHT}"
 
 # ----------------------------------------------------------------------

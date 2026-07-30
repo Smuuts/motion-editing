@@ -226,7 +226,13 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
         t_b = torch.full((1,), t, device=device, dtype=torch.long)
 
         # ε_θ(x_t, c_edit), with attention capture only when M1 is needed.
-        eps_c = model(x_t, t_b, context_edit, store_attn=need_attn)
+        # schedule.to_eps is the identity for an eps-head and the exact x0->eps
+        # conversion for an x0-head (Option 5). NB under x0 this yields ψ_ε, which
+        # equals √SNR_t · ψ_x0 — the same mask at any fixed t, but a
+        # low-noise-weighted MIXTURE across the sweep (§5.3). The x0-native M2 is a
+        # separate change; this shim only makes an x0 checkpoint run at all.
+        eps_c = schedule.to_eps(
+            model(x_t, t_b, context_edit, store_attn=need_attn), x_t, t_b)
         if need_attn:
             # M1 contribution
             layer_maps = model.get_attn_maps()                # list of (1, h, N, L)
@@ -235,7 +241,7 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
             attn_accum += _attn_readout_value(avg, tok, sem, attn_readout).reshape(F, G)
 
         # ψ = ε_θ(x_t, c_edit) − ε_θ(x_t, ref) → M2 contribution
-        eps_r = model(x_t, t_b, context_ref)
+        eps_r = schedule.to_eps(model(x_t, t_b, context_ref), x_t, t_b)
         psi = (eps_c - eps_r)[0].abs()                        # (F, D)
         psi_accum += psi @ agg_matrix if is_group else psi.mean(dim=-1, keepdim=True)
         n += 1

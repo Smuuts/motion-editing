@@ -160,7 +160,7 @@ def main():
     mean = np.load(os.path.join(args.data_root, "Mean.npy"))
     std  = np.load(os.path.join(args.data_root, "Std.npy"))
     text_encoder  = build_text_encoder(config, device=device)
-    schedule      = NoiseSchedule(timesteps=config.get("timesteps", 1000), device=device)
+    schedule      = NoiseSchedule.from_config(config, device=device)
     sampler       = DDPMSampler(model, schedule, device)
 
     # ── choose mode ────────────────────────────────────────────────────────────

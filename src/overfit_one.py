@@ -52,6 +52,9 @@ def parse_args():
 
     # diffusion — same defaults as train.py
     p.add_argument("--timesteps",     type=int,   default=1000)
+    p.add_argument("--predict_type",  default="eps", choices=["eps", "x0"],
+                   help="Output-head parameterisation, mirroring train.py "
+                        "(see docs/AttentionGrounding_Options.md Option 5).")
     p.add_argument("--cfg_dropout",   type=float, default=0.1)
     p.add_argument("--snr_gamma",     type=float, default=5.0)
 
@@ -148,7 +151,8 @@ def main():
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model: {n_params/1e6:.1f}M parameters")
 
-    schedule = NoiseSchedule(timesteps=args.timesteps, device=device)
+    schedule = NoiseSchedule(timesteps=args.timesteps, device=device,
+                             predict_type=args.predict_type)
     scaler   = GradScaler(device=device.type, enabled=device.type == "cuda")
 
     # ── optimiser + LR schedule (identical to train.py) ──────────────────────
@@ -193,15 +197,17 @@ def main():
         # loss — same as train.py
         with autocast(device_type=device.type):
             prediction = model(x_t, t, context_in, mask=attn_mask)
-            per_elem   = (noise - prediction) ** 2 * loss_mask     # (B, T, D)
+            # ε or x0 per predict_type; min_snr_weight flips form to match.
+            target     = schedule.diffusion_target(motion, noise)
+            per_elem   = (target - prediction) ** 2 * loss_mask    # (B, T, D)
 
             if args.snr_gamma > 0.0:
-                valid_elems = (attn_mask.float().sum(dim=1) * noise.shape[-1]).clamp(min=1)
+                valid_elems = (attn_mask.float().sum(dim=1) * target.shape[-1]).clamp(min=1)
                 per_sample  = per_elem.sum(dim=(1, 2)) / valid_elems
                 snr_weight  = schedule.min_snr_weight(t, args.snr_gamma)
                 loss = (per_sample * snr_weight).mean()
             else:
-                loss = per_elem.sum() / (loss_mask.sum() * noise.shape[-1]).clamp(min=1)
+                loss = per_elem.sum() / (loss_mask.sum() * target.shape[-1]).clamp(min=1)
 
         if not torch.isfinite(loss):
             optimizer.zero_grad()

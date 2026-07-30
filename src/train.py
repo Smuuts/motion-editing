@@ -93,6 +93,32 @@ def build_parser():
                         "load with it off automatically (missing config key).")
 
     # diffusion
+    p.add_argument("--predict_type", type=str,   default="eps",
+                   choices=["eps", "x0"],
+                   help="What the network's output head predicts. 'eps' (default) is "
+                        "the original noise-prediction parameterisation. 'x0' is Option "
+                        "5 of docs/AttentionGrounding_Options.md: regress the clean "
+                        "motion directly. Rationale — the eps-objective equals "
+                        "E[SNR_t * ||x0_hat - x0||^2], and SNR collapses at high noise "
+                        "(0.024 at t=900), so the caption (which only ever describes "
+                        "x0) has almost nothing to do above t~600 — exactly where the "
+                        "mask statistics are collected and SEGA guidance acts. Under x0 "
+                        "the model must reconstruct the clip at every noise level, where "
+                        "the text is the only information available. Flips Min-SNR to "
+                        "its x0 form and drops the geometric-loss confidence weight, "
+                        "both automatically. Saved in the checkpoint config, so the "
+                        "sampler/inversion/masking convert back to eps on load; old "
+                        "checkpoints default to 'eps'.")
+    p.add_argument("--geo_conf_weight", action=argparse.BooleanOptionalAction, default=None,
+                   help="Weight the geometric (FK/pos/vel/foot) losses by the "
+                        "x0-confidence factor alpha_bar_t. Default (unset) is AUTO: on "
+                        "for --predict_type eps, off for x0. The weight exists only to "
+                        "damp the 1/sqrt(alpha_bar_t) error amplification incurred when "
+                        "x0 is DERIVED from an eps prediction; an x0 head outputs x0 "
+                        "directly, so there is nothing to damp and keeping it would just "
+                        "fade the geometric losses out at high noise. Pass "
+                        "--geo_conf_weight to force it back on (escape hatch if an x0 "
+                        "run destabilises near t=T).")
     p.add_argument("--timesteps",    type=int,   default=1000)
     p.add_argument("--cfg_dropout",  type=float, default=0.1,
                    help="Fraction of batch to train unconditionally (CFG).")
@@ -156,17 +182,30 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
-    config = vars(args)
+    config = vars(args)          # NB: the live namespace __dict__ — args.* follows config
+    cli_keys = explicit_cli_keys(parser)
     if args.config:
         with open(args.config) as f:
             config.update(json.load(f))
+
+    # ── Option 5: the loss weighting must actually change, or the run tests nothing ──
+    # Min-SNR weights the clean-signal error ‖x̂0 − x0‖² by min(SNR_t, γ). At high t,
+    # min(SNR_t, γ) == SNR_t — which IS the ε-objective's weighting. So applying
+    # Min-SNR under an x0 head (in *either* algebraic form) reproduces the ε baseline
+    # almost exactly (measured: 3.0% of total training weight on t ≥ 600, same as
+    # today) and cancels the entire mechanism, which is that the model must reconstruct
+    # the clip at EVERY noise level — the regime where the caption is the only
+    # information available. Plain, unweighted x0 loss puts 40% of the weight on
+    # t ≥ 600. This is also what MDM and MotionCLR (both x0/sample predictors) do.
+    # See docs/AttentionGrounding_Options.md §5.4 (corrected 2026-07-30).
+    if config["predict_type"] == "x0" and "snr_gamma" not in cli_keys:
+        config["snr_gamma"] = 0.0
 
     if args.resume:
         saved_path = os.path.join(args.output_dir, "config.json")
         if os.path.exists(saved_path):
             with open(saved_path) as f:
                 saved = json.load(f)
-            cli_keys = explicit_cli_keys(parser)
             preserved = cli_keys | {"resume", "output_dir"}
             for k, v in saved.items():
                 if k not in preserved:
@@ -179,6 +218,13 @@ def main():
                     config[regime_key] = False
                     print(f"Resume: saved config predates {regime_key} — keeping it OFF "
                           f"to match how this run trained (pass --{regime_key} to override).")
+            # Same reasoning for the parameterisation, and it is even less forgiving:
+            # resuming an eps-trained run under an x0 objective would regress the
+            # existing weights against a different target entirely.
+            if "predict_type" not in saved and "predict_type" not in cli_keys:
+                config["predict_type"] = "eps"
+                print("Resume: saved config predates predict_type — keeping 'eps' to "
+                      "match how this run trained.")
             print(f"Resume: loaded config from {saved_path} "
                   f"(overridden by CLI args: {sorted(cli_keys - {'resume', 'output_dir'})})")
         else:
@@ -264,8 +310,23 @@ def main():
     print(f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.1f}M")
 
     ema      = EMA(model, decay=args.ema_decay)
-    schedule = NoiseSchedule(timesteps=args.timesteps, device=device)
+    schedule = NoiseSchedule.from_config(config, device=device)
     scaler   = GradScaler(device=device.type, enabled=device.type == "cuda")
+
+    # AUTO: the alpha_bar_t damping only makes sense when x0 is derived from eps.
+    geo_conf_weight = (config["predict_type"] == "eps"
+                       if config["geo_conf_weight"] is None else config["geo_conf_weight"])
+    if config["predict_type"] == "x0":
+        gamma = config["snr_gamma"]
+        weighting = ("plain (unweighted) — 40% of training weight on t>=600 vs 3% for eps"
+                     if gamma == 0.0 else
+                     f"min(SNR,{gamma}) x0-form — WARNING: this reproduces the eps "
+                     f"baseline's weighting (~3% on t>=600) and largely cancels Option 5")
+        print(f"Prediction target: x0 (Option 5). Loss weighting: {weighting}. "
+              f"Geometric-loss confidence weight "
+              f"{'ON (forced via --geo_conf_weight)' if geo_conf_weight else 'OFF (auto)'}. "
+              "Loss values are NOT comparable to eps runs (different objective, "
+              "different scale) — compare x0 runs only against other x0 runs.")
 
     # optimizer & scheduler
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999))
@@ -309,6 +370,7 @@ def main():
             hml3d_vel_weight=args.hml3d_vel_weight,
             hml3d_foot_weight=args.hml3d_foot_weight,
             attn_entropy_weight=config["attn_entropy_weight"],
+            geo_conf_weight=geo_conf_weight,
         )
         # Read the LR used for the epoch that just ran before advancing the
         # scheduler — get_last_lr() after step() would report next epoch's LR.
@@ -333,6 +395,7 @@ def main():
                     hml3d_pos_weight=args.hml3d_pos_weight,
                     hml3d_vel_weight=args.hml3d_vel_weight,
                     hml3d_foot_weight=args.hml3d_foot_weight,
+                    geo_conf_weight=geo_conf_weight,
                 )
             val_losses.append((epoch, val_loss))
             logger.log({"val/epoch_loss": val_loss, "val/epoch": epoch})

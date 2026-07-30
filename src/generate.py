@@ -137,7 +137,7 @@ def main():
 
     # Built lazily: only needed for clips without a precomputed text embedding.
     text_encoder = None
-    schedule     = NoiseSchedule(timesteps=config.get("timesteps", 1000), device=device)
+    schedule     = NoiseSchedule.from_config(config, device=device)
     sampler      = DDPMSampler(model, schedule, device)
 
     print(f"\nLoading '{args.split}' split …")

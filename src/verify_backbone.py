@@ -71,7 +71,9 @@ def main():
     print(f"Feature mode:  {feature_mode}")
     print(f"Noise steps:   {timesteps}")
 
-    schedule = NoiseSchedule(timesteps=timesteps, device=device)
+    # from_config so an x0-trained checkpoint (predict_type) is interpreted correctly;
+    # missing key -> "eps", i.e. unchanged for every existing checkpoint.
+    schedule = NoiseSchedule.from_config(config, device=device)
 
     loader = build_dataloader(
         args.data_root, split="val",
@@ -124,8 +126,11 @@ def main():
             t_batch = torch.full((B,), t_val, device=device, dtype=torch.long)
             x_t, noise = schedule.q_sample(motions, t_batch)
 
-            # Conditional: uses text embeddings
-            eps_c  = model(x_t, t_batch, contexts, mask=attn_mask)
+            # Conditional: uses text embeddings. to_eps/to_x0 are identities for an
+            # eps-head; for an x0-head (Option 5) they convert, so the noise-MSE and
+            # MPJPE checks below stay the same quantities across parameterisations.
+            eps_c  = schedule.to_eps(model(x_t, t_batch, contexts, mask=attn_mask),
+                                     x_t, t_batch)
             x0_c   = schedule.predict_x0_from_eps(x_t, t_batch, eps_c)
             mpjpe_c = compute_mpjpe(
                 x0_c, motions, mean_t, std_t, mask=attn_mask
@@ -133,7 +138,8 @@ def main():
 
             # Unconditional: context=None → model uses null_text_emb
             # This branch is required for Stage 1 inversion and Stage 3 CFG.
-            eps_u  = model(x_t, t_batch, context=None, mask=attn_mask)
+            eps_u  = schedule.to_eps(model(x_t, t_batch, context=None, mask=attn_mask),
+                                     x_t, t_batch)
             x0_u   = schedule.predict_x0_from_eps(x_t, t_batch, eps_u)
             mpjpe_u = compute_mpjpe(
                 x0_u, motions, mean_t, std_t, mask=attn_mask
@@ -193,7 +199,10 @@ def main():
     print(f"\n{'='*56}")
     print("LEDITS++ prerequisite check")
     print(f"{'='*56}")
-    print(f"  Architecture:  {type(model).__name__} (epsilon-prediction DiT)  ✓")
+    # Report the actual parameterisation — the checks above are run in eps space via
+    # schedule.to_eps either way, but an x0 checkpoint is not an eps model.
+    print(f"  Architecture:  {type(model).__name__} "
+          f"({schedule.predict_type}-prediction)  ✓")
     print(f"  Feature mode:  {feature_mode}")
     print(f"  MPJPE at t={best_t:3d} [cond]    {mpjpe_low_t:.4f} m   "
           f"[{'PASS' if mpjpe_ok  else 'REVIEW'} — threshold 0.15 m]")

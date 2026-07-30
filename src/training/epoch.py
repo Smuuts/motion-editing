@@ -21,20 +21,26 @@ def _batch_lengths(batch, device):
     return torch.as_tensor(lengths, device=device)
 
 
-def _diffusion_loss(noise, prediction, attn_mask, schedule, t, snr_gamma):
-    """Min-SNR-weighted (or plain) MSE between true and predicted noise, masked to
-    valid (non-padding) frames. Shared by train_one_epoch and validate_one_epoch so
-    the train/val curves are the same quantity and can be overlaid."""
+def _diffusion_loss(target, prediction, attn_mask, schedule, t, snr_gamma):
+    """Min-SNR-weighted (or plain) MSE between the target and the network output,
+    masked to valid (non-padding) frames. Shared by train_one_epoch and
+    validate_one_epoch so the train/val curves are the same quantity and can be
+    overlaid.
+
+    `target` is whatever the network predicts — ε or the clean signal x0, per
+    `schedule.predict_type` (use `schedule.diffusion_target(x0, noise)` to pick it).
+    `min_snr_weight` flips form to match, so the caller never has to know.
+    """
     loss_mask = attn_mask.float().unsqueeze(-1)           # (B, T, 1)
-    per_elem  = (noise - prediction) ** 2 * loss_mask     # (B, T, D)
+    per_elem  = (target - prediction) ** 2 * loss_mask    # (B, T, D)
 
     if snr_gamma > 0.0:
         # Per-sample mean MSE over valid (T, D) elements.
-        valid_elems = (attn_mask.float().sum(dim=1) * noise.shape[-1]).clamp(min=1)
+        valid_elems = (attn_mask.float().sum(dim=1) * target.shape[-1]).clamp(min=1)
         per_sample  = per_elem.sum(dim=(1, 2)) / valid_elems        # (B,)
         snr_weight  = schedule.min_snr_weight(t, snr_gamma)         # (B,)
         return (per_sample * snr_weight).mean()
-    return per_elem.sum() / (loss_mask.sum() * noise.shape[-1]).clamp(min=1)
+    return per_elem.sum() / (loss_mask.sum() * target.shape[-1]).clamp(min=1)
 
 
 def _add_geo_losses(loss, x0_pred, motion, attn_mask, geo_fn, weights, sample_weight=None):
@@ -64,7 +70,7 @@ def train_one_epoch(
     loader, device, cfg_dropout, logger, epoch, log_every,
     snr_gamma=5.0,
     geo_fn=None, hml3d_pos_weight=0.0, hml3d_vel_weight=0.0, hml3d_foot_weight=0.0,
-    attn_entropy_weight=0.0,
+    attn_entropy_weight=0.0, geo_conf_weight=True,
 ):
     model.train()
     total_loss = 0.0
@@ -103,7 +109,8 @@ def train_one_epoch(
         with autocast(device_type=device.type):
             prediction = model(x_t, t, context, mask=attn_mask,
                                entropy_layer=ent_layer)
-            loss = _diffusion_loss(noise, prediction, attn_mask, schedule, t, snr_gamma)
+            target = schedule.diffusion_target(motion, noise)
+            loss = _diffusion_loss(target, prediction, attn_mask, schedule, t, snr_gamma)
 
         entropy_log = {}
         if ent_layer is not None:
@@ -116,8 +123,12 @@ def train_one_epoch(
 
         geo_log = {}
         if geo_fn is not None:
-            x0_pred = schedule.predict_x0_from_eps(x_t, t, prediction.float())
-            sample_weight = schedule.x0_confidence_weight(t)
+            # to_x0 is a no-op for an x0-head (its output already IS x̂0) and the
+            # 1/√ᾱ_t conversion for an eps-head. geo_conf_weight follows: the ᾱ_t
+            # damping exists only to fade out that conversion's error amplification,
+            # so it is off by default under x0 (see schedule.x0_confidence_weight).
+            x0_pred = schedule.to_x0(prediction.float(), x_t, t)
+            sample_weight = schedule.x0_confidence_weight(t) if geo_conf_weight else None
             loss, geo_contrib = _add_geo_losses(
                 loss, x0_pred, motion.float(), attn_mask, geo_fn, geo_weights,
                 sample_weight=sample_weight)
@@ -165,6 +176,7 @@ def validate_one_epoch(
     ema_model, text_encoder, schedule, loader, device, epoch,
     snr_gamma=5.0,
     geo_fn=None, hml3d_pos_weight=0.0, hml3d_vel_weight=0.0, hml3d_foot_weight=0.0,
+    geo_conf_weight=True,
 ):
     ema_model.eval()
     torch.manual_seed(0)
@@ -190,11 +202,12 @@ def validate_one_epoch(
             prediction = ema_model(x_t, t, context, mask=attn_mask)
             # Mirror train_one_epoch's objective so the train/val curves are the
             # same quantity and can be overlaid in training_loss.png.
-            loss = _diffusion_loss(noise, prediction, attn_mask, schedule, t, snr_gamma)
+            target = schedule.diffusion_target(motion, noise)
+            loss = _diffusion_loss(target, prediction, attn_mask, schedule, t, snr_gamma)
 
         if geo_fn is not None:
-            x0_pred = schedule.predict_x0_from_eps(x_t, t, prediction.float())
-            sample_weight = schedule.x0_confidence_weight(t)
+            x0_pred = schedule.to_x0(prediction.float(), x_t, t)
+            sample_weight = schedule.x0_confidence_weight(t) if geo_conf_weight else None
             loss, _ = _add_geo_losses(
                 loss, x0_pred, motion.float(), attn_mask, geo_fn, geo_weights,
                 sample_weight=sample_weight)

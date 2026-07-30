@@ -106,7 +106,7 @@ def main():
         raise SystemExit(f"Expected 135-d SMPL-H stats, got {mean.shape[0]} at {args.smplh_data_root}.")
 
     text_encoder = build_text_encoder(config, device=device)
-    schedule = NoiseSchedule(timesteps=config.get("timesteps", 1000), device=device)
+    schedule = NoiseSchedule.from_config(config, device=device)
     editor = MotionEditor(model, schedule, device, is_group=True)
 
     mask_ts = (torch.linspace(1, schedule.T - 1, args.mask_timesteps).long().tolist()

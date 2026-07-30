@@ -22,8 +22,10 @@ source's own motion — not the word in the instruction.
 It is training-mode agnostic: it reuses the real editing stack (MotionEditor +
 masking.collect_statistics/build_mask), so it works for any checkpoint the editor
 works for — humanml3d (263-d) or smplh (135-d) features, GroupDiT or GroupCLR
-(U-Net) backbones (G=7 body-part groups), and the legacy flat MotionDiT (G=1, in
-which case only the temporal story is shown — the body-part axis does not exist).
+(U-Net) backbones, either token axis (group_mode: 7 body-part groups or 22 per-joint
+tokens — the group axis is read from the checkpoint, so the heatmaps scale to
+whichever it is), and the legacy flat MotionDiT (G=1, in which case only the
+temporal story is shown — the body-part axis does not exist).
 
 Two figures are written per source clip:
 
@@ -425,7 +427,7 @@ def main():
     mean = np.load(os.path.join(args.data_root, "Mean.npy"))
     std  = np.load(os.path.join(args.data_root, "Std.npy"))
     text_encoder = build_text_encoder(config, device=device)
-    schedule = NoiseSchedule(timesteps=config.get("timesteps", 1000), device=device)
+    schedule = NoiseSchedule.from_config(config, device=device)
 
     instructions = args.instructions or list(DEFAULT_INSTRUCTIONS)
     targets = resolve_targets(instructions, args.target_groups, group_mode)

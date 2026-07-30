@@ -77,7 +77,8 @@ class MotionEditor:
         it = tqdm(it, desc="Inversion", leave=False) if show_progress else it
         for t in it:
             t_b = torch.full((1,), t, device=self.device, dtype=torch.long)
-            eps = self.model(xs[t], t_b, context=None)                  # unconditional
+            # to_eps: identity for an eps-head, exact conversion for an x0-head.
+            eps = s.to_eps(self.model(xs[t], t_b, context=None), xs[t], t_b)  # uncond
             x0_pred = s.predict_x0_from_eps(xs[t], t_b, eps)
             mu = s.posterior_mean(x0_pred, xs[t], t_b)
             sigma = s.posterior_variance[t].clamp(min=1e-20).sqrt()
@@ -183,12 +184,16 @@ class MotionEditor:
         for t in it:
             t_b = torch.full((1,), t, device=self.device, dtype=torch.long)
 
-            eps_uncond = self.model(x, t_b, context=None)
+            # to_eps: identity for an eps-head, exact conversion for an x0-head. Note
+            # this keeps SEGA in eps space, so the 1/√ᾱ_t amplification (and hence
+            # guidance_alpha_floor) still applies under x0 — the x0-native Stage 3 of
+            # docs/AttentionGrounding_Options.md §5.3, which removes both, is not this.
+            eps_uncond = s.to_eps(self.model(x, t_b, context=None), x, t_b)
             eps_hat = eps_uncond
             # Gate guidance off at vanishing-√ᾱ steps to avoid x0-space divergence.
             if s.sqrt_alphas_cumprod[t] >= guidance_alpha_floor:
                 for ctx, m_ch, scale in zip(edit_contexts, m_channels, scales):
-                    eps_c   = self.model(x, t_b, ctx)
+                    eps_c   = s.to_eps(self.model(x, t_b, ctx), x, t_b)
                     eps_hat = eps_hat + scale * m_ch * (eps_c - eps_uncond)
 
             # reverse step reusing the stored edit-friendly noise z_t.

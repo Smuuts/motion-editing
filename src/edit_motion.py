@@ -219,7 +219,7 @@ def main():
     mean = np.load(os.path.join(args.data_root, "Mean.npy"))   # (D,) = 263 or 135
     std  = np.load(os.path.join(args.data_root, "Std.npy"))    # (D,)
     text_encoder = build_text_encoder(config, device=device)
-    schedule = NoiseSchedule(timesteps=config.get("timesteps", 1000), device=device)
+    schedule = NoiseSchedule.from_config(config, device=device)
 
     # ── source clip → normalised x0 + valid_frames ──────────────────────────────
     raw_feat, clip_id, length, src_caption = load_source(
