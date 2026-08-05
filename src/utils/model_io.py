@@ -1,6 +1,6 @@
 """
 Shared checkpoint loading for the inference/analysis scripts (generate.py,
-sample_model.py, edit_motion.py, analyse_attention.py, verify_backbone.py).
+sample_model.py, edit_motion.py, verify_backbone.py, the probe scripts).
 
 All of them do the same thing: read a checkpoint directory's config.json, build a
 matching model via model.dit.build_model, and load either the EMA or raw weights.

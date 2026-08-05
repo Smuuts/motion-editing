@@ -2,7 +2,7 @@
 Forward HumanML3D feature extraction: world-space joint positions (T, 22, 3)
 -> the 263-dim HumanML3D motion representation.
 
-This is the inverse of `utils.visualise.recover_from_ric` and a faithful, pure-NumPy
+This is the inverse of `utils.decode.recover_from_ric` and a faithful, pure-NumPy
 port of the official HumanML3D pipeline (uniform-skeleton retarget -> put on floor ->
 canonicalise facing to Z+ -> IK -> cont6d rotations + RIC positions + velocities +
 foot contacts). Quaternions are [w, x, y, z]; the channel layout matches

@@ -15,7 +15,7 @@ in MotionDiT / GroupDiT.  Both expose:
 
 token_info() is the tokenizer-agnostic entry point LEDITS++ Stage 2 uses to pick
 which columns of the L_text attention dimension belong to real instruction words
-(excluding BOS/EOS/padding) — see analyse_attention.py and the M1 mask.
+(excluding BOS/EOS/padding) — see editing/masking.py and the M1 mask.
 
 The unconditional ("null") branch is NOT provided here: the model owns a learned
 null_text_emb (used via context=None), which is what CFG dropout trains. A zero

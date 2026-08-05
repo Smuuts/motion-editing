@@ -1,0 +1,95 @@
+"""
+Decompose a mask's instruction-invariance into its LATERALITY and CATEGORY axes.
+
+One mean off-diagonal correlation conflates two very different failures — "left arm"
+vs "right arm" (same limb, other side) and "left arm" vs "left leg" (other limb) — and
+the project's history predicts these move apart (category is recoverable, laterality
+needs supervision; docs/FINDINGS.md). Splitting them is what makes a result readable;
+see docs/ARCHITECTURE.md "Mask instruction-invariance is reported decomposed".
+
+Also computed here:
+  align_*             share of the binary mask's active cells landing in the expected
+                      group, against the chance rate |target| / G,
+  laterality_contrast the named side's mass minus its mirror's, per instruction,
+  category_contrast   PAIRED within-clip arm/leg mass shift — an arm-instruction minus
+                      a leg-instruction on the SAME clip, so the source's own motion
+                      bias cancels and only the instruction-driven part survives.
+"""
+
+import numpy as np
+
+from utils.probe import flat_corr, group_profile, pairwise_corr
+from .instructions import (
+    CAT_PAIRS, DEFAULT_INSTRUCTIONS, DEFAULT_TARGETS, LAT_PAIRS, MIRROR,
+)
+
+
+def _axis_means(corr, pairs):
+    return float(np.mean([corr[i][j] for i, j in pairs]))
+
+
+def decompose(m1_maps, m2_maps, binaries, src_act, glabels,
+              instructions=DEFAULT_INSTRUCTIONS, targets=DEFAULT_TARGETS) -> dict:
+    """All per-clip statistics for one checkpoint × one clip, as a JSON-ready dict.
+
+    m1_maps / m2_maps : (F, G) arrays, one per instruction (from mask_probe).
+    binaries          : {mask_mode: [(F, G) binary maps]} — m1_only isolates what a
+                        grounded attention readout would drive, m2_only is the default.
+    """
+    G = len(glabels)
+    m1_corr, m2_corr = pairwise_corr(m1_maps), pairwise_corr(m2_maps)
+
+    res = {
+        "group_labels": glabels,
+        "instructions": list(instructions),
+        "m1_corr": m1_corr.tolist(),
+        "m2_corr": m2_corr.tolist(),
+        "m1_src_corr": [flat_corr(m, src_act) for m in m1_maps],
+        "m2_src_corr": [flat_corr(m, src_act) for m in m2_maps],
+        "src_profile": group_profile(src_act).tolist(),
+        "m1_profile": {e: group_profile(m).tolist() for e, m in zip(instructions, m1_maps)},
+        "m2_profile": {e: group_profile(m).tolist() for e, m in zip(instructions, m2_maps)},
+        "align_chance": 1.0 / G,
+    }
+
+    for key, corr in (("m1", m1_corr), ("m2", m2_corr)):
+        res[f"{key}_r_laterality"] = _axis_means(corr, LAT_PAIRS)
+        res[f"{key}_r_category"] = _axis_means(corr, CAT_PAIRS)
+        res[f"{key}_r_offdiag"] = float(np.mean(
+            [corr[i][j] for i in range(len(corr)) for j in range(len(corr)) if i != j]))
+
+    for mode, maps in binaries.items():
+        hits = []
+        for m, tgt in zip(maps, targets):
+            idx = [glabels.index(g) for g in tgt if g in glabels]
+            total = m.sum()
+            hits.append(float(m[:, idx].sum() / total) if total >= 1 and idx else 0.0)
+        res[f"align_{mode}"] = hits
+
+    for key, maps in (("m1", m1_maps), ("m2", m2_maps)):
+        profiles = [group_profile(m) for m in maps]
+        res[f"{key}_laterality_contrast"] = [
+            float(p[glabels.index(t[0])] - p[glabels.index(MIRROR[t[0]])])
+            for p, t in zip(profiles, targets)
+        ]
+        arm_instr = (profiles[0] + profiles[1]) / 2
+        leg_instr = (profiles[2] + profiles[3]) / 2
+        ai = [glabels.index("left_arm"), glabels.index("right_arm")]
+        li = [glabels.index("left_leg"), glabels.index("right_leg")]
+        res[f"{key}_category_contrast"] = {
+            "arm_mass_under_arm_instr": float(arm_instr[ai].sum()),
+            "arm_mass_under_leg_instr": float(leg_instr[ai].sum()),
+            "leg_mass_under_leg_instr": float(leg_instr[li].sum()),
+            "leg_mass_under_arm_instr": float(arm_instr[li].sum()),
+            "arm_shift": float(arm_instr[ai].sum() - leg_instr[ai].sum()),
+            "leg_shift": float(leg_instr[li].sum() - arm_instr[li].sum()),
+        }
+    return res
+
+
+def summary_row(res: dict) -> list[float]:
+    """The comparison table's columns, in header order."""
+    return [res["m1_r_category"], res["m1_r_laterality"], res["m1_r_offdiag"],
+            res["m2_r_category"], res["m2_r_laterality"], res["m2_r_offdiag"],
+            float(np.mean(res["m1_src_corr"])), float(np.mean(res["m2_src_corr"])),
+            float(np.mean(res["align_m1_only"])), float(np.mean(res["align_m2_only"]))]

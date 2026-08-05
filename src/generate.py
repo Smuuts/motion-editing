@@ -29,20 +29,17 @@ Usage:
 """
 
 import os
-import sys
 import json
 import argparse
 import numpy as np
 import torch
 from tqdm import tqdm
 
-src_dir = os.path.dirname(os.path.abspath(__file__))
-if src_dir not in sys.path:
-    sys.path.insert(0, src_dir)
-
+from data.clips import iter_split_clips
 from model.text_encoder import build_text_encoder
 from model.schedule import NoiseSchedule
 from model.sampler import DDPMSampler
+from utils.cli import resolve_device
 from utils.model_io import load_model
 
 
@@ -68,63 +65,13 @@ def parse_args():
     return p.parse_args()
 
 
-def load_split(data_root, split, max_frames, min_frames=16, max_clips=None, seed=42):
-    with open(os.path.join(data_root, f"{split}.txt")) as f:
-        all_ids = [l.strip() for l in f if l.strip()]
-
-    # Both reps share the HumanML3D layout: features in new_joint_vecs/, annotations in
-    # texts/ (and precomputed text_emb/ when present), all under data_root.
-    vec_dir      = os.path.join(data_root, "new_joint_vecs")
-    text_dir     = os.path.join(data_root, "texts")
-    text_emb_dir = os.path.join(data_root, "text_emb")
-    has_emb      = os.path.isdir(text_emb_dir)
-
-    clips = []
-    for cid in all_ids:
-        vec_path = os.path.join(vec_dir, f"{cid}.npy")
-        if not os.path.exists(vec_path):
-            continue
-        T_raw = int(np.load(vec_path, mmap_mode="r").shape[0])
-        if T_raw < min_frames:
-            continue
-
-        text_path = os.path.join(text_dir, f"{cid}.txt")
-        if not os.path.exists(text_path):
-            continue
-        with open(text_path) as f:
-            lines = [l.strip() for l in f if l.strip()]
-        if not lines:
-            continue
-        text = lines[0].split("#")[0].strip()
-
-        context_emb = None
-        if has_emb:
-            emb_path = os.path.join(text_emb_dir, f"{cid}.npy")
-            if os.path.exists(emb_path):
-                context_emb = np.load(emb_path)[0].astype(np.float32)
-
-        clips.append({
-            "id":          cid,
-            "text":        text,
-            "vec_path":    vec_path,
-            "T":           min(T_raw, max_frames),
-            "context_emb": context_emb,
-        })
-
-    rng = np.random.default_rng(seed)
-    rng.shuffle(clips)
-    if max_clips is not None:
-        clips = clips[:max_clips]
-    return clips
-
-
 def main():
     args = parse_args()
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device()
     print(f"Device: {device}")
 
     model, config = load_model(args.checkpoint, device, use_ema=not args.no_ema)
@@ -141,8 +88,9 @@ def main():
     sampler      = DDPMSampler(model, schedule, device)
 
     print(f"\nLoading '{args.split}' split …")
-    clips = load_split(args.data_root, args.split, max_frames,
-                       max_clips=args.max_clips, seed=args.seed)
+    clips = iter_split_clips(args.data_root, args.split, max_frames,
+                             max_clips=args.max_clips, seed=args.seed,
+                             with_text_emb=True)
     print(f"  {len(clips)} clips")
 
     succeeded = []

@@ -20,8 +20,6 @@ import torch
 import torch.nn as nn
 from scipy.ndimage import gaussian_filter1d
 from torch.amp import GradScaler, autocast
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, LinearLR, SequentialLR
 
 import matplotlib
 matplotlib.use("Agg")
@@ -31,7 +29,12 @@ from model.dit import build_model
 from model.sampler import DDPMSampler
 from model.schedule import NoiseSchedule
 from model.text_encoder import build_text_encoder, get_encoder_dims
-from utils.visualise import recover_from_ric, save_comparison_animation, mpjpe_from_joints
+from training.epoch import apply_cfg_dropout, diffusion_loss
+from training.optim import build_optimizer, build_scheduler
+from utils.cli import resolve_device
+from utils.decode import recover_from_ric
+from utils.skeleton import mpjpe_from_joints
+from utils.visualise import save_comparison_animation
 
 
 def parse_args():
@@ -83,13 +86,9 @@ def parse_args():
     return p.parse_args()
 
 
-def _recover_joints(raw_feat: np.ndarray, feature_mode: str) -> np.ndarray:
-    return recover_from_ric(raw_feat, joints_num=22)
-
-
 def main():
     args = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device()
     if device.type == "cuda":
         torch.cuda.empty_cache()
     print(f"Device: {device}")
@@ -155,59 +154,32 @@ def main():
                              predict_type=args.predict_type)
     scaler   = GradScaler(device=device.type, enabled=device.type == "cuda")
 
-    # ── optimiser + LR schedule (identical to train.py) ──────────────────────
-    optimizer = AdamW(model.parameters(), lr=args.lr,
-                      weight_decay=args.weight_decay, betas=(0.9, 0.999))
-    if args.no_lr_decay:
-        main_sched = LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
-    else:
-        main_sched = CosineAnnealingLR(
-            optimizer,
-            T_max=max(1, args.max_steps - args.warmup_steps),
-            eta_min=1e-6,
-        )
-    if args.warmup_steps > 0:
-        warmup    = LinearLR(optimizer, start_factor=0.01, end_factor=1.0,
-                             total_iters=args.warmup_steps)
-        scheduler = SequentialLR(optimizer, schedulers=[warmup, main_sched],
-                                 milestones=[args.warmup_steps])
-    else:
-        scheduler = main_sched
+    # optimiser + LR schedule, from the same builders train.py uses (per step here,
+    # per epoch there)
+    optimizer = build_optimizer(model, args.lr, args.weight_decay)
+    scheduler = build_scheduler(optimizer, args.max_steps, args.warmup_steps,
+                                decay=not args.no_lr_decay)
 
     # ── training loop ─────────────────────────────────────────────────────────
     print(f"\nMax steps: {args.max_steps}  |  batch_size: {B}"
           f"  |  snr_gamma={args.snr_gamma}  |  cfg_dropout={args.cfg_dropout}\n")
 
     model.train()
-    loss_mask = attn_mask.float().unsqueeze(-1)    # (B, F, 1)
-
     final_loss = float("inf")
     for step in range(1, args.max_steps + 1):
         t = torch.randint(0, schedule.T, (B,), device=device)
         x_t, noise = schedule.q_sample(motion, t)
 
-        # CFG dropout — same as train.py
-        if args.cfg_dropout > 0.0:
-            drop_mask  = (torch.rand(B, device=device) < args.cfg_dropout)[:, None, None]
-            null_emb   = model.null_text_emb.expand(B, -1, -1)
-            context_in = torch.where(drop_mask, null_emb, context)
-        else:
-            context_in = context
-
-        # loss — same as train.py
+        # CFG dropout and the objective come from training/epoch.py — the whole point
+        # of this script is to reproduce train.py's conditions, which a local copy of
+        # the loss could not guarantee.
+        context_in = apply_cfg_dropout(model, context, args.cfg_dropout)
         with autocast(device_type=device.type):
             prediction = model(x_t, t, context_in, mask=attn_mask)
             # ε or x0 per predict_type; min_snr_weight flips form to match.
-            target     = schedule.diffusion_target(motion, noise)
-            per_elem   = (target - prediction) ** 2 * loss_mask    # (B, T, D)
-
-            if args.snr_gamma > 0.0:
-                valid_elems = (attn_mask.float().sum(dim=1) * target.shape[-1]).clamp(min=1)
-                per_sample  = per_elem.sum(dim=(1, 2)) / valid_elems
-                snr_weight  = schedule.min_snr_weight(t, args.snr_gamma)
-                loss = (per_sample * snr_weight).mean()
-            else:
-                loss = per_elem.sum() / (loss_mask.sum() * target.shape[-1]).clamp(min=1)
+            target = schedule.diffusion_target(motion, noise)
+            loss = diffusion_loss(target, prediction, attn_mask, schedule, t,
+                                  args.snr_gamma)
 
         if not torch.isfinite(loss):
             optimizer.zero_grad()
@@ -252,8 +224,9 @@ def main():
     T_gt  = min(len(raw_full), args.max_frames)
     raw_gt = raw_full[:T_gt]
 
-    joints_gen = _recover_joints(motion_raw, args.feature_mode)
-    joints_gt  = _recover_joints(raw_gt,     args.feature_mode)
+    # overfit_one is humanml3d-only (263-d), so RIC recovery is the whole decode.
+    joints_gen = recover_from_ric(motion_raw, joints_num=22)
+    joints_gt  = recover_from_ric(raw_gt,     joints_num=22)
 
     if args.smooth_sigma > 0:
         joints_gen = gaussian_filter1d(joints_gen, sigma=args.smooth_sigma, axis=0)

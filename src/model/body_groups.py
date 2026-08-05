@@ -4,7 +4,7 @@ Body-part group definitions for the 22-joint HumanML3D/SMPL skeleton.
 These constants are shared by:
   - GroupDiT (model/dit.py)        — tokenises the 263-dim feature vector into
                                       one token per body-part group.
-  - analyse_attention.py           — labels the G-axis of attention heatmaps.
+  - analysis/ + utils/visualise/   — label the G-axis of attention heatmaps.
   - LEDITS++ Stage 2 masking       — reshapes (F*G) attention to (F, G) and maps
                                       LLM-named groups (e.g. "right_arm") to joints.
 
@@ -240,6 +240,22 @@ def named_token_indices(names: list[str], group_mode: str = "parts") -> list[int
             choices = axis if group_mode == "parts" else axis + list(_PART_TO_JOINT_TOKENS)
             raise ValueError(f"Unknown group/joint name {n!r}; choices: {choices}")
     return sorted(set(idxs))
+
+
+def axis_labels(names: list[str], group_mode: str = "parts") -> list[str]:
+    """Resolve part/joint names to the token-axis names of `group_mode` (deduplicated,
+    in axis order). The name-level counterpart of `named_token_indices` — in 'joints'
+    mode a coarse part name expands to its joint tokens. Raises ValueError on an
+    unknown name."""
+    axis = group_names(group_mode)
+    return [axis[i] for i in named_token_indices(names, group_mode)]
+
+
+def parse_axis_spec(spec: str, group_mode: str = "parts") -> list[str]:
+    """"left_arm,right_arm" / "left_arm right_arm" → token-axis names (see axis_labels).
+    The one place a user-typed group specification is interpreted."""
+    return axis_labels([n.strip() for n in spec.replace(",", " ").split() if n.strip()],
+                       group_mode)
 
 
 def resolve_group_context(config: dict) -> tuple[str, bool, str, list[str]]:

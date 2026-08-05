@@ -28,7 +28,10 @@ Builds, per edit instruction, a binary mask M = M1 ∩ M2 in (frame × group) sp
                          motion energy (psi_group_norm) for the same reason.
 
 Both masks are accumulated over the stored inversion timesteps x_t, so the mask is
-averaged over the whole trajectory rather than read off a single noise level.
+averaged over the whole trajectory rather than read off a single noise level. That
+average is a raw magnitude sum by default, so an evenly-spaced sweep is NOT an even
+average — and M1's and M2's signals do not live at the same noise levels anyway. See
+`per_step_norm` / `attn_timesteps` / `psi_timesteps` in collect_statistics.
 
 Group axis:
   GroupDiT  → G = 7 body-part groups (root + 6), giving true spatiotemporal masks.
@@ -43,8 +46,8 @@ import torch
 
 from model.body_groups import GROUP_CHANNELS, N_GROUPS
 
-# Same set as analyse_attention.py's _STOP_WORDS: function words + generic caption
-# vocabulary that carry no body-part/action semantics for mask purposes.
+# Function words + generic caption vocabulary that carry no body-part/action
+# semantics for mask purposes.
 _STOP_WORDS = {
     "a", "an", "the",
     "person", "man", "woman", "human", "someone",
@@ -134,6 +137,47 @@ def _attn_readout_value(avg: torch.Tensor, tok: torch.Tensor, sem: torch.Tensor,
     raise ValueError(f"unknown attn_readout {readout!r}")
 
 
+def _normalise_step(values: torch.Tensor, valid_frames) -> torch.Tensor:
+    """
+    Scale one timestep's (F, G) map to unit mean over valid frames.
+
+    The sweep accumulates raw magnitudes, and both quantities' scale varies strongly
+    with t (measured on an x0 checkpoint: M1 draws ~48% of its total from t ≥ 750,
+    ψ ~68% from t < 250 — see docs/FINDINGS.md). So an evenly-spaced grid still
+    produces a magnitude-weighted average, in which a handful of large-scale steps
+    decide the mask. Dividing each step by its own mean makes every swept t
+    contribute equally, which is what the even grid was meant to express. Relative
+    structure within a step — the only thing the percentile threshold reads — is
+    untouched.
+    """
+    cells = values[valid_frames] if valid_frames is not None else values
+    scale = cells.mean().clamp_min(1e-12)
+    return values / scale
+
+
+def _resolve_sweep(timesteps, override, T):
+    """Timestep list for one mask: its own override if given, else the shared sweep."""
+    ts = override if override is not None else timesteps
+    return list(range(1, T)) if ts is None else list(ts)
+
+
+def build_sweep(num_steps, T, lo=1, hi=None):
+    """
+    `num_steps` evenly-spaced timesteps inside [lo, hi] (default: the whole
+    trajectory, i.e. exactly the historical `linspace(1, T-1, num_steps)`).
+
+    Narrowing the window *resamples within it* rather than discarding steps, so a
+    10%-wide window is swept as densely as the full range — which matters because the
+    windows that carry the most signal are also the ones a uniform grid samples most
+    thinly (docs/FINDINGS.md).
+    """
+    hi = T - 1 if hi is None else min(hi, T - 1)
+    lo = max(1, lo)
+    if lo > hi:
+        raise ValueError(f"empty timestep window [{lo}, {hi}]")
+    return torch.linspace(lo, hi, num_steps).long().tolist()
+
+
 def _percentile_threshold(values: torch.Tensor, valid_frames: torch.Tensor,
                           percentile: float) -> torch.Tensor:
     """
@@ -151,7 +195,8 @@ def _percentile_threshold(values: torch.Tensor, valid_frames: torch.Tensor,
 def collect_statistics(model, schedule, xs, context_edit, token_idxs,
                        is_group, timesteps=None, need_attn=True,
                        group_channels=None, context_ref=None, psi_group_norm=False,
-                       valid_frames=None, attn_readout="raw", semantic_idxs=None):
+                       valid_frames=None, attn_readout="raw", semantic_idxs=None,
+                       attn_timesteps=None, psi_timesteps=None, per_step_norm=False):
     """
     Sweep the stored inversion sequence and accumulate the raw quantities for M1/M2.
 
@@ -187,10 +232,26 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
                     "renorm_spatial" — renorm rows, then spatial-normalise columns.
     semantic_idxs : stop-word-filtered subset of token_idxs (semantic_token_subset).
                     Required for the non-"raw" readouts; defaults to token_idxs.
+    attn_timesteps: sweep for M1 only, overriding `timesteps`. M1 and M2 are read off
+                    the same trajectory but their signal does not live at the same
+                    noise levels — on an x0 checkpoint M1's instruction-sensitivity
+                    strengthens monotonically toward high t, while ψ's is flat and its
+                    magnitude is concentrated at low t (docs/FINDINGS.md). A single
+                    shared sweep cannot serve both; these two arguments let each mask
+                    be read where its own signal is. None → use `timesteps`.
+    psi_timesteps : sweep for M2 only, overriding `timesteps`. None → use `timesteps`.
+    per_step_norm : scale each timestep's map to unit mean before accumulating, so the
+                    returned average weights every swept t equally instead of by its
+                    magnitude (see _normalise_step). Default False = historical
+                    behaviour.
 
     Returns (attn_fg, psi_fg), both (F, G):
       attn_fg — mean semantic cross-attention per (frame, group) (zeros if need_attn=False)
       psi_fg  — mean |ε_c − ε_ref| per (frame, group)
+
+    Only one forward pass per (t, conditioning) is ever run: a t needed by both masks
+    shares its conditional pass, and the reference pass is skipped for t that only M1
+    needs — so splitting the sweeps never costs more compute than the union of them.
     """
     T = schedule.T
     F = xs.shape[2]
@@ -202,15 +263,19 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
         G = 1
     else:
         G = len(group_channels) if group_channels is not None else N_GROUPS
-    if timesteps is None:
-        timesteps = range(1, T)
+    # Per-mask sweeps. They coincide unless a caller overrides one of them, in which
+    # case the loop runs over the union and each accumulator only takes the steps it
+    # asked for.
+    m1_ts = set(_resolve_sweep(timesteps, attn_timesteps, T)) if need_attn else set()
+    m2_ts = set(_resolve_sweep(timesteps, psi_timesteps, T))
+    sweep = sorted(m1_ts | m2_ts)
 
     device = context_edit.device
     # ψ reference: source-caption embedding if given, else None → the model falls
     # back to its learned null_text_emb (original behaviour).
     attn_accum = torch.zeros(F, G, device=device)
     psi_accum  = torch.zeros(F, G, device=device)
-    n = 0
+    n_attn = n_psi = 0
 
     tok = (torch.as_tensor(token_idxs, device=device, dtype=torch.long)
            if need_attn else None)
@@ -221,36 +286,41 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
     # sweep) instead of rebuilding it from group_channels every iteration.
     agg_matrix = (_group_aggregation_matrix(group_channels or GROUP_CHANNELS, device)
                   if is_group else None)
-    for t in timesteps:
+    for t in sweep:
+        want_attn, want_psi = t in m1_ts, t in m2_ts
         x_t = xs[t].to(device)
         t_b = torch.full((1,), t, device=device, dtype=torch.long)
 
-        # ε_θ(x_t, c_edit), with attention capture only when M1 is needed.
+        # ε_θ(x_t, c_edit), with attention capture only when M1 wants this step.
         # schedule.to_eps is the identity for an eps-head and the exact x0->eps
         # conversion for an x0-head (Option 5). NB under x0 this yields ψ_ε, which
         # equals √SNR_t · ψ_x0 — the same mask at any fixed t, but a
         # low-noise-weighted MIXTURE across the sweep (§5.3). The x0-native M2 is a
         # separate change; this shim only makes an x0 checkpoint run at all.
-        eps_c = schedule.to_eps(
-            model(x_t, t_b, context_edit, store_attn=need_attn), x_t, t_b)
-        if need_attn:
+        out_c = model(x_t, t_b, context_edit, store_attn=want_attn)
+        if want_attn:
             # M1 contribution
             layer_maps = model.get_attn_maps()                # list of (1, h, N, L)
             stacked = torch.stack(layer_maps, dim=0).float()  # (Lyr, 1, h, N, L)
             avg = stacked.mean(dim=(0, 1, 2))                 # (N, L)
-            attn_accum += _attn_readout_value(avg, tok, sem, attn_readout).reshape(F, G)
+            step = _attn_readout_value(avg, tok, sem, attn_readout).reshape(F, G)
+            attn_accum += _normalise_step(step, valid_frames) if per_step_norm else step
+            n_attn += 1
 
-        # ψ = ε_θ(x_t, c_edit) − ε_θ(x_t, ref) → M2 contribution
-        eps_r = schedule.to_eps(model(x_t, t_b, context_ref), x_t, t_b)
-        psi = (eps_c - eps_r)[0].abs()                        # (F, D)
-        psi_accum += psi @ agg_matrix if is_group else psi.mean(dim=-1, keepdim=True)
-        n += 1
+        if want_psi:
+            # ψ = ε_θ(x_t, c_edit) − ε_θ(x_t, ref) → M2 contribution
+            eps_c = schedule.to_eps(out_c, x_t, t_b)
+            eps_r = schedule.to_eps(model(x_t, t_b, context_ref), x_t, t_b)
+            psi = (eps_c - eps_r)[0].abs()                    # (F, D)
+            step = psi @ agg_matrix if is_group else psi.mean(dim=-1, keepdim=True)
+            psi_accum += _normalise_step(step, valid_frames) if per_step_norm else step
+            n_psi += 1
 
-    psi_fg = psi_accum / max(n, 1)
+    psi_fg = psi_accum / max(n_psi, 1)
     if psi_group_norm and is_group:
         energy = _group_motion_energy(xs[0][0].to(device), valid_frames, agg_matrix)
         psi_fg = psi_fg / energy[None, :]
-    return attn_accum / max(n, 1), psi_fg
+    return attn_accum / max(n_attn, 1), psi_fg
 
 
 # mask_mode -> (semantic source | None, use_m2). The two mask components are

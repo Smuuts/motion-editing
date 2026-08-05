@@ -2,7 +2,7 @@
 Per-epoch train/validate loops for train.py.
 
 Both loops compute the same Min-SNR-weighted (or plain) diffusion MSE and, when
-enabled, the same MDM-style geometric losses — factored into _diffusion_loss and
+enabled, the same MDM-style geometric losses — factored into diffusion_loss and
 _add_geo_losses so the train/val objectives can't silently drift apart.
 """
 
@@ -11,7 +11,7 @@ import torch.nn as nn
 from torch.amp import autocast
 from tqdm import tqdm
 
-from utils.masks import length_to_mask
+from utils.padding import length_to_mask
 
 
 def _batch_lengths(batch, device):
@@ -21,11 +21,25 @@ def _batch_lengths(batch, device):
     return torch.as_tensor(lengths, device=device)
 
 
-def _diffusion_loss(target, prediction, attn_mask, schedule, t, snr_gamma):
+def apply_cfg_dropout(model, context, cfg_dropout):
+    """Replace a `cfg_dropout` fraction of the batch's conditioning with the learned
+    null embedding.
+
+    null_text_emb must keep its gradient so CFG scale > 1 works at inference. This also
+    trains the unconditional branch used by LEDITS++ Stage 1 inversion (context=None)
+    and the ε_θ(x_t, ∅) term in Stage 3 Eq. 1.
+    """
+    if cfg_dropout <= 0.0:
+        return context
+    B = context.shape[0]
+    drop = (torch.rand(B, device=context.device) < cfg_dropout)[:, None, None]
+    return torch.where(drop, model.null_text_emb.expand(B, -1, -1), context)
+
+
+def diffusion_loss(target, prediction, attn_mask, schedule, t, snr_gamma):
     """Min-SNR-weighted (or plain) MSE between the target and the network output,
-    masked to valid (non-padding) frames. Shared by train_one_epoch and
-    validate_one_epoch so the train/val curves are the same quantity and can be
-    overlaid.
+    masked to valid (non-padding) frames. Shared by train_one_epoch,
+    validate_one_epoch and overfit_one.py, so the three cannot drift apart.
 
     `target` is whatever the network predicts — ε or the clean signal x0, per
     `schedule.predict_type` (use `schedule.diffusion_target(x0, noise)` to pick it).
@@ -91,13 +105,7 @@ def train_one_epoch(
         else:
             with torch.no_grad():
                 context = text_encoder.encode(batch["text"])
-        if cfg_dropout > 0.0:
-            drop_mask = (torch.rand(B, device=device) < cfg_dropout)[:, None, None]
-            # null_text_emb must keep its gradient so CFG scale > 1 works at inference.
-            # CFG dropout also trains the unconditional branch used by LEDITS++ Stage 1
-            # inversion (context=None) and the ε_θ(x_t, ∅) term in Stage 3 Eq. 1.
-            null_emb  = model.null_text_emb.expand(B, -1, -1)
-            context   = torch.where(drop_mask, null_emb, context)
+        context = apply_cfg_dropout(model, context, cfg_dropout)
 
         attn_mask = length_to_mask(_batch_lengths(batch, device), motion.shape[1])
 
@@ -110,7 +118,7 @@ def train_one_epoch(
             prediction = model(x_t, t, context, mask=attn_mask,
                                entropy_layer=ent_layer)
             target = schedule.diffusion_target(motion, noise)
-            loss = _diffusion_loss(target, prediction, attn_mask, schedule, t, snr_gamma)
+            loss = diffusion_loss(target, prediction, attn_mask, schedule, t, snr_gamma)
 
         entropy_log = {}
         if ent_layer is not None:
@@ -203,7 +211,7 @@ def validate_one_epoch(
             # Mirror train_one_epoch's objective so the train/val curves are the
             # same quantity and can be overlaid in training_loss.png.
             target = schedule.diffusion_target(motion, noise)
-            loss = _diffusion_loss(target, prediction, attn_mask, schedule, t, snr_gamma)
+            loss = diffusion_loss(target, prediction, attn_mask, schedule, t, snr_gamma)
 
         if geo_fn is not None:
             x0_pred = schedule.to_x0(prediction.float(), x_t, t)

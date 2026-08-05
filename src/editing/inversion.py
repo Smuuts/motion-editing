@@ -92,7 +92,8 @@ class MotionEditor:
                       lambda_attn=70.0, lambda_noise=70.0, timesteps=None,
                       mask_mode="m2_only", llm_group_masks=None,
                       context_source=None, m2_group_norm=False,
-                      attn_readout="raw", semantic_idxs_per_edit=None):
+                      attn_readout="raw", semantic_idxs_per_edit=None,
+                      attn_timesteps=None, psi_timesteps=None, per_step_norm=False):
         """
         Build one mask dict per edit instruction (see masking.build_mask).
 
@@ -113,6 +114,11 @@ class MotionEditor:
         semantic_idxs_per_edit : stop-word-filtered token index lists (one per edit,
                                masking.semantic_token_subset); used by the non-"raw"
                                readouts. Defaults to token_idxs_per_edit.
+        attn_timesteps / psi_timesteps : per-mask sweeps overriding `timesteps` (M1 and
+                               M2 carry their signal at different noise levels — see
+                               masking.collect_statistics). None → shared `timesteps`.
+        per_step_norm        : weight every swept timestep equally instead of by its
+                               magnitude (see masking._normalise_step).
         """
         need_attn = mask_mode in ("attn", "m1_only")
         if token_idxs_per_edit is None:
@@ -133,6 +139,8 @@ class MotionEditor:
                 context_ref=context_source, psi_group_norm=m2_group_norm,
                 valid_frames=valid_frames,
                 attn_readout=attn_readout, semantic_idxs=sem,
+                attn_timesteps=attn_timesteps, psi_timesteps=psi_timesteps,
+                per_step_norm=per_step_norm,
             )
             masks.append(masking.build_mask(
                 attn_fg, psi_fg, valid_frames, self.is_group,

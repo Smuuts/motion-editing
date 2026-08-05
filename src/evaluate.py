@@ -1,74 +1,60 @@
 """
-evaluate.py — compute FID and R-Precision using the T2M evaluator.
+evaluate.py — FID, R-Precision, MM-Dist and Diversity with the T2M evaluator.
 
-FID and R-Precision use the pretrained T2M evaluator (Guo et al., 2022) and
-are directly comparable to MDM, MLD, MotionDiffuse, and other HumanML3D papers.
-MPJPE is also reported for internal tracking but is not a standard benchmark metric.
+These use the pretrained T2M evaluator (Guo et al., 2022), so they are directly
+comparable to MDM, MLD, MotionDiffuse and other HumanML3D papers. MPJPE is also
+reported for internal tracking but is not a standard benchmark metric. Metric
+definitions and the rep-aware decode live in src/eval/t2m_metrics.py.
 
 Required files in --evaluator_dir:
   checkpoint/finest.tar              — text_mot_match/model/finest.tar
-  glove/our_vab_data.npy             — GloVe word vectors
-  glove/our_vab_words.pkl
-  glove/our_vab_idx.pkl
-  t2m/Comp_v6_KLD01/meta/mean.npy    — evaluator's own normalisation
-  t2m/Comp_v6_KLD01/meta/std.npy
-
-Text is read from the HumanML3D text files' pre-tagged `word/POS` tokens —
-no spaCy / re-tokenisation needed (that would shift the text embeddings).
+  glove/our_vab_{data.npy,words.pkl,idx.pkl}
+  t2m/Comp_v6_KLD01/meta/{mean,std}.npy   — the evaluator's own normalisation
 
 Usage:
-    python src/evaluate.py \\
-        --generated_dir generated/val \\
-        --data_root     data/HumanML3D \\
-        --evaluator_dir data/t2m_evaluator \\
-        --experiment_name val \\
-        [--output_dir   eval_results] \\
-        [--pool_size 32] \\
-        [--smooth_sigma 1.5] \\
-        [--seed 42]
+    python src/evaluate.py --generated_dir generated/val --data_root data/HumanML3D \\
+        --evaluator_dir data/t2m_evaluator --experiment_name val
 """
 
 import os
-import sys
 import json
 import argparse
+
 import numpy as np
 import torch
-from scipy.linalg import sqrtm
 from scipy.ndimage import gaussian_filter1d
 from tqdm import tqdm
-
-src_dir = os.path.dirname(os.path.abspath(__file__))
-if src_dir not in sys.path:
-    sys.path.insert(0, src_dir)
 
 import matplotlib
 matplotlib.use("Agg")
 
+from eval.t2m_metrics import (
+    build_decoders, compute_diversity, compute_fid, compute_mm_dist,
+    compute_r_precision, load_generated,
+)
 from model.t2m_eval import T2MEvaluator
-from utils.visualise import recover_from_ric, mpjpe_from_joints
-from data.hml3d_features import extract_hml3d_features, get_tgt_offsets
+from utils.cli import resolve_device
+from utils.skeleton import mpjpe_from_joints
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--generated_dir", required=True,
-                   help="Directory written by generate.py (contains .npz files + manifest.json).")
+                   help="Directory written by generate.py (.npz files + manifest.json).")
     p.add_argument("--data_root",     required=True,
-                   help="Processed HumanML3D root — texts/ (R-Precision), 263 Mean/Std "
-                        "(humanml3d MPJPE), and new_joints/ (smplh tgt-offset reference).")
-    p.add_argument("--smplh_feat_root", default=None,
-                   help="smplh mode only: dir with the 135-d feature Mean/Std used to "
-                        "denormalise the generated clips (defaults to manifest['data_root']).")
-    p.add_argument("--smplh_model_path", default="data/motionfix/data/body_models/smplh",
-                   help="smplh mode only: SMPLHLayer dir (needs SMPLH_NEUTRAL.npz).")
+                   help="Processed HumanML3D root — texts/ (R-Precision), 263 Mean/Std, "
+                        "and new_joints/ (smplh tgt-offset reference).")
     p.add_argument("--evaluator_dir", required=True,
-                   help="Root of T2M evaluator files (e.g. data/t2m_evaluator).")
+                   help="Root of the T2M evaluator files (e.g. data/t2m_evaluator).")
     p.add_argument("--experiment_name", required=True,
-                   help="Experiment name — results are written to "
-                        "<output_dir>/results_<experiment_name>.json.")
+                   help="Results go to <output_dir>/results_<experiment_name>.json.")
+    p.add_argument("--smplh_feat_root", default=None,
+                   help="smplh only: dir with the 135-d Mean/Std used to denormalise "
+                        "(defaults to manifest['data_root']).")
+    p.add_argument("--smplh_model_path", default="data/motionfix/data/body_models/smplh",
+                   help="smplh only: SMPLHLayer dir (needs SMPLH_NEUTRAL.npz).")
     p.add_argument("--eval_meta_dir", default=None,
-                   help="Dir with the T2M evaluator's own Mean/std.npy "
+                   help="Dir with the evaluator's own Mean/std.npy "
                         "(default: <evaluator_dir>/t2m/Comp_v6_KLD01/meta).")
     p.add_argument("--output_dir",    default="./eval_results")
     p.add_argument("--pool_size",     type=int,   default=32)
@@ -79,151 +65,16 @@ def parse_args():
     return p.parse_args()
 
 
-def load_generated(generated_dir, data_root):
-    manifest_path = os.path.join(generated_dir, "manifest.json")
-    with open(manifest_path) as f:
-        manifest = json.load(f)
+def mpjpe_over_clips(clips, to_joints, smooth_sigma):
+    """Per-clip root-relative MPJPE between the generated and GT decodes."""
+    values = []
+    for clip in tqdm(clips, desc="MPJPE"):
+        joints = [to_joints(clip[k]) for k in ("gen_norm", "gt_norm")]
+        if smooth_sigma > 0:
+            joints = [gaussian_filter1d(j, sigma=smooth_sigma, axis=0) for j in joints]
+        values.append(mpjpe_from_joints(*joints)[1])
+    return np.array(values)
 
-    text_dir = os.path.join(data_root, "texts")
-    clips = []
-    for cid in manifest["clip_ids"]:
-        npz_path  = os.path.join(generated_dir, f"{cid}.npz")
-        text_path = os.path.join(text_dir, f"{cid}.txt")
-        if not os.path.exists(npz_path):
-            print(f"  [WARN] missing {npz_path}, skipping")
-            continue
-        if not os.path.exists(text_path):
-            print(f"  [WARN] missing text for {cid}, skipping")
-            continue
-
-        data = np.load(npz_path)
-        with open(text_path) as f:
-            lines = [l.strip() for l in f if l.strip()]
-        if not lines:
-            continue
-        # HumanML3D format: caption#word/POS word/POS ...#start#end
-        # Use the pre-tagged tokens (field 1) — same preprocessing the T2M
-        # evaluator was trained on. Re-tokenising would shift the embeddings.
-        parts  = lines[0].split("#")
-        text   = parts[0].strip()
-        tokens = parts[1].strip().split() if len(parts) > 1 and parts[1].strip() else []
-
-        clips.append({
-            "id":       cid,
-            "gen_norm": data["gen_norm"],   # (T, 263)
-            "gt_norm":  data["gt_norm"],    # (T, 263)
-            "text":     text,
-            "tokens":   tokens,
-            "T":        int(data["T"]),
-        })
-    return clips, manifest
-
-
-# ── FID ───────────────────────────────────────────────────────────────────────
-
-def compute_fid(real_feats, gen_feats):
-    mu_r, mu_g = real_feats.mean(0), gen_feats.mean(0)
-    sig_r = np.cov(real_feats.T)
-    sig_g = np.cov(gen_feats.T)
-    diff    = mu_r - mu_g
-    covmean = sqrtm(sig_r @ sig_g)
-    if np.iscomplexobj(covmean):
-        covmean = covmean.real
-    return float(diff @ diff + np.trace(sig_r + sig_g - 2 * covmean))
-
-
-# ── R-Precision ───────────────────────────────────────────────────────────────
-
-def compute_r_precision(motion_embs, text_embs, pool_size=32, top_k=(1, 2, 3), seed=0):
-    N = len(motion_embs)
-    counts = {k: 0 for k in top_k}
-    rng = np.random.default_rng(seed)
-
-    for i in tqdm(range(N), desc="R-Precision", leave=False):
-        neg_pool = [j for j in range(N) if j != i]
-        n_neg    = min(pool_size - 1, len(neg_pool))
-        neg_idx  = rng.choice(neg_pool, size=n_neg, replace=False)
-        pool_idx = np.concatenate([[i], neg_idx])
-
-        m_emb  = motion_embs[i]        # (512,)
-        t_embs = text_embs[pool_idx]   # (pool, 512)
-        dists  = np.sqrt(((m_emb - t_embs) ** 2).sum(axis=-1))
-        rank   = int(np.where(np.argsort(dists) == 0)[0][0]) + 1
-
-        for k in top_k:
-            if rank <= k:
-                counts[k] += 1
-
-    return {k: counts[k] / N for k in top_k}
-
-
-# ── Multimodal Distance ─────────────────────────────────────────────────────────
-
-def compute_mm_dist(motion_embs, text_embs):
-    """Mean Euclidean distance between each motion and its own caption embedding.
-    Lower = better text-motion alignment (R-Precision's continuous counterpart)."""
-    return float(np.sqrt(((motion_embs - text_embs) ** 2).sum(axis=-1)).mean())
-
-
-# ── Diversity ───────────────────────────────────────────────────────────────────
-
-def compute_diversity(motion_embs, diversity_times=300, seed=0):
-    """Mean distance between randomly paired motion embeddings.
-    Detects mode collapse — should be close to the ground-truth diversity."""
-    n     = len(motion_embs)
-    times = min(diversity_times, n)
-    rng   = np.random.default_rng(seed)
-    first  = rng.choice(n, times, replace=False)
-    second = rng.choice(n, times, replace=False)
-    return float(np.sqrt(((motion_embs[first] - motion_embs[second]) ** 2).sum(axis=-1)).mean())
-
-
-# ── Feature decoding (rep-aware) ────────────────────────────────────────────────
-#
-# The T2M evaluator only understands 263-d HumanML3D features, so smplh-generated
-# clips (135-d) are decoded to joints via SMPL forward kinematics and re-extracted into
-# 263-d features. Both gen AND gt go through the identical path so the FID stays a
-# self-consistent comparison. The decode is: raw135 -> Y-up joints (smplh_decode_to_joints)
-# -> extract_hml3d_features -> raw263.
-
-def build_decoders(feature_mode, args, manifest, mean, std):
-    """Return (to_raw263, to_joints): closures mapping a *normalised* motion (as stored in
-    the .npz) to raw 263-d HumanML3D features and to (T, 22, 3) Y-up joints respectively."""
-    if feature_mode != "smplh":
-        def to_raw263(m_norm):
-            return (m_norm * std + mean).astype(np.float32)
-        def to_joints(m_norm):
-            return recover_from_ric((m_norm * std + mean).astype(np.float32), joints_num=22)
-        return to_raw263, to_joints
-
-    # smplh: denormalise with the 135-d feature stats, FK to joints, re-extract 263.
-    import smplx
-    from data.smplh_features import smplh_decode_to_joints
-
-    feat_root = args.smplh_feat_root or manifest.get("data_root")
-    if feat_root is None:
-        raise ValueError("smplh eval needs the 135-d feature Mean/Std: pass --smplh_feat_root "
-                         "or regenerate so manifest['data_root'] is present.")
-    smplh_mean = np.load(os.path.join(feat_root, "Mean.npy"))
-    smplh_std  = np.load(os.path.join(feat_root, "Std.npy"))
-    body_model = smplx.SMPLHLayer(model_path=args.smplh_model_path, gender="neutral", ext="npz").eval()
-
-    # Rest-pose skeleton to retarget onto: taken once from a reference HumanML3D clip.
-    ref_dir = os.path.join(args.data_root, "new_joints")
-    ref_files = sorted(f for f in os.listdir(ref_dir) if f.endswith(".npy"))
-    tgt_offsets = get_tgt_offsets(np.load(os.path.join(ref_dir, ref_files[0])))
-
-    def to_joints(m_norm):
-        raw135 = (m_norm * smplh_std + smplh_mean).astype(np.float32)
-        return smplh_decode_to_joints(raw135, body_model)     # (T, 22, 3) Y-up
-
-    def to_raw263(m_norm):
-        return extract_hml3d_features(to_joints(m_norm), tgt_offsets)   # (T-1, 263)
-
-    return to_raw263, to_joints
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     args = parse_args()
@@ -231,7 +82,7 @@ def main():
     torch.manual_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device()
     print(f"Device: {device}")
 
     print(f"\nLoading generated clips from {args.generated_dir} …")
@@ -249,89 +100,64 @@ def main():
         device=device,
     )
 
-    feature_mode = manifest.get("feature_mode", "humanml3d")
-    # Robustness: manifests from older runs lack feature_mode — infer from the stored dim.
-    if clips and clips[0]["gen_norm"].shape[-1] == 135:
-        feature_mode = "smplh"
+    # Manifests from older runs lack feature_mode — infer it from the stored dim.
+    feature_mode = ("smplh" if clips[0]["gen_norm"].shape[-1] == 135
+                    else manifest.get("feature_mode", "humanml3d"))
     print(f"Feature mode: {feature_mode}")
 
     mean = np.load(os.path.join(args.data_root, "Mean.npy"))
     std  = np.load(os.path.join(args.data_root, "Std.npy"))
+    to_raw263, to_joints = build_decoders(
+        feature_mode, mean, std, args.data_root,
+        smplh_feat_root=args.smplh_feat_root or manifest.get("data_root"),
+        smplh_model_path=args.smplh_model_path)
 
-    # The T2M evaluator was trained with its OWN normalisation, which differs
-    # from the HumanML3D training Mean/Std. Motions must be denormalised to raw
-    # then renormalised with the evaluator's stats before encoding, otherwise
+    # The evaluator was trained with its OWN normalisation. Motions must be
+    # denormalised to raw and renormalised with its stats before encoding, or
     # cross-modal alignment (R-Precision) collapses.
     eval_meta = args.eval_meta_dir or os.path.join(
         args.evaluator_dir, "t2m", "Comp_v6_KLD01", "meta")
     eval_mean = np.load(os.path.join(eval_meta, "mean.npy"))
     eval_std  = np.load(os.path.join(eval_meta, "std.npy"))
 
-    # Rep-aware decode: humanml3d passes through; smplh runs SMPL-FK -> re-extract 263.
-    to_raw263, to_joints = build_decoders(feature_mode, args, manifest, mean, std)
-
     def to_eval_norm(motion_norm):
-        raw = to_raw263(motion_norm)
-        return ((raw - eval_mean) / eval_std).astype(np.float32)
+        return ((to_raw263(motion_norm) - eval_mean) / eval_std).astype(np.float32)
 
-    # ── MPJPE (non-standard, internal tracking only) ───────────────────────────
     print("\n── MPJPE (internal, not comparable to literature) ──────────────────────────")
-    mpjpe_values = []
-    for clip in tqdm(clips, desc="MPJPE"):
-        joints_gen = to_joints(clip["gen_norm"])
-        joints_gt  = to_joints(clip["gt_norm"])
-        if args.smooth_sigma > 0:
-            joints_gen = gaussian_filter1d(joints_gen, sigma=args.smooth_sigma, axis=0)
-            joints_gt  = gaussian_filter1d(joints_gt,  sigma=args.smooth_sigma, axis=0)
-        _, clip_mpjpe, _ = mpjpe_from_joints(joints_gen, joints_gt)
-        mpjpe_values.append(clip_mpjpe)
+    mpjpe = mpjpe_over_clips(clips, to_joints, args.smooth_sigma)
+    print(f"MPJPE   {mpjpe.mean()*1000:.2f} ± {mpjpe.std()*1000:.2f} mm  (N={N})")
 
-    mpjpe_arr = np.array(mpjpe_values)
-    print(f"MPJPE   {mpjpe_arr.mean()*1000:.2f} ± {mpjpe_arr.std()*1000:.2f} mm  (N={N})")
-
-    # ── T2M embeddings ────────────────────────────────────────────────────────
     print("\n── Encoding motions and texts …")
-    gen_motions = [to_eval_norm(c["gen_norm"]) for c in clips]
-    gt_motions  = [to_eval_norm(c["gt_norm"])  for c in clips]
-    token_lists = [c["tokens"] for c in clips]
-
-    gen_embs  = evaluator.encode_motion(tqdm(gen_motions, desc="  gen motions"))
-    gt_embs   = evaluator.encode_motion(tqdm(gt_motions,  desc="  gt  motions"))
-    text_embs = evaluator.encode_text(token_lists)
+    gen_embs = evaluator.encode_motion(
+        tqdm([to_eval_norm(c["gen_norm"]) for c in clips], desc="  gen motions"))
+    gt_embs = evaluator.encode_motion(
+        tqdm([to_eval_norm(c["gt_norm"]) for c in clips], desc="  gt  motions"))
+    text_embs = evaluator.encode_text([c["tokens"] for c in clips])
     print(f"  embedding dim: {gen_embs.shape[1]}")
 
-    # ── FID ───────────────────────────────────────────────────────────────────
-    print("\n── FID ─────────────────────────────────────────────────────────────────────")
     fid = compute_fid(gt_embs, gen_embs)
-    print(f"FID     {fid:.4f}  (T2M feature space — comparable to MDM / MLD / MotionDiffuse)")
+    print(f"\nFID     {fid:.4f}  (T2M feature space — comparable to MDM / MLD / MotionDiffuse)")
 
-    # ── R-Precision ───────────────────────────────────────────────────────────
-    print("\n── R-Precision ─────────────────────────────────────────────────────────────")
     effective_pool = min(args.pool_size, N)
-    r_prec = compute_r_precision(gen_embs, text_embs,
-                                  pool_size=effective_pool, seed=args.seed)
+    r_prec = compute_r_precision(gen_embs, text_embs, pool_size=effective_pool,
+                                 seed=args.seed)
     for k, v in sorted(r_prec.items()):
         print(f"R-Prec@{k} {v:.4f}")
 
-    # ── Multimodal Distance ────────────────────────────────────────────────────
-    print("\n── Multimodal Distance ─────────────────────────────────────────────────────")
     mm_dist = compute_mm_dist(gen_embs, text_embs)
     print(f"MM-Dist {mm_dist:.4f}  (lower = better; distance to own caption)")
 
-    # ── Diversity ──────────────────────────────────────────────────────────────
-    print("\n── Diversity ───────────────────────────────────────────────────────────────")
     div_gen = compute_diversity(gen_embs, args.diversity_times, seed=args.seed)
     div_gt  = compute_diversity(gt_embs,  args.diversity_times, seed=args.seed)
     print(f"Diversity (gen) {div_gen:.4f}   (real motions: {div_gt:.4f} — closer is better)")
 
-    # ── Save ──────────────────────────────────────────────────────────────────
     summary = {
         "generated_dir": args.generated_dir,
         "evaluator_dir": args.evaluator_dir,
         "feature_mode":  feature_mode,
         "n_clips":       N,
-        "mpjpe_mean_mm": round(float(mpjpe_arr.mean() * 1000), 4),
-        "mpjpe_std_mm":  round(float(mpjpe_arr.std()  * 1000), 4),
+        "mpjpe_mean_mm": round(float(mpjpe.mean() * 1000), 4),
+        "mpjpe_std_mm":  round(float(mpjpe.std() * 1000), 4),
         "fid":           round(fid, 6),
         "r_precision":   {f"top_{k}": round(v, 6) for k, v in r_prec.items()},
         "mm_dist":       round(mm_dist, 6),

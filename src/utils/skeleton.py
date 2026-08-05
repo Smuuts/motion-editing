@@ -1,8 +1,12 @@
 """
-MDM-style geometric losses and MPJPE for the 22-joint HumanML3D skeleton,
-operating directly on the 263-dim feature representation.
+MDM-style geometric losses and MPJPE for the 22-joint HumanML3D skeleton.
+
+The losses and `compute_mpjpe` operate directly on the (normalised) feature
+representation, on torch tensors, inside the training loop; `mpjpe_from_joints` is the
+numpy counterpart used by the offline scripts, which already hold decoded joints.
 """
 
+import numpy as np
 import torch
 
 # Parent joint index for each of the 22 joints (-1 = root).
@@ -239,3 +243,19 @@ def compute_mpjpe(
         return dist.sum() / (mask.float().sum() * 22).clamp(min=1)
 
     return dist.mean()
+
+
+def mpjpe_from_joints(joints_a: np.ndarray, joints_b: np.ndarray):
+    """Root-relative MPJPE between two decoded joint sequences.
+
+    joints_a, joints_b : (T, J, 3) world-space positions in the same joint order.
+                         Joint 0 is treated as the root and subtracted out.
+    Only the overlapping frame range is compared if the lengths differ.
+
+    Returns (per_frame (T_common,), mean: float, T_common: int).
+    """
+    T_common = min(len(joints_a), len(joints_b))
+    a = joints_a[:T_common] - joints_a[:T_common, 0:1]
+    b = joints_b[:T_common] - joints_b[:T_common, 0:1]
+    per_frame = np.sqrt(((a - b) ** 2).sum(axis=-1)).mean(axis=-1)  # (T_common,)
+    return per_frame, float(per_frame.mean()), T_common

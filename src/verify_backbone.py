@@ -20,25 +20,21 @@ Usage:
 """
 
 import os
-import sys
 import argparse
 import json
 
 import torch
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
-src_dir = os.path.dirname(os.path.abspath(__file__))
-if src_dir not in sys.path:
-    sys.path.insert(0, src_dir)
 
 from model.text_encoder import build_text_encoder
 from model.schedule import NoiseSchedule
 from data.dataset import build_dataloader
+from utils.cli import resolve_device
 from utils.skeleton import compute_mpjpe
 from utils.model_io import load_model
-from utils.masks import length_to_mask
+from utils.padding import length_to_mask
+from utils.visualise import plot_noise_level_sweep
 
 
 def parse_args():
@@ -61,7 +57,7 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device()
     print(f"Device: {device}")
 
     model, config = load_model(args.checkpoint, device)
@@ -158,33 +154,8 @@ def main():
     with open(os.path.join(args.output_dir, "results.json"), "w") as f:
         json.dump(results, f, indent=2)
 
-    # ── Plot ───────────────────────────────────────────────────────────────────
-    ts = sorted(results.keys())
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-
-    ax = axes[0]
-    ax.plot(ts, [results[t]["cond"]   for t in ts], "o-",  label="conditional (text)")
-    ax.plot(ts, [results[t]["uncond"] for t in ts], "s--", label="unconditional (null)")
-    ax.set_xlabel("Noise level  t")
-    ax.set_ylabel("One-step x̂₀  MPJPE (m)")
-    ax.set_title("One-step reconstruction quality vs. noise level")
-    ax.legend()
-    ax.grid(True, linestyle="--", alpha=0.4)
-
-    ax = axes[1]
-    ax.plot(ts, [results[t]["noise_mse"] for t in ts], "o-", color="tab:green")
-    ax.set_xlabel("Noise level  t")
-    ax.set_ylabel("Noise prediction  MSE")
-    ax.set_title("Noise MSE (conditional) vs. noise level")
-    ax.axhline(1.0, color="red", linestyle=":", label="random baseline (MSE=1)")
-    ax.legend()
-    ax.grid(True, linestyle="--", alpha=0.4)
-
-    fig.tight_layout()
-    plot_path = os.path.join(args.output_dir, "mpjpe_vs_noise_level.png")
-    fig.savefig(plot_path, dpi=150)
-    plt.close(fig)
-    print(f"\nPlot saved → {plot_path}")
+    plot_noise_level_sweep(
+        results, os.path.join(args.output_dir, "mpjpe_vs_noise_level.png"))
 
     # ── Verdict ────────────────────────────────────────────────────────────────
     best_t      = min(args.noise_levels)

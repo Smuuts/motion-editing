@@ -18,12 +18,9 @@ from model.layers import (
     TimestepEmbedding, FramePositionalEmbedding, DiTBlock, resolve_context_and_mask,
 )
 
-# Body-part group definitions live in their own module because they are also
-# consumed by the LEDITS++ masking code (Stage 2 M1 + LLM-fallback mask) and by
-# analyse_attention.py. GROUP_NAMES is re-exported here for backward compatibility
-# with `from model.dit import GROUP_NAMES`.
+# Body-part group definitions live in their own module (model/body_groups.py) because
+# the LEDITS++ masking code and the probe scripts consume them too.
 from model.body_groups import (
-    GROUP_NAMES,
     group_layout as _group_layout,
     is_grouped_mode as _is_grouped_mode,
 )

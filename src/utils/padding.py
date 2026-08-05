@@ -1,4 +1,4 @@
-"""Small tensor-mask helpers shared by the training and analysis scripts."""
+"""Padding-mask helpers: sequence lengths -> per-frame boolean masks."""
 
 import torch
 

@@ -123,3 +123,5 @@ results/
 checkpoints/
 generated/
 graphify-out/
+.claude/
+CLAUDE.md

@@ -1,0 +1,63 @@
+"""
+Statistics shared by the mask/attention probe scripts.
+
+These are the quantities every probe reports against a baseline: how similar two maps
+are (`flat_corr`), what the source clip does on its own (`source_activity` — the
+instruction-independent reference the implicit masks are measured against), and where
+a map puts its mass across body-part groups (`group_profile`).
+"""
+
+import numpy as np
+import torch
+
+from editing import masking
+
+
+def flat_corr(a, b) -> float:
+    """Pearson r between two arrays' flattened values; 0 if either is constant."""
+    a, b = np.asarray(a).ravel(), np.asarray(b).ravel()
+    if a.std() < 1e-12 or b.std() < 1e-12:
+        return 0.0
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def pairwise_corr(maps) -> np.ndarray:
+    """(n, n) matrix of flat_corr between every pair of maps."""
+    n = len(maps)
+    return np.array([[flat_corr(maps[i], maps[j]) for j in range(n)] for i in range(n)])
+
+
+def source_activity(x0, group_channels, is_group=True) -> np.ndarray:
+    """(F, G) per-(frame, group) source motion energy |Δx0|, with a zero first frame.
+
+    This is the reference every mask is compared against: it depends only on the source
+    clip, so a mask that correlates with it is a source-dynamics detector.
+    """
+    diff = (x0[0][1:] - x0[0][:-1]).abs()                        # (F-1, D)
+    if is_group:
+        act = torch.stack([diff[:, ch].mean(dim=-1) for ch in group_channels], dim=-1)
+    else:
+        act = diff.mean(dim=-1, keepdim=True)                    # (F-1, 1)
+    return torch.cat([act[:1] * 0, act], dim=0).cpu().numpy()    # (F, G)
+
+
+def group_profile(fg) -> np.ndarray:
+    """(F, G) map → per-group marginal (mean over frames) normalised to sum 1."""
+    v = np.asarray(fg).mean(axis=0)
+    s = v.sum()
+    return v / s if s > 1e-12 else v
+
+
+def resolve_sweeps(mask_timesteps, T, m1_window=None, m2_window=None):
+    """(shared_ts, m1_ts, m2_ts) timestep sweeps for mask collection.
+
+    `None` on a per-mask window keeps that mask on the shared sweep, so the default run
+    is a single even sweep over the whole trajectory. A window is resampled to the same
+    number of steps *inside* the window (denser sampling, not fewer points) — M1 and M2
+    carry their signal at different noise levels, see docs/FINDINGS.md.
+    """
+    shared = masking.build_sweep(mask_timesteps, T) if mask_timesteps else None
+    n = mask_timesteps or T - 1
+    m1 = masking.build_sweep(n, T, *m1_window) if m1_window else None
+    m2 = masking.build_sweep(n, T, *m2_window) if m2_window else None
+    return shared, m1, m2
