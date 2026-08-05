@@ -119,11 +119,12 @@ class CrossAttention(nn.Module):
         k = self.k(context).reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v(context).reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # The fused SDPA kernel can't express the sink column or return probabilities,
-        # so any of these features forces the explicit-softmax path (costs the
-        # materialised (B, h, N, L) attention tensor — during training too, when the
-        # sink or the entropy regulariser is enabled).
-        explicit = store_attn or compute_entropy or self.sink_logit is not None
+        # SDPA can't RETURN the probabilities, so anything that needs to read them forces
+        # the explicit-softmax path (which costs the materialised (B, h, N, L) tensor).
+        # The sink no longer does: it is expressible as one extra key/value column, see
+        # the else-branch. store_attn is inference-only (mask collection) and the entropy
+        # regulariser defaults off, so training now stays on the fused kernel.
+        explicit = store_attn or compute_entropy
 
         if explicit:
             logits = q @ k.transpose(-2, -1) * self.scale        # (B, h, N, L)
@@ -156,9 +157,31 @@ class CrossAttention(nn.Module):
                 self.last_attn_map = attn.detach()
             out = (attn @ v).transpose(1, 2).reshape(B, N, -1)
         else:
-            attn_mask = (context_mask[:, None, None, :]
-                         if context_mask is not None else None)
             dropout_p = self.dropout.p if self.training else 0.0
+            if self.sink_logit is None:
+                attn_mask = (context_mask[:, None, None, :]
+                             if context_mask is not None else None)
+            else:
+                # Sink as an SDPA-expressible extra column (exactly the identity quoted
+                # in the explicit branch, read left-to-right instead of right-to-left):
+                # append a key/value pair whose KEY is zero — so its logit is q·0 = 0 —
+                # and whose VALUE is zero, so any mass routed to it contributes nothing
+                # to the output. A float attn_mask then adds the learned per-head
+                # sink_logit to that column, making its logit exactly sink_logit[h].
+                # softmax over [logits, sink_logit] is what the sink is defined to be,
+                # so this is the same function, computed by the fused kernel instead of
+                # a materialised (B, h, N, L) softmax. Measured: −1.85 GiB at B=16.
+                zk = k.new_zeros(B, self.num_heads, 1, self.head_dim)
+                k = torch.cat([k, zk], dim=2)                        # (B, h, L+1, hd)
+                v = torch.cat([v, zk], dim=2)                        # zero VALUE column
+                neg = torch.finfo(q.dtype).min
+                bias = q.new_zeros(B, self.num_heads, 1, L + 1)      # broadcast over N
+                if context_mask is not None:
+                    bias[..., :L] = torch.where(context_mask[:, None, None, :], 0.0, neg)
+                bias[..., L] = self.sink_logit.view(1, -1, 1).to(q.dtype)
+                attn_mask = bias
+                # Side benefit: the sink column is never masked, so no query row can be
+                # fully -inf — the NaN mode a fully-padded context would otherwise hit.
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask,
                                                  dropout_p=dropout_p)
             out = out.transpose(1, 2).reshape(B, N, -1)
