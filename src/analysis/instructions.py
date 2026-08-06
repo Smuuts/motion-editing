@@ -19,6 +19,21 @@ DEFAULT_INSTRUCTIONS = [
 ]
 DEFAULT_TARGETS = [["left_arm"], ["right_arm"], ["left_leg"], ["right_leg"]]
 
+# The same four contrasts phrased the way HumanML3D annotates motion — third person and
+# descriptive, not imperative. The editor sends imperatives, so the imperative set is the
+# right one for probing the *editing* pathway; but anything that asks the model to
+# *generate* (Option 6) is querying a text-to-motion model with a phrasing its training
+# captions never use, and a negative there could be a distribution-shift artefact rather
+# than a statement about body-part grounding. Same order, same targets, so the two sets
+# are interchangeable and their numbers are directly comparable.
+DESCRIPTIVE_INSTRUCTIONS = [
+    "a person raises their left arm",
+    "a person raises their right arm",
+    "a person kicks with their left leg",
+    "a person kicks with their right leg",
+]
+PHRASINGS = {"instruction": DEFAULT_INSTRUCTIONS, "descriptive": DESCRIPTIVE_INSTRUCTIONS}
+
 MIRROR = {"left_arm": "right_arm", "right_arm": "left_arm",
           "left_leg": "right_leg", "right_leg": "left_leg"}
 LAT_PAIRS = [(0, 1), (2, 3)]                    # same limb, opposite side

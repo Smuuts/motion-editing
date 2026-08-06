@@ -5,7 +5,14 @@ These are the quantities every probe reports against a baseline: how similar two
 are (`flat_corr`), what the source clip does on its own (`source_activity` — the
 instruction-independent reference the implicit masks are measured against), and where
 a map puts its mass across body-part groups (`group_profile`).
+
+`wilson_ci`/`accuracy_block` are the shared *forced-choice* reporting: several probes
+ask a question a constant bias cannot win (chance exactly 0.5) and must report the
+answer with a CI and with which side of chance it falls on, so those two live here
+rather than in whichever script needed them first.
 """
+
+import math
 
 import numpy as np
 import torch
@@ -46,6 +53,33 @@ def group_profile(fg) -> np.ndarray:
     v = np.asarray(fg).mean(axis=0)
     s = v.sum()
     return v / s if s > 1e-12 else v
+
+
+def wilson_ci(k, n, z=1.96):
+    """Binomial 95 % CI (Wilson) — sane at small n and near 0/1, unlike the normal one."""
+    if n == 0:
+        return (0.0, 0.0)
+    p = k / n
+    d = 1 + z * z / n
+    c = p + z * z / (2 * n)
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    return ((c - half) / d, (c + half) / d)
+
+
+def accuracy_block(wins, label, chance=0.5):
+    """A forced-choice result with its CI and *which side of chance* it falls on.
+
+    `below_chance` is a real state, not a failed pass: it means the loser won
+    systematically, i.e. the thing being probed has a fixed preference independent of
+    the input — the exact bias a forced-choice design is built to expose.
+    """
+    n = len(wins)
+    k = int(np.sum(wins))
+    lo, hi = wilson_ci(k, n)
+    lo, hi = max(0.0, lo), min(1.0, hi)
+    return {"label": label, "n": n, "correct": k,
+            "accuracy": k / n if n else 0.0, "ci95": [lo, hi], "chance": chance,
+            "beats_chance": lo > chance, "below_chance": hi < chance}
 
 
 def resolve_sweeps(mask_timesteps, T, m1_window=None, m2_window=None):

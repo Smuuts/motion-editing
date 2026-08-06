@@ -10,6 +10,34 @@ import json
 import os
 import sys
 
+import torch
+
+# --amp_dtype name -> torch dtype. fp32 disables autocast's reduced precision entirely
+# (the GradScaler is disabled with it, since there is nothing to scale).
+AMP_DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
+
+
+def resolve_amp_dtype(name: str) -> torch.dtype:
+    """`--amp_dtype` -> the dtype autocast runs the forward in.
+
+    "auto" (the default) picks **bf16 wherever the hardware supports it**, else fp16.
+    The two carry the same ~3 decimal digits of precision, but bf16 keeps fp32's
+    exponent range (max ~3.4e38) where fp16 saturates at 65504 — so an activation that
+    merely grows large produces a finite number instead of an `inf` that turns the loss
+    non-finite and the step into a no-op. This project has lost two runs to exactly that
+    (see docs/FINDINGS.md "fp16 activation overflow"), so "auto" deliberately does not
+    mean "whatever the previous default was".
+
+    Resumed runs keep whatever they trained with (config.py's compat default is fp16),
+    so an existing run's numerics do not change under it.
+    """
+    if name == "auto":
+        return (torch.bfloat16 if torch.cuda.is_available()
+                and torch.cuda.is_bf16_supported() else torch.float16)
+    if name not in AMP_DTYPES:
+        raise ValueError(f"amp_dtype must be 'auto' or one of {sorted(AMP_DTYPES)}, got {name!r}")
+    return AMP_DTYPES[name]
+
 
 def explicit_cli_keys(parser, argv=None) -> set[str]:
     """Arg dest names that were explicitly passed on the command line — the difference
@@ -53,7 +81,7 @@ def _merge_resumed(config, cli_keys, output_dir):
             config[k] = v
 
     for key, legacy in (("ctx_pad_mask", False), ("attn_sink", False),
-                        ("predict_type", "eps")):
+                        ("predict_type", "eps"), ("amp_dtype", "fp16")):
         if key not in saved and key not in cli_keys:
             config[key] = legacy
             print(f"Resume: saved config predates {key} — keeping {legacy!r} to match "

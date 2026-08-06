@@ -13,6 +13,13 @@ from tqdm import tqdm
 
 from utils.padding import length_to_mask
 
+# Fraction of an epoch's steps that may be dropped for a non-finite loss before
+# train_one_epoch gives up. Past this the run is not "recovering slowly": with almost no
+# gradient reaching the optimiser it cannot climb back out, and `ema.update_from` runs so
+# rarely that even the validation curve freezes — which is exactly what a run diverging
+# into fp16 overflow looks like from the outside. Fail loudly instead of burning the night.
+MAX_SKIP_FRACTION = 0.5
+
 
 def _batch_lengths(batch, device):
     lengths = batch["length"]
@@ -84,7 +91,7 @@ def train_one_epoch(
     loader, device, cfg_dropout, logger, epoch, log_every,
     snr_gamma=5.0,
     geo_fn=None, hml3d_pos_weight=0.0, hml3d_vel_weight=0.0, hml3d_foot_weight=0.0,
-    attn_entropy_weight=0.0, geo_conf_weight=True,
+    attn_entropy_weight=0.0, geo_conf_weight=True, amp_dtype=torch.float16,
 ):
     model.train()
     total_loss = 0.0
@@ -116,7 +123,7 @@ def train_one_epoch(
         # still receives the same pressure.
         ent_layer = (int(torch.randint(len(model.blocks), (1,)).item())
                      if use_entropy else None)
-        with autocast(device_type=device.type):
+        with autocast(device_type=device.type, dtype=amp_dtype):
             prediction = model(x_t, t, context, mask=attn_mask,
                                entropy_layer=ent_layer)
             target = schedule.diffusion_target(motion, noise)
@@ -194,6 +201,15 @@ def train_one_epoch(
               f"non-finite loss. This is divergence, not noise — the reported loss is a "
               f"mean over the {n_counted} surviving steps only.")
         logger.log({"train/skipped_steps": n_skipped, "train/epoch": epoch})
+    if n_skipped > MAX_SKIP_FRACTION * len(loader):
+        raise RuntimeError(
+            f"Epoch {epoch}: {n_skipped}/{len(loader)} steps had a non-finite loss "
+            f"(> {MAX_SKIP_FRACTION:.0%}). Almost no gradient is reaching the optimiser, so "
+            f"the run cannot recover on its own and every further epoch is wasted compute. "
+            f"Most likely cause is an fp16 activation overflow in the forward pass (fp16 "
+            f"saturates at 65504): re-run with --amp_dtype bf16 if the GPU supports it, or "
+            f"resume from a checkpoint before the first skipped epoch with a lower --lr. "
+            f"See docs/FINDINGS.md 'fp16 activation overflow'.")
     geo_epoch = {}
     if geo_fn is not None:
         # Raw (unweighted) per-epoch means — see the comment above geo_log for why
@@ -211,7 +227,7 @@ def validate_one_epoch(
     ema_model, text_encoder, schedule, loader, device, epoch,
     snr_gamma=5.0,
     geo_fn=None, hml3d_pos_weight=0.0, hml3d_vel_weight=0.0, hml3d_foot_weight=0.0,
-    geo_conf_weight=True,
+    geo_conf_weight=True, amp_dtype=torch.float16,
 ):
     ema_model.eval()
     torch.manual_seed(0)
@@ -233,7 +249,7 @@ def validate_one_epoch(
 
         attn_mask = length_to_mask(_batch_lengths(batch, device), motion.shape[1])
 
-        with autocast(device_type=device.type):
+        with autocast(device_type=device.type, dtype=amp_dtype):
             prediction = ema_model(x_t, t, context, mask=attn_mask)
             # Mirror train_one_epoch's objective so the train/val curves are the
             # same quantity and can be overlaid in training_loss.png.

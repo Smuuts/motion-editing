@@ -17,11 +17,15 @@ from .animation import (
 )
 from .diagnostics import plot_noise_level_sweep
 from .heatmaps import mean_off_diagonal
-from .masks import plot_mask_problem, plot_mask_quant, save_mask_heatmap
+from .masks import (
+    plot_gen_diff, plot_gen_diff_summary, plot_mask_problem, plot_mask_quant,
+    save_mask_heatmap,
+)
 
 __all__ = [
     "CHAIN_COLORS", "KINEMATIC_CHAIN",
     "save_animation", "save_comparison_animation", "show_animation",
     "plot_noise_level_sweep", "mean_off_diagonal",
+    "plot_gen_diff", "plot_gen_diff_summary",
     "plot_mask_problem", "plot_mask_quant", "save_mask_heatmap",
 ]

@@ -53,7 +53,6 @@ Usage
 
 import os
 import json
-import math
 import argparse
 
 import numpy as np
@@ -63,6 +62,7 @@ from analysis.scorers import build_scorer
 from data.clips import load_clip, read_tagged_caption, split_ids
 from data.text_tags import verify_against_dataset
 from utils.cli import resolve_device
+from utils.probe import accuracy_block
 
 # Pairs of DEFAULT_INSTRUCTIONS indices that differ ONLY in the laterality word.
 INSTRUCTION_PAIRS = LAT_PAIRS
@@ -127,37 +127,9 @@ def caption_side(text):
     return "left" if li < ri else "right"
 
 
-# ── statistics ──────────────────────────────────────────────────────────────────
-
-def wilson_ci(k, n, z=1.96):
-    """Binomial 95 % CI (Wilson) — sane at small n and near 0/1, unlike the normal one."""
-    if n == 0:
-        return (0.0, 0.0)
-    p = k / n
-    d = 1 + z * z / n
-    c = p + z * z / (2 * n)
-    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
-    return ((c - half) / d, (c + half) / d)
-
-
-def accuracy_block(wins, label):
-    """A forced-choice result with its CI and *which side of chance* it falls on.
-
-    `below_chance` is a real state, not a failed pass: on Part B it means the preferred
-    side did not flip when the motion was mirrored, i.e. the scorer has a fixed
-    preference for one instruction regardless of the motion — the exact bias the design
-    is built to expose.
-    """
-    n = len(wins)
-    k = int(np.sum(wins))
-    lo, hi = wilson_ci(k, n)
-    lo, hi = max(0.0, lo), min(1.0, hi)
-    return {"label": label, "n": n, "correct": k,
-            "accuracy": k / n if n else 0.0, "ci95": [lo, hi],
-            "beats_chance": lo > 0.5, "below_chance": hi < 0.5}
-
-
 # ── the three measurements ──────────────────────────────────────────────────────
+# `wilson_ci` / `accuracy_block` (the forced-choice reporting) live in utils/probe.py,
+# shared with the other probes that ask a question a constant bias cannot win.
 
 def part_a(scorer, embs, pairs):
     """Mirrored caption × mirrored motion: does each motion prefer its own caption?"""

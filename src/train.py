@@ -125,6 +125,12 @@ def build_parser():
                    help="Epochs spent linearly warming the LR from 1%% to target.")
     p.add_argument("--no_lr_decay",  action="store_true",
                    help="Keep the learning rate constant (no cosine decay).")
+    p.add_argument("--amp_dtype", default="auto", choices=["auto", "fp16", "bf16", "fp32"],
+                   help="Autocast dtype for the forward pass. 'auto' (default) = bf16 "
+                        "where the GPU supports it, else fp16. bf16 has fp32's exponent "
+                        "range, so a large activation stays finite instead of becoming an "
+                        "inf that makes the loss non-finite and the step a no-op. Resumed "
+                        "runs keep what they trained with.")
     p.add_argument("--resume",       type=str, default=None,
                    help="Checkpoint dir to resume from, or 'latest'. Missing args are "
                         "filled from --output_dir/config.json (explicit CLI args win).")

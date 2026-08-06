@@ -91,3 +91,58 @@ class DDPMSampler:
             x = self.schedule.p_sample(x, t_batch, eps)
 
         return x[0]  # (length, 263)
+
+    @torch.no_grad()
+    def sample_paired(
+        self,
+        contexts: torch.Tensor,       # (B, L, context_dim) one text embedding per row
+        length: int = 120,
+        guidance_scale: float = 4.0,
+        num_steps: int | None = None,
+        generator: torch.Generator | None = None,
+        show_progress: bool = True,
+    ) -> torch.Tensor:
+        """Generate one motion per context row along ONE shared noise path. (B, F, D).
+
+        Identical to `sample` except that the initial x_T and every posterior draw z_t
+        are drawn once and reused across the batch, so two rows can only diverge through
+        their text. That is the paired-sample trick Option 6 is built on
+        (docs/AttentionGrounding_Options.md): with independent noise, two generations of
+        the same prompt already differ everywhere, and the text-driven difference is not
+        recoverable from a single pair.
+
+        The pairing is exact, not approximate: rows that carry the *same* context stay
+        bitwise identical for all T steps, which is what `probe_gen_diff.py` asserts as
+        its plumbing check. Note that the shared z_t makes the rows statistically
+        dependent — this returns a matched set for differencing, not B i.i.d. samples.
+        """
+        self.model.eval()
+        B = contexts.shape[0]
+        D = self.model.input_dim
+
+        if num_steps is None:
+            num_steps = self.schedule.T
+        if num_steps != self.schedule.T:
+            raise ValueError(
+                f"DDPMSampler only supports full-resolution sampling (num_steps == "
+                f"schedule.T == {self.schedule.T}); got num_steps={num_steps}.")
+
+        def shared_noise():
+            """One (1, F, D) draw, broadcast to the whole batch."""
+            return torch.randn(1, length, D, device=self.device,
+                               generator=generator).expand(B, -1, -1)
+
+        x = shared_noise().contiguous()
+
+        timesteps = list(range(self.schedule.T - 1, 0, -1))
+        it = tqdm(timesteps, desc="Sampling (paired)") if show_progress else timesteps
+
+        for t in it:
+            t_batch = torch.full((B,), t, device=self.device, dtype=torch.long)
+            eps_cond = self.schedule.to_eps(self.model(x, t_batch, contexts), x, t_batch)
+            eps_uncond = self.schedule.to_eps(
+                self.model(x, t_batch, context=None), x, t_batch)
+            eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+            x = self.schedule.p_sample(x, t_batch, eps, noise=shared_noise())
+
+        return x  # (B, length, D)

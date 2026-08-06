@@ -18,6 +18,7 @@ from data.dataset import build_dataloader
 from model.dit import build_model
 from model.schedule import NoiseSchedule
 from model.text_encoder import build_text_encoder, get_encoder_dims
+from training.config import resolve_amp_dtype
 from training.epoch import train_one_epoch, validate_one_epoch
 from training.optim import build_optimizer, build_scheduler
 from training.plotting import save_loss_graph
@@ -116,8 +117,15 @@ class Trainer:
 
         self.ema = EMA(self.model, decay=c["ema_decay"])
         self.schedule = NoiseSchedule.from_config(c, device=self.device)
+        # GradScaler exists to keep fp16 GRADIENTS out of the subnormal range. bf16 has
+        # fp32's exponent range and fp32 needs no scaling at all, so it is enabled for
+        # fp16 only — leaving it on under bf16 costs a pointless inf-check per step.
+        self.amp_dtype = resolve_amp_dtype(c.get("amp_dtype", "auto"))
         self.scaler = GradScaler(device=self.device.type,
-                                 enabled=self.device.type == "cuda")
+                                 enabled=(self.device.type == "cuda"
+                                          and self.amp_dtype is torch.float16))
+        print(f"AMP: autocast dtype {str(self.amp_dtype).replace('torch.', '')}"
+              f"{'  (GradScaler on)' if self.scaler.is_enabled() else '  (GradScaler off)'}")
 
     def _build_text_encoder(self, context_dim, text_seq_len):
         """None when precomputed embeddings exist (the encoder is never loaded), after
@@ -175,6 +183,7 @@ class Trainer:
                 hml3d_foot_weight=self.geo_weights["foot"],
                 attn_entropy_weight=c["attn_entropy_weight"],
                 geo_conf_weight=self.geo_conf_weight,
+                amp_dtype=self.amp_dtype,
             )
             # Read the LR used for the epoch that just ran BEFORE advancing the
             # scheduler — get_last_lr() after step() reports next epoch's LR.
@@ -217,6 +226,7 @@ class Trainer:
                 hml3d_vel_weight=self.geo_weights["vel"],
                 hml3d_foot_weight=self.geo_weights["foot"],
                 geo_conf_weight=self.geo_conf_weight,
+                amp_dtype=self.amp_dtype,
             )
         self.val_losses.append((epoch, val_loss))
         self.logger.log({"val/epoch_loss": val_loss, "val/epoch": epoch})

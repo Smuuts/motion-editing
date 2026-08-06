@@ -183,11 +183,15 @@ def build_sweep(num_steps, T, lo=1, hi=None):
     return torch.linspace(lo, hi, num_steps).long().tolist()
 
 
-def _percentile_threshold(values: torch.Tensor, valid_frames: torch.Tensor,
-                          percentile: float) -> torch.Tensor:
+def percentile_threshold(values: torch.Tensor, valid_frames: torch.Tensor,
+                         percentile: float) -> torch.Tensor:
     """
     Binarise (F, G) values, keeping entries above the given percentile of the
     distribution over valid (non-padding) frames. percentile=70 keeps the top 30%.
+
+    Public because the probes binarise candidate mask maps of their own (Option 6's
+    generation-space divergence, say) and their alignment numbers are only comparable to
+    the editor's if the mask is cut the same way.
     """
     valid_vals = values[valid_frames].flatten()
     if valid_vals.numel() == 0:
@@ -415,7 +419,7 @@ def build_mask(attn_fg, psi_fg, valid_frames, is_group,
     # edited across ALL groups. See the docstring for why we trust only this axis.
     if mask_mode == "temporal":
         activity = psi_fg.sum(dim=1, keepdim=True)                    # (F, 1)
-        active   = _percentile_threshold(activity, valid_frames, lambda_noise)  # (F, 1) bool
+        active   = percentile_threshold(activity, valid_frames, lambda_noise)  # (F, 1) bool
         m_group  = (valid & active).expand(-1, psi_fg.shape[1]).clone()
         if llm_group_mask is not None:
             gm = llm_group_mask.to(m_group.device, dtype=torch.bool)
@@ -432,7 +436,7 @@ def build_mask(attn_fg, psi_fg, valid_frames, is_group,
     if semantic_source is None:
         m_sem = None
     elif semantic_source == "attn":
-        m_sem = _percentile_threshold(attn_fg, valid_frames, lambda_attn)
+        m_sem = percentile_threshold(attn_fg, valid_frames, lambda_attn)
     else:  # "groups"
         if llm_group_mask is None:
             raise ValueError(f"mask_mode={mask_mode!r} requires llm_group_mask (F, G) or (G,).")
@@ -441,7 +445,7 @@ def build_mask(attn_fg, psi_fg, valid_frames, is_group,
             m_sem = m_sem[None, :].expand(valid_frames.shape[0], -1)
 
     # noise component (M2)
-    m2 = _percentile_threshold(psi_fg, valid_frames, lambda_noise) if use_m2 else None
+    m2 = percentile_threshold(psi_fg, valid_frames, lambda_noise) if use_m2 else None
 
     m_group = valid.expand(-1, attn_fg.shape[1]).clone()
     if m_sem is not None:

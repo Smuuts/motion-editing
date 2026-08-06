@@ -253,13 +253,19 @@ class NoiseSchedule:
         coef2 = (alpha_t.sqrt() * (1 - acp_prev)) / denom
         return coef1 * x0 + coef2 * x_t
 
-    def p_sample(self, x_t, t, eps_pred):
+    def p_sample(self, x_t, t, eps_pred, noise=None):
         """Reverse DDPM step: compute x_{t-1} from x_t and predicted noise.
 
         LEDITS++ Stage 3: after computing the masked eps_hat (Eq. 1 in the proposal),
         this function performs the reverse step. After each call, frames whose mask
         column is all-zero must be overwritten with q_sample(x0_source, t-1) — the
         source motion noised to t-1 — to guarantee zero drift on unedited frames.
+
+        `noise` overrides the posterior noise draw z_t (broadcast against x_t). Passing
+        ONE z shared by every batch element denoises a batch of prompts along a single
+        noise path, so the samples differ only through their text — the paired-sample
+        trick Option 6 rests on (docs/AttentionGrounding_Options.md; the caller is
+        DDPMSampler.sample_paired).
         """
         x0_pred = self.predict_x0_from_eps(x_t, t, eps_pred).clamp(-5, 5)
         mean    = self.posterior_mean(x0_pred, x_t, t)
@@ -267,6 +273,6 @@ class NoiseSchedule:
         # alphas_cumprod[0] == 1.0 exactly, so 1-acp_t == 0 at t=0 → posterior
         # is degenerate; return x0_pred directly there.
         nonzero_t = (t > 0).float()[:, None, None]
-        noise = torch.randn_like(x_t)
+        noise = torch.randn_like(x_t) if noise is None else noise
         var = self.posterior_variance[t][:, None, None]
         return torch.where(nonzero_t > 0, mean + var.sqrt() * noise, x0_pred)
