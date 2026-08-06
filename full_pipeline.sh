@@ -58,6 +58,12 @@ GEO_CONF_WEIGHT=""
 # NOTE: attn_sink forces the explicit (non-fused) attention path during training —
 # costs GPU memory vs SDPA (bs 20 OOMs on a 12 GB card where SDPA fit; bs 16 OK).
 # Re-check the batch size on the training machine before a long run.
+# Autocast dtype. "auto" = bf16 where the GPU supports it, else fp16. fp16 saturates at
+# 65504, so an activation that merely grows large becomes an inf -> non-finite loss ->
+# skipped step; bf16 keeps fp32's exponent range and cannot overflow that way. Two runs
+# have been lost to this (docs/FINDINGS.md "fp16 activation overflow"). fp32 is the
+# slow, definitely-safe fallback for a GPU without bf16 (pre-Ampere, e.g. V100).
+AMP_DTYPE="auto"                 # auto | bf16 | fp16 | fp32
 BATCH_SIZE=128
 ATTN_SINK="--attn_sink"          # "--no-attn_sink" to disable (see ARCHITECTURE.md)
 ATTN_ENTROPY_WEIGHT=0.0          # 0 disables; try 0.01 (experiment knob, keep runs attributable)
@@ -123,6 +129,7 @@ python src/train.py \
   --feature_mode  "${FEATURE_MODE}" \
   --group_mode    "${GROUP_MODE}" \
   --text_encoder  "${TEXT_ENCODER}" \
+  --amp_dtype     "${AMP_DTYPE}" \
   --hml3d_pos_weight  "${GEO_POS_WEIGHT}" \
   --hml3d_vel_weight  "${GEO_VEL_WEIGHT}" \
   --hml3d_foot_weight "${GEO_FOOT_WEIGHT}" \
