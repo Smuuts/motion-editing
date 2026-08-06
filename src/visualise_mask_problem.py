@@ -121,7 +121,10 @@ def main():
     print(f"Source: {clip_id}  ({F} frames)   prompt: {caption!r}\n"
           f"instructions: {instructions}")
 
-    editor = MotionEditor(model, schedule, device, is_group=is_group)
+    editor = MotionEditor(model, schedule, device, is_group=is_group,
+                          edit_space=args.edit_space)
+    print(f"predict_type={schedule.predict_type}  edit_space={editor.edit_space} "
+          f"(ψ read as {'|x̂0_c − x̂0_ref|' if editor.edit_space == 'x0' else '|ε_c − ε_ref|'})")
     glabels = group_names(group_mode) if is_group else ["all"]
     src_act = source_activity(x0, editor.group_channels, is_group)   # (F, G) reference
 

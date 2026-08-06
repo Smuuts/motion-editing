@@ -15,9 +15,14 @@ Builds, per edit instruction, a binary mask M = M1 ∩ M2 in (frame × group) sp
                          "renorm" (drop sink columns, renormalise — Attend-and-
                          Excite, Chefer et al. 2023) and/or "spatial" (per-token
                          spatial profile — DAAM, Tang et al. 2023).
-  M2 (noise-estimate)  — magnitude of the guidance vector ψ = ε_θ(x_t, c) − ε_θ(x_t, ref),
+  M2 (noise-estimate)  — magnitude of the guidance vector ψ = f_θ(x_t, c) − f_θ(x_t, ref),
                          aggregated per group and thresholded. "Where does the edit
-                         actually change the prediction?" The reference ref is the
+                         actually change the prediction?" f_θ is read in the editor's
+                         space (`psi_space`): noise estimates ε_θ for an ε checkpoint,
+                         clean-signal predictions x̂0 for an x0 one, where ψ becomes the
+                         directly interpretable "how differently does the model
+                         reconstruct the clean clip when told the instruction"
+                         (docs/AttentionGrounding_Options.md §5.3). The reference ref is the
                          learned null embedding by default; passing the SOURCE
                          caption's embedding instead (DiffEdit's "reference text",
                          Couairon et al., ICLR 2023) cancels the part of ψ both
@@ -196,12 +201,13 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
                        is_group, timesteps=None, need_attn=True,
                        group_channels=None, context_ref=None, psi_group_norm=False,
                        valid_frames=None, attn_readout="raw", semantic_idxs=None,
-                       attn_timesteps=None, psi_timesteps=None, per_step_norm=False):
+                       attn_timesteps=None, psi_timesteps=None, per_step_norm=False,
+                       psi_space=None):
     """
     Sweep the stored inversion sequence and accumulate the raw quantities for M1/M2.
 
     model         : EMA MotionDiT / GroupDiT (eval mode)
-    schedule      : NoiseSchedule (only T is used here)
+    schedule      : NoiseSchedule (T, and the ψ space — see psi_space)
     xs            : (T, 1, F, 263) stored inversion samples x_t (see inversion.py)
     context_edit  : (1, L, dim) embedding of ONE edit instruction
     token_idxs    : list[int] — content-token columns in [0, L) for this instruction
@@ -244,10 +250,27 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
                     returned average weights every swept t equally instead of by its
                     magnitude (see _normalise_step). Default False = historical
                     behaviour.
+    psi_space     : space the ψ contrast is taken in — "eps" (ψ_ε = |ε_c − ε_ref|),
+                    "x0" (ψ_x0 = |x̂0^c − x̂0^ref|), or None/"auto" = the checkpoint's own
+                    predict_type, which is how the editor passes it. The two differ by
+                    the positive scalar √SNR_t:
+
+                        ψ_ε(t) = √SNR_t · ψ_x0(t)
+
+                    so AT A FIXED t they rank cells identically and give the same
+                    percentile mask — reading an ε checkpoint's ψ in x0 space is not a
+                    fix, and the measured per-cell instruction-invariance survives any
+                    such rescaling. What differs is the MIXTURE across the sweep: those
+                    weights run 70.7 → 0.04 over the default linspace(1, 999, 40) grid,
+                    where t=1 alone carries 46% of ψ_ε's total and all t ≥ 500 together
+                    5.6%. So ψ_ε is effectively a low-noise readout, while ψ_x0 weights
+                    every swept t by its own clean-signal displacement — the regime where
+                    an x0-trained model's text conditioning is strongest
+                    (docs/AttentionGrounding_Options.md §5.3).
 
     Returns (attn_fg, psi_fg), both (F, G):
       attn_fg — mean semantic cross-attention per (frame, group) (zeros if need_attn=False)
-      psi_fg  — mean |ε_c − ε_ref| per (frame, group)
+      psi_fg  — mean |f_θ(x_t, c) − f_θ(x_t, ref)| per (frame, group), in psi_space
 
     Only one forward pass per (t, conditioning) is ever run: a t needed by both masks
     shares its conditional pass, and the reference pass is skipped for t that only M1
@@ -269,6 +292,7 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
     m1_ts = set(_resolve_sweep(timesteps, attn_timesteps, T)) if need_attn else set()
     m2_ts = set(_resolve_sweep(timesteps, psi_timesteps, T))
     sweep = sorted(m1_ts | m2_ts)
+    psi_space = schedule.resolve_space(psi_space)
 
     device = context_edit.device
     # ψ reference: source-caption embedding if given, else None → the model falls
@@ -291,12 +315,7 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
         x_t = xs[t].to(device)
         t_b = torch.full((1,), t, device=device, dtype=torch.long)
 
-        # ε_θ(x_t, c_edit), with attention capture only when M1 wants this step.
-        # schedule.to_eps is the identity for an eps-head and the exact x0->eps
-        # conversion for an x0-head (Option 5). NB under x0 this yields ψ_ε, which
-        # equals √SNR_t · ψ_x0 — the same mask at any fixed t, but a
-        # low-noise-weighted MIXTURE across the sweep (§5.3). The x0-native M2 is a
-        # separate change; this shim only makes an x0 checkpoint run at all.
+        # f_θ(x_t, c_edit), with attention capture only when M1 wants this step.
         out_c = model(x_t, t_b, context_edit, store_attn=want_attn)
         if want_attn:
             # M1 contribution
@@ -308,10 +327,11 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
             n_attn += 1
 
         if want_psi:
-            # ψ = ε_θ(x_t, c_edit) − ε_θ(x_t, ref) → M2 contribution
-            eps_c = schedule.to_eps(out_c, x_t, t_b)
-            eps_r = schedule.to_eps(model(x_t, t_b, context_ref), x_t, t_b)
-            psi = (eps_c - eps_r)[0].abs()                    # (F, D)
+            # ψ = f_θ(x_t, c_edit) − f_θ(x_t, ref) → M2 contribution, read in psi_space:
+            # a contrast of noise estimates ("eps") or of clean-motion predictions ("x0").
+            f_c = schedule.to_space(out_c, x_t, t_b, psi_space)
+            f_r = schedule.to_space(model(x_t, t_b, context_ref), x_t, t_b, psi_space)
+            psi = (f_c - f_r)[0].abs()                        # (F, D)
             step = psi @ agg_matrix if is_group else psi.mean(dim=-1, keepdim=True)
             psi_accum += _normalise_step(step, valid_frames) if per_step_norm else step
             n_psi += 1

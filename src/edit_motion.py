@@ -96,9 +96,11 @@ def parse_args():
                         "(sink-dominated). 'renorm' = semantic share of it "
                         "(Attend-and-Excite). 'spatial' = per-token spatial profile "
                         "(DAAM). 'renorm_spatial' = both.")
-    p.add_argument("--guidance_alpha_floor", type=float, default=0.03,
+    p.add_argument("--guidance_alpha_floor", type=float, default=None,
                    help="Skip edit guidance where sqrt(alpha_cumprod_t) < this "
-                        "(prevents x0-space divergence at high noise).")
+                        "(prevents x0-space divergence at high noise). Default: 0.03 "
+                        "in eps space, 0 (guide every step) in x0 space, which has no "
+                        "1/sqrt(alpha_cumprod_t) amplification to gate.")
     p.add_argument("--smooth_sigma", type=float, default=1.5)
     p.add_argument("--out_dir", default="eval_results/edit_demo")
     return p.parse_args()
@@ -142,7 +144,11 @@ def main():
     print(f"Source: {clip_id}  ({F} frames)  original prompt: {src_caption!r}")
 
     # ── invert ONCE (inversion depends only on the source, not the instruction) ──
-    editor = MotionEditor(model, schedule, device, is_group=is_group)
+    editor = MotionEditor(model, schedule, device, is_group=is_group,
+                          edit_space=args.edit_space)
+    print(f"predict_type={schedule.predict_type}  edit_space={editor.edit_space}  "
+          f"guidance_alpha_floor={editor.resolve_alpha_floor(args.guidance_alpha_floor):g}"
+          + ("  (x0-native ψ/SEGA)" if editor.edit_space == "x0" else ""))
     print("Stage 1: inversion …")
     state = editor.invert(x0)
 

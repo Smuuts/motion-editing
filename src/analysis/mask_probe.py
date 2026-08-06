@@ -25,6 +25,12 @@ def collect_instruction_masks(
     `sweeps` is (shared_ts, m1_ts, m2_ts) from utils.probe.resolve_sweeps.
     M1 is always collected (need_attn=True) so the raw map is available for the figures
     regardless of which mask_mode drives the binary mask.
+
+    ψ/M2 is read in `editor.edit_space` — so on an x0 checkpoint the probe measures the
+    x0-native ψ the editor now actually uses, not the ε-space shim. M2 numbers are
+    therefore only comparable across checkpoints trained with the same predict_type;
+    to reproduce a pre-2026-08-05 M2 measurement on an x0 checkpoint, build the editor
+    with edit_space="eps".
     """
     shared_ts, m1_ts, m2_ts = sweeps
     with torch.no_grad():
@@ -40,6 +46,7 @@ def collect_instruction_masks(
             attn_readout=attn_readout, semantic_idxs=semantic_token_subset(*ti),
             attn_timesteps=m1_ts, psi_timesteps=m2_ts, per_step_norm=per_step_norm,
             context_ref=context_ref, psi_group_norm=psi_group_norm,
+            psi_space=editor.edit_space,
         )
         m1_maps.append(attn_fg)
         m2_maps.append(psi_fg)

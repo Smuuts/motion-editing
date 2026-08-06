@@ -129,14 +129,15 @@ class NoiseSchedule:
         """Interpret a raw network output as ε, whatever the network predicts.
 
         THE inference-side boundary for Option 5: every consumer that treats the model
-        output as a noise estimate (sampler, inversion, ψ/M2 in editing/masking.py,
-        verify_backbone) routes through here, so an x0-trained checkpoint runs the
-        entire existing pipeline unchanged. Identity in "eps" mode — the default path
-        is byte-for-byte what it was.
+        output as a noise estimate (sampler, verify_backbone) routes through here, so an
+        x0-trained checkpoint runs the entire existing pipeline unchanged. Identity in
+        "eps" mode — the default path is byte-for-byte what it was.
 
         NOTE this keeps the 1/√ᾱ_t amplification on the guidance term (and hence the
-        need for `guidance_alpha_floor`); the x0-native editing path of §5.3 removes
-        that, and is deliberately NOT what this does.
+        need for `guidance_alpha_floor`). The editing stack no longer routes through it
+        unconditionally: it picks its space via `resolve_space`/`to_space`, so an
+        x0-trained checkpoint takes the x0-native path of
+        docs/AttentionGrounding_Options.md §5.3 instead.
         """
         if self.predict_type == "eps":
             return model_out
@@ -152,6 +153,37 @@ class NoiseSchedule:
         if self.predict_type == "x0":
             return model_out
         return self.predict_x0_from_eps(x_t, t, model_out)
+
+    def resolve_space(self, space: str | None = "auto") -> str:
+        """Which quantity the *editing* stack should do its arithmetic in: "eps" or "x0".
+
+        "auto" (or None) resolves to the checkpoint's own `predict_type`, which is the
+        intended way to select it: an x0-trained checkpoint then runs the x0-native
+        LEDITS++ path (docs/AttentionGrounding_Options.md §5.3) and an ε-trained one the
+        historical ε-space path, with nothing to pass. An explicit "eps"/"x0" forces the
+        other space — that is the control needed to attribute a measured change to the
+        space rather than to the checkpoint, and the escape hatch for running the
+        x0-native path on an ε head (see `to_space`).
+        """
+        if space is None or space == "auto":
+            return self.predict_type
+        if space not in self.PREDICT_TYPES:
+            raise ValueError(f"space must be 'auto' or one of {self.PREDICT_TYPES}, "
+                             f"got {space!r}")
+        return space
+
+    def to_space(self, model_out, x_t, t, space: str):
+        """Interpret a raw network output in `space`: `to_eps` or `to_x0`.
+
+        Both conversions are affine in `model_out` at fixed (x_t, t), which is why the
+        SEGA contrast and the whole LEDITS++ stack survive the choice: substituting one
+        into the other reproduces it exactly (§5.3). What the choice does change is
+        *conditioning*, because only one of the two directions is a no-op for a given
+        head — the converted direction carries a 1/√ᾱ_t (to x0) or √ᾱ_t/√(1−ᾱ_t) (to ε)
+        factor that amplifies the head's own error at one end of the schedule.
+        """
+        return (self.to_eps(model_out, x_t, t) if space == "eps"
+                else self.to_x0(model_out, x_t, t))
 
     def diffusion_target(self, x0, noise):
         """The regression target matching `predict_type`: ε or the clean signal x0."""

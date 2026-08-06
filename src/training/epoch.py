@@ -88,6 +88,8 @@ def train_one_epoch(
 ):
     model.train()
     total_loss = 0.0
+    n_counted  = 0          # steps that actually contributed to total_loss
+    n_skipped  = 0          # steps dropped for a non-finite loss (see the skip path)
     total_geo  = {"pos": 0.0, "vel": 0.0, "foot": 0.0}
     geo_weights = {"pos": hml3d_pos_weight, "vel": hml3d_vel_weight, "foot": hml3d_foot_weight}
     use_entropy = attn_entropy_weight > 0.0
@@ -129,7 +131,7 @@ def train_one_epoch(
             loss = loss - attn_entropy_weight * h_attn
             entropy_log["train/attn_entropy"] = h_attn.item()
 
-        geo_log = {}
+        geo_log, geo_contrib = {}, {}
         if geo_fn is not None:
             # to_x0 is a no-op for an x0-head (its output already IS x̂0) and the
             # 1/√ᾱ_t conversion for an eps-head. geo_conf_weight follows: the ᾱ_t
@@ -145,10 +147,22 @@ def train_one_epoch(
             # is why e.g. "pos_raw" can be numerically larger than the total loss.
             for key, value in geo_contrib.items():
                 geo_log[f"train/geo_{key}_raw"] = value
-                total_geo[key] += value
 
         if not torch.isfinite(loss):
+            # Drop this step's autograd graph BEFORE the next iteration's forward
+            # allocates its own. `backward()` is what normally frees the saved
+            # activations, and it is precisely what this path skips — so leaving `loss`
+            # bound keeps the entire graph alive across the next model(...) call and the
+            # process holds TWO full graphs at once. That is a hard 2x on peak memory:
+            # a diverging run (growing loss, then an fp16 overflow) dies with a CUDA OOM
+            # instead of skipping a step. Measured on a 32 GB card at batch 50: steady
+            # state 22 GB, OOM at 30.5 GB live partway through the second forward.
+            #
+            # INVARIANT: every name below holds, or may hold, a tensor with grad_fn from
+            # this iteration. Anything new that does must be added here.
             optimizer.zero_grad(set_to_none=True)
+            loss = prediction = x0_pred = h_attn = None
+            n_skipped += 1
             continue
 
         optimizer.zero_grad(set_to_none=True)
@@ -160,13 +174,26 @@ def train_one_epoch(
         ema.update_from(model)  # per-step update so decay=0.9999 accumulates correctly
 
         total_loss += loss.item()
+        n_counted += 1
+        # Accumulated here, not where geo_contrib is built, so the epoch means cover the
+        # same steps as total_loss (a skipped step contributes to neither).
+        for key, value in geo_contrib.items():
+            total_geo[key] += value
         pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         if (step + 1) % log_every == 0:
             logger.log({"train/loss": loss.item(), "train/step": epoch * len(loader) + step,
                         **geo_log, **entropy_log})
 
-    n = len(loader)
+    # Averaging over the steps that actually contributed, not over len(loader): a
+    # skipped step used to be counted as a zero, which DEFLATES the reported epoch loss
+    # exactly when the run is diverging — i.e. it hides the problem that caused the skip.
+    n = max(n_counted, 1)
+    if n_skipped:
+        print(f"  WARNING: epoch {epoch} skipped {n_skipped}/{len(loader)} steps with a "
+              f"non-finite loss. This is divergence, not noise — the reported loss is a "
+              f"mean over the {n_counted} surviving steps only.")
+        logger.log({"train/skipped_steps": n_skipped, "train/epoch": epoch})
     geo_epoch = {}
     if geo_fn is not None:
         # Raw (unweighted) per-epoch means — see the comment above geo_log for why

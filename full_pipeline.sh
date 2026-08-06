@@ -32,10 +32,28 @@ EPOCHS=500
 #   under an x0 head reproduces the eps baseline's weighting almost exactly (3% of
 #   training weight on t>=600 vs 40% unweighted), which cancels the whole point.
 PREDICT_TYPE="eps"               # eps | x0
+# MDM-style geometric losses, added to the diffusion MSE with these weights.
+#   pos  — joint-position error. humanml3d reads the positions straight out of channels
+#          [4:67]; smplh has none in its features and must run SMPL FK to get them, which
+#          composes rotation error down the kinematic chain (the expensive, less stable one).
+#   vel  — frame-to-frame position difference (penalises jitter).
+#   foot — predicted foot velocity on frames the GT calls "in contact" (anti-skating).
+# ALL THREE AT 0 DISABLES THEM COMPLETELY: build_geo_fn returns geo_fn=None, the epoch
+# loop skips the whole block, and under smplh the SMPL-H body model is never even loaded.
+# Setting only some to 0 keeps the machinery and drops those terms.
+#   Worth knowing before changing these: every run in runs/ so far used exactly
+#   (0.1, 0.1, 0.01) — they have never been ablated, so there is no measurement in this
+#   project of what they buy. Under smplh they are the ONLY positional supervision (the
+#   135-d features are rotations); under humanml3d L_pos largely re-weights channels the
+#   diffusion MSE already covers. See docs/PROGRESS.md for the run they are implicated in.
+GEO_POS_WEIGHT=0.1
+GEO_VEL_WEIGHT=0.1
+GEO_FOOT_WEIGHT=0.01
 # Geometric-loss confidence weight (alpha_bar_t damping). "" = AUTO: on for eps, off
 # for x0 (an x0 head outputs x0 directly, so there is no 1/sqrt(alpha_bar_t) error
 # amplification to damp). "--geo_conf_weight" forces on — the escape hatch if an x0
-# run destabilises near t=T; "--no-geo_conf_weight" forces off.
+# run destabilises near t=T; "--no-geo_conf_weight" forces off. No effect when the
+# three weights above are all 0.
 GEO_CONF_WEIGHT=""
 # NOTE: attn_sink forces the explicit (non-fused) attention path during training —
 # costs GPU memory vs SDPA (bs 20 OOMs on a 12 GB card where SDPA fit; bs 16 OK).
@@ -82,7 +100,13 @@ fi
 # ----------------------------------------------------------------------
 # 1. Train
 # ----------------------------------------------------------------------
-log "Training (arch=${ARCH}, predict=${PREDICT_TYPE}, lr=${LEARNING_RATE}, out=${OUTPUT_DIR})"
+# Numeric test, not a string one, so 0 / 0.0 / 0e0 all report the same thing.
+if awk "BEGIN{exit !(${GEO_POS_WEIGHT}+${GEO_VEL_WEIGHT}+${GEO_FOOT_WEIGHT}==0)}"; then
+  GEO_DESC="geo=OFF"
+else
+  GEO_DESC="geo=${GEO_POS_WEIGHT}/${GEO_VEL_WEIGHT}/${GEO_FOOT_WEIGHT}"
+fi
+log "Training (arch=${ARCH}, predict=${PREDICT_TYPE}, lr=${LEARNING_RATE}, ${GEO_DESC}, out=${OUTPUT_DIR})"
 python src/train.py \
   --data_root     "${FEAT_ROOT}" \
   --output_dir    "${OUTPUT_DIR}" \
@@ -99,6 +123,9 @@ python src/train.py \
   --feature_mode  "${FEATURE_MODE}" \
   --group_mode    "${GROUP_MODE}" \
   --text_encoder  "${TEXT_ENCODER}" \
+  --hml3d_pos_weight  "${GEO_POS_WEIGHT}" \
+  --hml3d_vel_weight  "${GEO_VEL_WEIGHT}" \
+  --hml3d_foot_weight "${GEO_FOOT_WEIGHT}" \
   "${ARCH_ARGS[@]}" \
   ${ATTN_SINK} \
   ${GEO_CONF_WEIGHT} \

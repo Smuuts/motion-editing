@@ -48,8 +48,16 @@ def add_data_args(parser, *, split=True, source=False, max_frames=196, smplh=Fal
     return parser
 
 
-def add_mask_args(parser, *, mask_timesteps=40, thresholds=True, windows=True):
+def add_mask_args(parser, *, mask_timesteps=40, thresholds=True, windows=True,
+                  edit_space=True):
     """The Stage-2 mask-collection knobs (see editing/masking.collect_statistics)."""
+    if edit_space:
+        parser.add_argument("--edit_space", default="auto", choices=["auto", "eps", "x0"],
+                            help="Space the editor does ψ/M2 and SEGA guidance in. "
+                                 "'auto' (default) = the checkpoint's own predict_type, "
+                                 "so an x0 checkpoint edits x0-natively "
+                                 "(docs/AttentionGrounding_Options.md §5.3). Force a "
+                                 "value to A/B the space against the checkpoint.")
     parser.add_argument("--mask_timesteps", type=int, default=mask_timesteps,
                         help="Sweep this many evenly-spaced timesteps for mask "
                              "collection" + (" (default: all 1000; 40 is much faster "

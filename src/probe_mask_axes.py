@@ -80,7 +80,8 @@ def probe_one(ckpt, clip, args, device) -> dict:
     x0 = torch.from_numpy((raw - mean) / std).float().unsqueeze(0).to(device)
     valid = torch.ones(F, dtype=torch.bool, device=device)
 
-    editor = MotionEditor(model, schedule, device, is_group=is_group)
+    editor = MotionEditor(model, schedule, device, is_group=is_group,
+                          edit_space=args.edit_space)
     state = editor.invert(x0)
     src_act = source_activity(x0, editor.group_channels)
 
@@ -97,14 +98,25 @@ def probe_one(ckpt, clip, args, device) -> dict:
     return {
         "checkpoint": ckpt, "clip": clip, "frames": F,
         "predict_type": config.get("predict_type", "eps"),
+        # M2 is read in this space; ψ_ε and ψ_x0 are different mixtures across the
+        # sweep, so an M2 number is only comparable to another with the same value.
+        "edit_space": editor.edit_space,
         "arch": config.get("arch", "dit"), "feature_mode": feature_mode,
         "group_mode": group_mode,
         **decompose(m1_maps, m2_maps, binaries, src_act, glabels),
     }
 
 
+def _target_label(d) -> str:
+    """Column label for a result: the checkpoint's predict_type, or "trained>read" when
+    the editor was forced off its native space (--edit_space), since that changes what
+    the M2 columns mean."""
+    space = d.get("edit_space", d["predict_type"])
+    return d["predict_type"] if space == d["predict_type"] else f"{d['predict_type']}>{space}"
+
+
 def _format_row(label, target, values):
-    return (f"{label:8} | {target:5} | "
+    return (f"{label:8} | {target:7} | "
             + "   ".join(f"{v:.3f}" for v in values[:3]) + "   | "
             + "   ".join(f"{v:.3f}" for v in values[3:6]) + "   | "
             + "  ".join(f"{v:+.3f}" for v in values[6:8]) + "  | "
@@ -112,7 +124,7 @@ def _format_row(label, target, values):
 
 
 def print_table(results):
-    hdr = (f"{'clip':8} | {'target':5} | "
+    hdr = (f"{'clip':8} | {'target':7} | "
            + " ".join(f"{c:7}" for c in TABLE_COLUMNS[:3]) + " | "
            + " ".join(f"{c:7}" for c in TABLE_COLUMNS[3:6]) + " | "
            + " ".join(f"{c:7}" for c in TABLE_COLUMNS[6:8]) + " | "
@@ -122,8 +134,8 @@ def print_table(results):
     per_target = {}
     for d in results:
         row = summary_row(d)
-        per_target.setdefault(d["predict_type"], []).append(row)
-        print(_format_row(d["clip"], d["predict_type"], row))
+        per_target.setdefault(_target_label(d), []).append(row)
+        print(_format_row(d["clip"], _target_label(d), row))
     print("-" * len(hdr))
     for target, rows in per_target.items():
         print(_format_row("MEAN", target, np.mean(rows, axis=0)))
@@ -134,7 +146,7 @@ def print_table(results):
     for d in results:
         for key in ("m1", "m2"):
             cc = d[f"{key}_category_contrast"]
-            print(f"  {d['clip']} {d['predict_type']:5} {key}: "
+            print(f"  {d['clip']} {_target_label(d):7} {key}: "
                   f"arm {cc['arm_shift']:+.3f}   leg {cc['leg_shift']:+.3f}")
 
 

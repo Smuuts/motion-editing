@@ -77,7 +77,13 @@ def parse_args():
     p.add_argument("--mask_timesteps", type=int, default=None,
                    help="Use this many evenly-spaced timesteps for mask collection "
                         "(default: all). Small values (e.g. 40) speed up the run a lot.")
-    p.add_argument("--guidance_alpha_floor", type=float, default=0.03)
+    p.add_argument("--edit_space", default="auto", choices=["auto", "eps", "x0"],
+                   help="Space for ψ/M2 and SEGA guidance. 'auto' (default) = the "
+                        "checkpoint's predict_type, so an x0 checkpoint edits "
+                        "x0-natively (docs/AttentionGrounding_Options.md §5.3).")
+    p.add_argument("--guidance_alpha_floor", type=float, default=None,
+                   help="Skip guidance where sqrt(alpha_cumprod_t) < this. Default: "
+                        "0.03 in eps space, 0 (guide every step) in x0 space.")
     p.add_argument("--src_fps", type=float, default=30.0, help="MotionFix native fps.")
     p.add_argument("--edit_fps", type=float, default=20.0, help="Editor (HumanML3D) fps.")
     p.add_argument("--max_frames", type=int, default=196)
@@ -107,7 +113,9 @@ def main():
 
     text_encoder = build_text_encoder(config, device=device)
     schedule = NoiseSchedule.from_config(config, device=device)
-    editor = MotionEditor(model, schedule, device, is_group=True)
+    editor = MotionEditor(model, schedule, device, is_group=True,
+                          edit_space=args.edit_space)
+    print(f"predict_type={schedule.predict_type}  edit_space={editor.edit_space}")
 
     mask_ts = (torch.linspace(1, schedule.T - 1, args.mask_timesteps).long().tolist()
                if args.mask_timesteps else None)
@@ -176,6 +184,11 @@ def main():
         "checkpoint": os.path.abspath(args.checkpoint),
         "feature_mode": feature_mode,
         "mask_mode": args.mask_mode,
+        # Which arithmetic produced these edits — ψ_x0 + ungated high-noise guidance
+        # ("x0") or the historical ε-space path. Needed to compare two score sheets.
+        "predict_type": schedule.predict_type,
+        "edit_space": editor.edit_space,
+        "guidance_alpha_floor": editor.resolve_alpha_floor(args.guidance_alpha_floor),
         "scales": args.scales,
         "src_fps": args.src_fps, "edit_fps": args.edit_fps,
         "n_clips": len(keyids), "n_edited": n_done,
