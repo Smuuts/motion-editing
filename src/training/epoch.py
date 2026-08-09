@@ -11,6 +11,7 @@ import torch.nn as nn
 from torch.amp import autocast
 from tqdm import tqdm
 
+from training import grounding
 from utils.padding import length_to_mask
 
 # Fraction of an epoch's steps that may be dropped for a non-finite loss before
@@ -35,12 +36,21 @@ def apply_cfg_dropout(model, context, cfg_dropout):
     null_text_emb must keep its gradient so CFG scale > 1 works at inference. This also
     trains the unconditional branch used by LEDITS++ Stage 1 inversion (context=None)
     and the ε_θ(x_t, ∅) term in Stage 3 Eq. 1.
+
+    Returns (context, kept) where `kept` is (B,) bool, False on the rows whose caption
+    was replaced. Any loss defined on the CAPTION rather than on the motion — the
+    grounding loss is the first — must exclude those rows: their words are not in the
+    context at all, so supervising their columns optimises attention toward text the
+    forward pass never saw. Silent training noise, not an error anything would catch.
     """
     if cfg_dropout <= 0.0:
-        return context
+        return context, torch.ones(context.shape[0], dtype=torch.bool,
+                                   device=context.device)
     B = context.shape[0]
-    drop = (torch.rand(B, device=context.device) < cfg_dropout)[:, None, None]
-    return torch.where(drop, model.null_text_emb.expand(B, -1, -1), context)
+    drop = torch.rand(B, device=context.device) < cfg_dropout
+    context = torch.where(drop[:, None, None],
+                          model.null_text_emb.expand(B, -1, -1), context)
+    return context, ~drop
 
 
 def diffusion_loss(target, prediction, attn_mask, schedule, t, snr_gamma):
@@ -86,12 +96,98 @@ def _add_geo_losses(loss, x0_pred, motion, attn_mask, geo_fn, weights, sample_we
     return loss, contributions
 
 
+def _add_grounding_loss(loss, A, batch, motion, attn_mask, kept, t, schedule, cfg):
+    """Add the TokenCompose grounding term (training/grounding.py) to `loss`.
+
+    Returns (loss, l_ground, stats). `l_ground` is handed back so the caller can drop it
+    on the non-finite skip path — it holds a graph over an explicit (B, h, F·G, L)
+    softmax, which is the largest single tensor in the step.
+
+    TIMESTEP WEIGHTING — the one line most likely to be "fixed" back to the wrong thing.
+    `w_t = 1 − ᾱ_t` up-weights HIGH noise. AttentionGrounding_Options.md §1.5 prescribed
+    ᾱ_t, i.e. the opposite, and that is backwards twice over:
+      1. Under x0 the mask's instruction-sensitivity strengthens with noise (category r
+         0.899 at t<250 vs 0.746 at t≥750) and alignment improves 0.205 → 0.238 under
+         `--m1_window 750 999`. ᾱ_t would supervise hardest where the mask is never read.
+      2. It opens the source-dynamics shortcut. At low t, x_t ≈ x0 and the clip's motion
+         is legible, so "attend to whatever moves" satisfies the loss without reading a
+         word. At t = 900 there is nothing left to detect and the caption is the only
+         signal present.
+    `--attn_ground_window LO HI` is the hard-gate alternative kept for ablation: it
+    supervises only in-window samples, at ~4× fewer grounded samples per batch.
+    """
+    if "text" not in batch:
+        # Precomputed text_emb/ makes the dataset return `context` and drop the caption,
+        # and the labels are keyed by caption string. Trainer._build_grounding refuses
+        # the run for this reason; this catches any other caller.
+        raise KeyError(
+            "the grounding loss needs batch['text'], but this batch carries precomputed "
+            "'context' embeddings instead — the caption is the label cache's key.")
+
+    if cfg.window is not None:
+        lo, hi = cfg.window
+        valid = kept & (t >= lo) & (t <= hi)
+        w_t = None                      # a hard gate does not also soft-weight
+    else:
+        valid = kept
+        w_t = 1.0 - schedule.x0_confidence_weight(t)          # (B,)
+
+    src = None
+    if cfg.monitor:
+        # The shortcut monitor (docs/TokenCompose_Handoff.md §4.6). Computed on the
+        # clean motion, detached — it never touches the gradient, it only says whether
+        # rising m_S is word routing or a sharpened motion detector.
+        with torch.no_grad():
+            src = grounding.batched_source_activity(
+                motion.detach(), cfg.group_channels, attn_mask)
+
+    l_ground, stats = grounding.grounding_loss(
+        A.float(), batch["text"], cfg.cache, attn_mask, valid,
+        sample_weight=w_t, lambda_mirror=cfg.mirror, margin=cfg.margin,
+        source_act=src, mirror_mat=cfg.mirror_mat)
+    return loss + cfg.weight * l_ground, l_ground, stats
+
+
+class _GroundingAccumulator:
+    """Per-epoch means of the grounding diagnostics.
+
+    They are means over STEPS, not over items, so a step with one supervised token
+    counts the same as a step with twenty. That is deliberate: `m_S` is read as a level
+    ("the word puts X of its attention on its own group") and an item-weighted mean
+    would let the handful of caption-dense batches set the epoch's number.
+    """
+
+    KEYS = ("m_S", "m_S_tier1", "m_mirror", "src_corr")
+
+    def __init__(self):
+        self.sums = {k: 0.0 for k in self.KEYS}
+        self.counts = {k: 0 for k in self.KEYS}
+        self.items = 0
+
+    def add(self, stats):
+        self.items += stats.get("n_items", 0)
+        for k in self.KEYS:
+            if k in stats:
+                self.sums[k] += stats[k]
+                self.counts[k] += 1
+
+    def epoch_means(self, prefix):
+        if not self.items:
+            return {}
+        out = {f"{prefix}/ground_items_epoch": self.items}
+        for k in self.KEYS:
+            if self.counts[k]:
+                out[f"{prefix}/ground_{k}_epoch"] = self.sums[k] / self.counts[k]
+        return out
+
+
 def train_one_epoch(
     model, ema, text_encoder, schedule, optimizer, scaler,
     loader, device, cfg_dropout, logger, epoch, log_every,
     snr_gamma=5.0,
     geo_fn=None, hml3d_pos_weight=0.0, hml3d_vel_weight=0.0, hml3d_foot_weight=0.0,
     attn_entropy_weight=0.0, geo_conf_weight=True, amp_dtype=torch.float16,
+    grounding=None,
 ):
     model.train()
     total_loss = 0.0
@@ -100,6 +196,8 @@ def train_one_epoch(
     total_geo  = {"pos": 0.0, "vel": 0.0, "foot": 0.0}
     geo_weights = {"pos": hml3d_pos_weight, "vel": hml3d_vel_weight, "foot": hml3d_foot_weight}
     use_entropy = attn_entropy_weight > 0.0
+    use_ground  = grounding is not None and grounding.active(epoch)
+    ground_acc  = _GroundingAccumulator()
 
     pbar = tqdm(loader, desc=f"Epoch {epoch}", leave=False)
     for step, batch in enumerate(pbar):
@@ -114,7 +212,7 @@ def train_one_epoch(
         else:
             with torch.no_grad():
                 context = text_encoder.encode(batch["text"])
-        context = apply_cfg_dropout(model, context, cfg_dropout)
+        context, kept = apply_cfg_dropout(model, context, cfg_dropout)
 
         attn_mask = length_to_mask(_batch_lengths(batch, device), motion.shape[1])
 
@@ -123,11 +221,22 @@ def train_one_epoch(
         # still receives the same pressure.
         ent_layer = (int(torch.randint(len(model.blocks), (1,)).item())
                      if use_entropy else None)
+        ground_layer = grounding.pick_layer() if use_ground else None
         with autocast(device_type=device.type, dtype=amp_dtype):
             prediction = model(x_t, t, context, mask=attn_mask,
-                               entropy_layer=ent_layer)
+                               entropy_layer=ent_layer,
+                               supervise_layer=ground_layer)
             target = schedule.diffusion_target(motion, noise)
             loss = diffusion_loss(target, prediction, attn_mask, schedule, t, snr_gamma)
+
+        A = l_ground = None
+        ground_log = {}
+        if ground_layer is not None:
+            A = model.get_sup_attn(ground_layer)          # (B, F, G, L), graph kept
+            loss, l_ground, gstats = _add_grounding_loss(
+                loss, A, batch, motion, attn_mask, kept, t, schedule, grounding)
+            ground_acc.add(gstats)
+            ground_log = {f"train/ground_{k}": v for k, v in gstats.items()}
 
         entropy_log = {}
         if ent_layer is not None:
@@ -168,7 +277,7 @@ def train_one_epoch(
             # INVARIANT: every name below holds, or may hold, a tensor with grad_fn from
             # this iteration. Anything new that does must be added here.
             optimizer.zero_grad(set_to_none=True)
-            loss = prediction = x0_pred = h_attn = None
+            loss = prediction = x0_pred = h_attn = A = l_ground = None
             n_skipped += 1
             continue
 
@@ -190,7 +299,7 @@ def train_one_epoch(
 
         if (step + 1) % log_every == 0:
             logger.log({"train/loss": loss.item(), "train/step": epoch * len(loader) + step,
-                        **geo_log, **entropy_log})
+                        **geo_log, **entropy_log, **ground_log})
 
     # Averaging over the steps that actually contributed, not over len(loader): a
     # skipped step used to be counted as a zero, which DEFLATES the reported epoch loss
@@ -219,7 +328,7 @@ def train_one_epoch(
             "train/geo_vel_raw_epoch":  total_geo["vel"]  / n,
             "train/geo_foot_raw_epoch": total_geo["foot"] / n,
         }
-    return total_loss / n, geo_epoch
+    return total_loss / n, {**geo_epoch, **ground_acc.epoch_means("train")}
 
 
 @torch.no_grad()
@@ -227,12 +336,19 @@ def validate_one_epoch(
     ema_model, text_encoder, schedule, loader, device, epoch,
     snr_gamma=5.0,
     geo_fn=None, hml3d_pos_weight=0.0, hml3d_vel_weight=0.0, hml3d_foot_weight=0.0,
-    geo_conf_weight=True, amp_dtype=torch.float16,
+    geo_conf_weight=True, amp_dtype=torch.float16, grounding_cfg=None,
 ):
     ema_model.eval()
     torch.manual_seed(0)
     total_loss = 0.0
     geo_weights = {"pos": hml3d_pos_weight, "vel": hml3d_vel_weight, "foot": hml3d_foot_weight}
+    # Same term, same layer choice rule, so train/val stay the SAME quantity and the two
+    # curves can be overlaid — the reason diffusion_loss and _add_geo_losses are shared
+    # functions rather than two copies. Deterministic layer (not a random draw) because
+    # a val curve should not carry sampling noise the train curve averages out.
+    use_ground = grounding_cfg is not None and grounding_cfg.active(epoch)
+    val_layer  = grounding_cfg.val_layer() if use_ground else None
+    ground_acc = _GroundingAccumulator()
 
     pbar = tqdm(loader, desc=f"Val {epoch}", leave=False)
     for batch in pbar:
@@ -250,11 +366,21 @@ def validate_one_epoch(
         attn_mask = length_to_mask(_batch_lengths(batch, device), motion.shape[1])
 
         with autocast(device_type=device.type, dtype=amp_dtype):
-            prediction = ema_model(x_t, t, context, mask=attn_mask)
+            prediction = ema_model(x_t, t, context, mask=attn_mask,
+                                   supervise_layer=val_layer)
             # Mirror train_one_epoch's objective so the train/val curves are the
             # same quantity and can be overlaid in training_loss.png.
             target = schedule.diffusion_target(motion, noise)
             loss = diffusion_loss(target, prediction, attn_mask, schedule, t, snr_gamma)
+
+        if val_layer is not None:
+            # No CFG dropout in validation, so every row's caption is really in the
+            # context — kept is all-True.
+            kept = torch.ones(B, dtype=torch.bool, device=device)
+            loss, _, gstats = _add_grounding_loss(
+                loss, ema_model.get_sup_attn(val_layer), batch, motion, attn_mask,
+                kept, t, schedule, grounding_cfg)
+            ground_acc.add(gstats)
 
         if geo_fn is not None:
             x0_pred = schedule.to_x0(prediction.float(), x_t, t)
@@ -266,4 +392,4 @@ def validate_one_epoch(
         total_loss += loss.item()
         pbar.set_postfix(val_loss=f"{loss.item():.4f}")
 
-    return total_loss / len(loader)
+    return total_loss / len(loader), ground_acc.epoch_means("val")

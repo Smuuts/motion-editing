@@ -104,11 +104,48 @@ class _MotionDiTBase(nn.Module):
         return [b.cross_attn.last_attn_map for b in self.blocks
                 if b.cross_attn.last_attn_map is not None]
 
+    def get_attn_values(self) -> list[torch.Tensor]:
+        """Value vectors (B, heads, L_text, head_dim) from the same stored forward as
+        get_attn_maps(), layer for layer and column for column.
+
+        For the norm-weighted M1 readouts (Option 15): attention weight ranks keys by
+        how hard a query LOOKS at them, not by what it RECEIVES, and those disagree
+        whenever value norms differ — maximally so for the zero-value padding columns
+        that once held 92.9% of this model's cross-attention mass (docs/FINDINGS.md).
+        """
+        return [b.cross_attn.last_value for b in self.blocks
+                if b.cross_attn.last_value is not None]
+
     def get_attn_entropy(self, block_idx: int) -> torch.Tensor:
         """Entropy stashed by the last forward that passed entropy_layer=block_idx
         (training regulariser; one block per step bounds the materialised-attention
         memory). Kept with graph — consume it in the same step's loss."""
         return self.blocks[block_idx].cross_attn.last_entropy
+
+    def get_sup_attn(self, block_idx: int) -> torch.Tensor:
+        """Head-averaged cross-attention (B, F, G, L_text) stashed by the last forward
+        that passed supervise_layer=block_idx, WITH graph — the input to the
+        TokenCompose grounding loss (training/grounding.py).
+
+        The F·G → (F, G) split is row-major, matching how GroupDiT.forward flattens its
+        token grid (tokens.reshape(B, F*G, latent_dim) after stacking groups on dim=2),
+        so cell (f, g) here is body-part group g of frame f. G = 1 for the flat
+        MotionDiT, which keeps the loss's shape contract identical across backbones.
+
+        READING IT CLEARS IT. Unlike get_attn_entropy's scalar, this is a full
+        (B, F·G, L) tensor with a grad_fn, and a different block is sampled each step —
+        so left in place it would pin one stale map (and its graph nodes) per candidate
+        block until that block happens to be drawn again. ~32 MB each at batch 45 with
+        L = 128, for a value no one will read twice. Dropping the reference here does
+        not affect backward: the loss's own graph holds everything it needs.
+        """
+        cross = self.blocks[block_idx].cross_attn
+        attn, cross.last_sup_attn = cross.last_sup_attn, None       # (B, N, L)
+        if attn is None:
+            return None
+        B, N, L = attn.shape
+        G = getattr(self, "G", 1)
+        return attn.reshape(B, N // G, G, L)
 
 
 class MotionDiT(_MotionDiTBase):
@@ -153,6 +190,7 @@ class MotionDiT(_MotionDiTBase):
         store_attn: bool = False,
         mask:       torch.Tensor | None = None,
         entropy_layer: int | None = None,
+        supervise_layer: int | None = None,
     ) -> torch.Tensor:
         B, F, _ = motion.shape
         context, ctx_mask = self._context_and_mask(context, B)
@@ -162,7 +200,8 @@ class MotionDiT(_MotionDiTBase):
 
         for i, block in enumerate(self.blocks):
             x = block(x, t_emb, context, store_attn=store_attn, mask=mask,
-                      context_mask=ctx_mask, compute_entropy=(i == entropy_layer))
+                      context_mask=ctx_mask, compute_entropy=(i == entropy_layer),
+                      supervise=(i == supervise_layer))
 
         return self.output_proj(self.final_norm(x))
 
@@ -244,6 +283,7 @@ class GroupDiT(_MotionDiTBase):
         store_attn: bool = False,
         mask:       torch.Tensor | None = None,  # (B, F) per-frame
         entropy_layer: int | None = None,
+        supervise_layer: int | None = None,
     ) -> torch.Tensor:
         B, F, _ = motion.shape
         G = self.G  # 7 (parts) or 22 (joints)
@@ -278,7 +318,8 @@ class GroupDiT(_MotionDiTBase):
         t_emb = self.time_emb(t)
         for i, block in enumerate(self.blocks):
             tokens = block(tokens, t_emb, context, store_attn=store_attn, mask=mask,
-                           context_mask=ctx_mask, compute_entropy=(i == entropy_layer))
+                           context_mask=ctx_mask, compute_entropy=(i == entropy_layer),
+                           supervise=(i == supervise_layer))
 
         tokens = self.final_norm(tokens).reshape(B, F, G, self.latent_dim)
 

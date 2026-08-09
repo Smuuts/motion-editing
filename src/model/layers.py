@@ -93,14 +93,34 @@ class CrossAttention(nn.Module):
         # then average over heads, timesteps, and layers before thresholding.
         self.last_attn_map = None
 
+        # Value vectors of the last stored forward: (B, heads, L_text, head_dim), same
+        # column order as last_attn_map. Attention WEIGHT is not attention CONTRIBUTION
+        # — what reaches the residual stream from key j is alpha_ij * v_j, and value
+        # norms vary by an order of magnitude (Kobayashi et al., EMNLP 2020). Every M1
+        # readout in this project has been weight-only; masking.collect_statistics's
+        # "normw"/"normsum" readouts need these to weight by contribution instead.
+        # Stored only alongside store_attn, so training is unaffected.
+        self.last_value = None
+
         # Mean normalised row entropy of the last forward's real-token attention,
         # kept WITH graph when compute_entropy=True (training regulariser); see forward.
         self.last_entropy = None
 
+        # Head-averaged attention of the last forward, (B, N_motion, L_text), kept WITH
+        # graph when supervise=True — the input to the TokenCompose grounding loss
+        # (training/grounding.py, Option 1). Deliberately a SEPARATE attribute from
+        # last_attn_map: that one is detached by contract (every M1 read-out consumes it
+        # under no_grad and would otherwise silently retain a training graph), and
+        # merging the two would make "is this map differentiable?" depend on which
+        # caller ran last. Head-averaged at capture because the loss is defined on the
+        # head mean and keeping (B, h, N, L) alive through backward is heads× the memory.
+        self.last_sup_attn = None
+
     def forward(self, x: torch.Tensor, context: torch.Tensor,
                 store_attn: bool = False,
                 context_mask: torch.Tensor | None = None,
-                compute_entropy: bool = False) -> torch.Tensor:
+                compute_entropy: bool = False,
+                supervise: bool = False) -> torch.Tensor:
         # store_attn=True is passed during Stage 1 inversion and Stage 3 denoising
         # to collect A^{t,l} maps. Must be False during training to avoid memory growth.
         # context_mask: (B, L) bool, False = padding key. Without it, every padding
@@ -112,6 +132,8 @@ class CrossAttention(nn.Module):
         # compute_entropy=True additionally stashes the mean normalised row entropy
         # of the real-token attention in self.last_entropy (graph kept) for the
         # training-time entropy regulariser.
+        # supervise=True stashes the head-averaged attention in self.last_sup_attn
+        # (graph kept) for the TokenCompose grounding loss.
         B, N, _ = x.shape
         _, L, _ = context.shape
 
@@ -124,7 +146,7 @@ class CrossAttention(nn.Module):
         # The sink no longer does: it is expressible as one extra key/value column, see
         # the else-branch. store_attn is inference-only (mask collection) and the entropy
         # regulariser defaults off, so training now stays on the fused kernel.
-        explicit = store_attn or compute_entropy
+        explicit = store_attn or compute_entropy or supervise
 
         if explicit:
             logits = q @ k.transpose(-2, -1) * self.scale        # (B, h, N, L)
@@ -152,9 +174,22 @@ class CrossAttention(nn.Module):
                          if context_mask is not None else math.log(L))
                 self.last_entropy = (h_row / log_n).mean()
 
+            if supervise:
+                # BEFORE dropout, deliberately: the grounding target is "where does this
+                # word's attention go", and attention dropout zeroes a random subset of
+                # (query, key) pairs, which would inject noise into the normalising
+                # denominator rather than into the model. Same placement as the entropy
+                # term above. Rows still sum to <= 1 under the sink; the loss renormalises
+                # per text column, so the sink's share divides out.
+                self.last_sup_attn = attn.mean(dim=1)             # (B, N, L), graph kept
+
             attn = self.dropout(attn)
             if store_attn:
                 self.last_attn_map = attn.detach()
+                # v here is the un-augmented (B, h, L, hd) tensor — the sink is folded
+                # into `attn` as a scalar gate in this branch, never as an extra column,
+                # so v's columns line up 1:1 with last_attn_map's.
+                self.last_value = v.detach()
             out = (attn @ v).transpose(1, 2).reshape(B, N, -1)
         else:
             dropout_p = self.dropout.p if self.training else 0.0
@@ -288,7 +323,8 @@ class DiTBlock(nn.Module):
                 context: torch.Tensor, store_attn: bool = False,
                 mask: torch.Tensor | None = None,
                 context_mask: torch.Tensor | None = None,
-                compute_entropy: bool = False):
+                compute_entropy: bool = False,
+                supervise: bool = False):
         mods = self.adaLN_modulation(t_emb)
         s1, b1, g1, s2, b2, g2, s3, b3, g3 = mods.chunk(9, dim=-1)
         s1, b1, g1 = s1[:, None], b1[:, None], g1[:, None]
@@ -300,6 +336,7 @@ class DiTBlock(nn.Module):
         x = x + g1 * self.self_attn(self.norm1(x) * (1 + s1) + b1, mask=mask)
         x = x + g2 * self.cross_attn(self.norm2(x) * (1 + s2) + b2, context,
                                      store_attn=store_attn, context_mask=context_mask,
-                                     compute_entropy=compute_entropy)
+                                     compute_entropy=compute_entropy,
+                                     supervise=supervise)
         x = x + g3 * self.ff(self.norm3(x) * (1 + s3) + b3)
         return x

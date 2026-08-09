@@ -14,7 +14,12 @@ Builds, per edit instruction, a binary mask M = M1 ∩ M2 in (frame × group) sp
                          selects sink-corrected readouts (see collect_statistics):
                          "renorm" (drop sink columns, renormalise — Attend-and-
                          Excite, Chefer et al. 2023) and/or "spatial" (per-token
-                         spatial profile — DAAM, Tang et al. 2023).
+                         spatial profile — DAAM, Tang et al. 2023). All of those are
+                         weight-only; "normw"/"normsum" instead read the CONTRIBUTION
+                         α·‖v‖ that actually reaches the residual stream (Kobayashi
+                         et al. 2020), which is a different ranking whenever value
+                         norms differ across columns — and they differ maximally here,
+                         the padding columns having value vectors of exactly zero.
   M2 (noise-estimate)  — magnitude of the guidance vector ψ = f_θ(x_t, c) − f_θ(x_t, ref),
                          aggregated per group and thresholded. "Where does the edit
                          actually change the prediction?" f_θ is read in the editor's
@@ -142,6 +147,98 @@ def _attn_readout_value(avg: torch.Tensor, tok: torch.Tensor, sem: torch.Tensor,
     raise ValueError(f"unknown attn_readout {readout!r}")
 
 
+# Readouts that need only the attention weights, and those that additionally need the
+# value vectors. Kept as data so a caller can ask for "every readout" in one sweep and
+# the probe scripts can validate a --m1_readout choice without a second list.
+WEIGHT_READOUTS = ("raw", "renorm", "spatial", "renorm_spatial")
+VALUE_READOUTS = ("normw", "normsum")
+ALL_READOUTS = WEIGHT_READOUTS + VALUE_READOUTS
+
+
+def _value_weighted_map(stacked: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+    """(Lyr, B, h, N, L) attention → (N, L) map of CONTRIBUTION α·‖v‖, not weight α.
+
+    The per-head value norm is the right scale: attention is computed per head, and a
+    head's output contribution from column w is α[h,·,w]·v[h,w], so weighting by a
+    head-agnostic norm would mix scales across heads that need not be comparable.
+    """
+    vnorm = values.norm(dim=-1)                                  # (Lyr, B, h, L)
+    return (stacked * vnorm[..., None, :]).mean(dim=(0, 1, 2))   # (N, L)
+
+
+def _summed_contribution(stacked: torch.Tensor, values: torch.Tensor,
+                         sem: torch.Tensor) -> torch.Tensor:
+    """‖Σ_w α_w v_w‖ over the semantic columns → (N,) — what each cell actually
+    RECEIVED from the body-part words.
+
+    Differs from the per-token form by accounting for CANCELLATION: two words whose
+    value vectors point in opposite directions contribute a large α·‖v‖ each while
+    summing to nearly nothing. "left" vs "right" is exactly the pair one would expect
+    to be near-antiparallel, so this is the form in which a laterality signal could
+    survive when the per-token form shows none.
+    """
+    a = stacked[..., sem]                                        # (Lyr, B, h, N, S)
+    v = values[:, :, :, sem, :]                                  # (Lyr, B, h, S, hd)
+    contrib = a @ v                                              # (Lyr, B, h, N, hd)
+    contrib = contrib.permute(0, 1, 3, 2, 4).flatten(-2)         # (Lyr, B, N, h*hd)
+    return contrib.norm(dim=-1).mean(dim=(0, 1))                 # (N,)
+
+
+def _attn_step_readouts(stacked: torch.Tensor, values, tok: torch.Tensor,
+                        sem: torch.Tensor, readouts) -> dict[str, torch.Tensor]:
+    """One timestep's (Lyr, B, h, N, L) attention → {readout: (N,) per-cell value}.
+
+    All requested readouts are computed from the SAME stored tensors, so a probe
+    comparing them is comparing readouts and nothing else — no second inversion, no
+    run-to-run spread between the numbers being contrasted.
+    """
+    out, avg = {}, None
+    for r in readouts:
+        if r in WEIGHT_READOUTS:
+            if avg is None:
+                avg = stacked.mean(dim=(0, 1, 2))                # (N, L)
+            out[r] = _attn_readout_value(avg, tok, sem, r)
+        elif r == "normw":
+            out[r] = _attn_readout_value(_value_weighted_map(stacked, values),
+                                         tok, sem, "raw")
+        elif r == "normsum":
+            out[r] = _summed_contribution(stacked, values, sem)
+        else:
+            raise ValueError(f"unknown attn_readout {r!r}")
+    return out
+
+
+def _column_class_stats(stacked: torch.Tensor, values: torch.Tensor,
+                        tok: torch.Tensor) -> dict[str, float]:
+    """Attention mass and mean value norm, split by column class.
+
+    The standing question Option 15 exists to settle: `renorm` drops the EOS/sink column
+    from its denominator as a distractor, which is only right if that column contributes
+    little. Pads are the calibration point — their value vectors are exactly zero, so
+    any mass on them is contribution-free by construction.
+
+    EOS is the column immediately after the last content token (T5 emits
+    [tokens..., EOS, pad...]; token_info returns the content columns only).
+    """
+    avg = stacked.mean(dim=(0, 1, 2))                            # (N, L)
+    vnorm = values.norm(dim=-1).mean(dim=(0, 1, 2))              # (L,)
+    L = avg.shape[-1]
+    eos = int(tok.max().item()) + 1
+    pad = torch.arange(eos + 1, L, device=avg.device)
+    out = {
+        "mass_content": float(avg[:, tok].sum(dim=-1).mean()),
+        "vnorm_content": float(vnorm[tok].mean()),
+        "row_total": float(avg.sum(dim=-1).mean()),
+    }
+    if eos < L:
+        out["mass_eos"] = float(avg[:, eos].mean())
+        out["vnorm_eos"] = float(vnorm[eos])
+    if pad.numel():
+        out["mass_pad"] = float(avg[:, pad].sum(dim=-1).mean())
+        out["vnorm_pad"] = float(vnorm[pad].mean())
+    return out
+
+
 def _normalise_step(values: torch.Tensor, valid_frames) -> torch.Tensor:
     """
     Scale one timestep's (F, G) map to unit mean over valid frames.
@@ -206,7 +303,7 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
                        group_channels=None, context_ref=None, psi_group_norm=False,
                        valid_frames=None, attn_readout="raw", semantic_idxs=None,
                        attn_timesteps=None, psi_timesteps=None, per_step_norm=False,
-                       psi_space=None):
+                       psi_space=None, stats_out=None):
     """
     Sweep the stored inversion sequence and accumulate the raw quantities for M1/M2.
 
@@ -240,8 +337,29 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
                                 averaged: a token holding little total mass still
                                 votes with its full spatial distribution.
                     "renorm_spatial" — renorm rows, then spatial-normalise columns.
+                    "normw"   — CONTRIBUTION α·‖v‖ instead of weight α, then read as
+                                "raw". Attention weight ranks keys by how hard a query
+                                looks at them; what reaches the residual stream is
+                                α·v, and value norms vary by an order of magnitude
+                                (Kobayashi et al., EMNLP 2020). This project holds the
+                                extreme case: 92.9% of mass once sat on padding columns
+                                whose value vectors are exactly zero.
+                    "normsum" — ‖Σ_w α_w v_w‖ over the semantic columns: the strictly
+                                correct "what this cell received", which additionally
+                                accounts for cancellation between tokens.
+                    May also be a SEQUENCE of readout names, in which case every one is
+                    computed from the same stored attention and the returned attn_fg is
+                    a {name: (F, G)} dict instead of a single map. That is the only way
+                    to contrast readouts without a second inversion — the inversion is
+                    stochastic (±0.02 run-to-run on these metrics), so re-running it per
+                    readout would put that spread inside the comparison.
     semantic_idxs : stop-word-filtered subset of token_idxs (semantic_token_subset).
                     Required for the non-"raw" readouts; defaults to token_idxs.
+    stats_out     : optional dict, filled in place with the sweep-mean attention mass
+                    and value norm per column class (content / EOS / pad) — the
+                    diagnostic that says whether dropping the sink column from a readout
+                    discards a distractor or the dominant contribution. Only populated
+                    when a value-based readout is requested.
     attn_timesteps: sweep for M1 only, overriding `timesteps`. M1 and M2 are read off
                     the same trajectory but their signal does not live at the same
                     noise levels — on an x0 checkpoint M1's instruction-sensitivity
@@ -273,7 +391,8 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
                     (docs/AttentionGrounding_Options.md §5.3).
 
     Returns (attn_fg, psi_fg), both (F, G):
-      attn_fg — mean semantic cross-attention per (frame, group) (zeros if need_attn=False)
+      attn_fg — mean semantic cross-attention per (frame, group) (zeros if need_attn=False),
+                or {readout: (F, G)} when attn_readout is a sequence
       psi_fg  — mean |f_θ(x_t, c) − f_θ(x_t, ref)| per (frame, group), in psi_space
 
     Only one forward pass per (t, conditioning) is ever run: a t needed by both masks
@@ -298,11 +417,23 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
     sweep = sorted(m1_ts | m2_ts)
     psi_space = schedule.resolve_space(psi_space)
 
+    # One readout or many, from one sweep. `single` restores the historical scalar-map
+    # return so no existing caller sees a type change.
+    single = isinstance(attn_readout, str)
+    readouts = (attn_readout,) if single else tuple(attn_readout)
+    need_values = need_attn and any(r in VALUE_READOUTS for r in readouts)
+    if need_values and not hasattr(model, "get_attn_values"):
+        raise ValueError(
+            f"readouts {[r for r in readouts if r in VALUE_READOUTS]} need the value "
+            f"vectors, which {type(model).__name__} does not expose "
+            f"(get_attn_values). Weight-only readouts {WEIGHT_READOUTS} still work.")
+
     device = context_edit.device
     # ψ reference: source-caption embedding if given, else None → the model falls
     # back to its learned null_text_emb (original behaviour).
-    attn_accum = torch.zeros(F, G, device=device)
+    attn_accum = {r: torch.zeros(F, G, device=device) for r in readouts}
     psi_accum  = torch.zeros(F, G, device=device)
+    col_stats  = {}
     n_attn = n_psi = 0
 
     tok = (torch.as_tensor(token_idxs, device=device, dtype=torch.long)
@@ -325,9 +456,15 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
             # M1 contribution
             layer_maps = model.get_attn_maps()                # list of (1, h, N, L)
             stacked = torch.stack(layer_maps, dim=0).float()  # (Lyr, 1, h, N, L)
-            avg = stacked.mean(dim=(0, 1, 2))                 # (N, L)
-            step = _attn_readout_value(avg, tok, sem, attn_readout).reshape(F, G)
-            attn_accum += _normalise_step(step, valid_frames) if per_step_norm else step
+            values = (torch.stack(model.get_attn_values(), dim=0).float()
+                      if need_values else None)              # (Lyr, 1, h, L, hd)
+            for r, v in _attn_step_readouts(stacked, values, tok, sem, readouts).items():
+                step = v.reshape(F, G)
+                attn_accum[r] += (_normalise_step(step, valid_frames)
+                                  if per_step_norm else step)
+            if need_values and stats_out is not None:
+                for k, val in _column_class_stats(stacked, values, tok).items():
+                    col_stats[k] = col_stats.get(k, 0.0) + val
             n_attn += 1
 
         if want_psi:
@@ -344,7 +481,10 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
     if psi_group_norm and is_group:
         energy = _group_motion_energy(xs[0][0].to(device), valid_frames, agg_matrix)
         psi_fg = psi_fg / energy[None, :]
-    return attn_accum / max(n_attn, 1), psi_fg
+    if stats_out is not None and col_stats:
+        stats_out.update({k: v / max(n_attn, 1) for k, v in col_stats.items()})
+    attn_fg = {r: a / max(n_attn, 1) for r, a in attn_accum.items()}
+    return (attn_fg[readouts[0]] if single else attn_fg), psi_fg
 
 
 # mask_mode -> (semantic source | None, use_m2). The two mask components are

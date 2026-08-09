@@ -121,6 +121,26 @@ class CLIPTextEncoder(nn.Module):
             labels.append(self._decode_tok(tid))
         return idxs, labels
 
+    def token_spans(self, text: str) -> list[tuple[int, int, int]]:
+        """(column, char_start, char_end) for every content token.
+
+        CLIP's BPE tokenizer exposes no offset mapping, so spans are reconstructed by
+        walking the decoded pieces through the lowercased text. Used by
+        data/body_part_labels.py to map a body-part WORD to the attention columns it
+        occupies; see T5TextEncoder.token_spans for the exact-offsets version.
+        """
+        idxs, labels = self.token_info(text)
+        lowered, cursor, spans = text.lower(), 0, []
+        for pos, piece in zip(idxs, labels):
+            if not piece:
+                continue
+            start = lowered.find(piece, cursor)
+            if start < 0:                       # unresolvable piece; skip rather than guess
+                continue
+            spans.append((pos, start, start + len(piece)))
+            cursor = start + len(piece)
+        return spans
+
 
 class T5TextEncoder(nn.Module):
     """
@@ -191,6 +211,33 @@ class T5TextEncoder(nn.Module):
             idxs.append(pos)
             labels.append(self.tokenizer.convert_ids_to_tokens(tid).replace("▁", " ").strip())
         return idxs, labels
+
+    def token_spans(self, text: str) -> list[tuple[int, int, int]]:
+        """(column, char_start, char_end) for every content token, from the tokenizer's
+        own offset mapping.
+
+        Exact by construction — no string reassembly. That matters because
+        data/body_part_labels.py decides which attention columns get supervised by
+        overlapping these spans with body-part WORDS, and supervising the wrong columns
+        trains nonsense silently. Positions match encode()'s L axis: both tokenise the
+        same way, and padding only ever appends.
+
+        SentencePiece attributes the word-boundary marker to the token, so a leading
+        space is included in the span; it is stripped here so a span never bleeds into
+        the preceding word.
+        """
+        enc = self.tokenizer([text], max_length=self.max_length, truncation=True,
+                             return_offsets_mapping=True)
+        ids = enc["input_ids"][0]
+        spans = []
+        for pos, (tid, (start, end)) in enumerate(zip(ids, enc["offset_mapping"][0])):
+            if tid in (self.tokenizer.pad_token_id, self.tokenizer.eos_token_id):
+                continue
+            while start < end and text[start].isspace():
+                start += 1
+            if start < end:
+                spans.append((pos, start, end))
+        return spans
 
 
 def build_text_encoder(config: dict, device="cpu") -> "CLIPTextEncoder | T5TextEncoder":

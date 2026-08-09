@@ -22,51 +22,44 @@ LATENT_DIM=512
 UNET_LEVELS=3
 UNET_BLOCKS_PER_LEVEL=2
 EPOCHS=500
-# Output-head parameterisation: eps (default) or x0 (Option 5, see
-# docs/AttentionGrounding_Options.md §5 and ARCHITECTURE.md "Prediction target").
-# x0 regresses the clean motion directly instead of the noise. Saved into the
-# checkpoint config, so generate/evaluate/edit convert back automatically — nothing
-# downstream needs a flag.
-#   !! Do NOT add --snr_gamma to the train call below when using x0. train.py forces
-#   snr_gamma=0 under x0 *only if the flag was not passed explicitly*, and Min-SNR
-#   under an x0 head reproduces the eps baseline's weighting almost exactly (3% of
-#   training weight on t>=600 vs 40% unweighted), which cancels the whole point.
-PREDICT_TYPE="eps"               # eps | x0
-# MDM-style geometric losses, added to the diffusion MSE with these weights.
-#   pos  — joint-position error. humanml3d reads the positions straight out of channels
-#          [4:67]; smplh has none in its features and must run SMPL FK to get them, which
-#          composes rotation error down the kinematic chain (the expensive, less stable one).
-#   vel  — frame-to-frame position difference (penalises jitter).
-#   foot — predicted foot velocity on frames the GT calls "in contact" (anti-skating).
-# ALL THREE AT 0 DISABLES THEM COMPLETELY: build_geo_fn returns geo_fn=None, the epoch
-# loop skips the whole block, and under smplh the SMPL-H body model is never even loaded.
-# Setting only some to 0 keeps the machinery and drops those terms.
-#   Worth knowing before changing these: every run in runs/ so far used exactly
-#   (0.1, 0.1, 0.01) — they have never been ablated, so there is no measurement in this
-#   project of what they buy. Under smplh they are the ONLY positional supervision (the
-#   135-d features are rotations); under humanml3d L_pos largely re-weights channels the
-#   diffusion MSE already covers. See docs/PROGRESS.md for the run they are implicated in.
-GEO_POS_WEIGHT=0.1
-GEO_VEL_WEIGHT=0.1
-GEO_FOOT_WEIGHT=0.01
-# Geometric-loss confidence weight (alpha_bar_t damping). "" = AUTO: on for eps, off
-# for x0 (an x0 head outputs x0 directly, so there is no 1/sqrt(alpha_bar_t) error
-# amplification to damp). "--geo_conf_weight" forces on — the escape hatch if an x0
-# run destabilises near t=T; "--no-geo_conf_weight" forces off. No effect when the
-# three weights above are all 0.
+# What the output head predicts: noise (eps) or the clean motion (x0, Option 5 — see
+# ARCHITECTURE.md "Prediction target"). Saved in the checkpoint, so nothing downstream
+# needs a flag. !! Do NOT add --snr_gamma under x0: Min-SNR there reproduces the eps
+# weighting and cancels the point (train.py forces it to 0 unless passed explicitly).
+PREDICT_TYPE="x0"               # eps | x0
+# MDM-style geometric losses on top of the diffusion MSE. All three at 0 disables the
+# machinery entirely (no geo_fn, and smplh never loads the SMPL-H body model).
+# Never ablated — every run in runs/ used exactly these values.
+GEO_POS_WEIGHT=0.1               # joint-position error (smplh: via SMPL FK)
+GEO_VEL_WEIGHT=0.1               # frame-to-frame position difference (anti-jitter)
+GEO_FOOT_WEIGHT=0.01             # foot velocity on GT-contact frames (anti-skating)
+# alpha_bar_t damping of the geo losses. "" = AUTO (on for eps, off for x0 — an x0 head
+# has no 1/sqrt(alpha_bar_t) amplification to damp). "--geo_conf_weight" / "--no-..." force it.
 GEO_CONF_WEIGHT=""
-# NOTE: attn_sink forces the explicit (non-fused) attention path during training —
-# costs GPU memory vs SDPA (bs 20 OOMs on a 12 GB card where SDPA fit; bs 16 OK).
-# Re-check the batch size on the training machine before a long run.
-# Autocast dtype. "auto" = bf16 where the GPU supports it, else fp16. fp16 saturates at
-# 65504, so an activation that merely grows large becomes an inf -> non-finite loss ->
-# skipped step; bf16 keeps fp32's exponent range and cannot overflow that way. Two runs
-# have been lost to this (docs/FINDINGS.md "fp16 activation overflow"). fp32 is the
-# slow, definitely-safe fallback for a GPU without bf16 (pre-Ampere, e.g. V100).
+# "auto" = bf16 where supported, else fp16. fp16 saturates at 65504, so a large activation
+# becomes an inf -> non-finite loss -> skipped step; two runs were lost that way
+# (docs/FINDINGS.md "fp16 activation overflow"). fp32 is the safe fallback pre-Ampere.
 AMP_DTYPE="auto"                 # auto | bf16 | fp16 | fp32
 BATCH_SIZE=128
 ATTN_SINK="--attn_sink"          # "--no-attn_sink" to disable (see ARCHITECTURE.md)
 ATTN_ENTROPY_WEIGHT=0.0          # 0 disables; try 0.01 (experiment knob, keep runs attributable)
+# ── Attention grounding: TokenCompose L_token (Option 1) ──────────────────────────
+# Trains the caption's body-part words to attend to that part's group tokens.
+# Design, risks and the measured gate: docs/TokenCompose_Handoff.md; loss:
+# src/training/grounding.py. Labels come from the caption parser, no LLM.
+ATTN_GROUND_WEIGHT=0.0           # 0 = off (whole block). The run: 5e-3
+ATTN_GROUND_LAYERS="middle"      # "middle" (blocks 3-5 of 8) | "all" | "3,4,5"
+ATTN_GROUND_MIRROR=1.0           # weight of the left/right mirror margin (tier-1 items)
+ATTN_GROUND_MARGIN=0.1           # how far the target group must beat its mirror
+ATTN_GROUND_WARMUP_EPOCHS=20     # from-scratch attention is noise before this
+# "" = soft 1-alpha_bar_t weighting (pressure at HIGH noise — the defence against the
+# loss being satisfied by a motion detector; do not flip it to alpha_bar_t).
+# "--attn_ground_window 750 999" is the hard-gate ablation.
+ATTN_GROUND_WINDOW=""
+# "" = log corr(supervised attention, source motion energy) per epoch.
+# KILL CRITERION: above ~0.5 and rising while m_S rises. "--no-attn_ground_monitor" off.
+ATTN_GROUND_MONITOR=""
+ATTN_GROUND_CACHE=""             # "" = <FEAT_ROOT>/ground_labels.json, built on first use
 EMA_DECAY=0.9999
 SAVE_EVERY=250
 VAL_EVERY=1
@@ -75,15 +68,14 @@ SPLIT="val"
 # ----------------------------------------------------------------------
 # Derived paths
 # ----------------------------------------------------------------------
-# Feature root differs per mode; each dataset dir is self-contained (new_joint_vecs/, texts/,
-# Mean/Std, splits). evaluate additionally needs new_joints/ for the smplh tgt-offset reference,
-# which only lives in the processed HumanML3D dir. For humanml3d all roots coincide.
+# Each dataset dir is self-contained, so the feature root just follows FEATURE_MODE.
+# evaluate is the exception: it also needs new_joints/, which only the HumanML3D dir has.
 if [[ "${FEATURE_MODE}" == "smplh" ]]; then
-  FEAT_ROOT="${SMPLH_ROOT}"    # train/generate read 135-d feats + texts + Mean/Std here
+  FEAT_ROOT="${SMPLH_ROOT}"
 else
   FEAT_ROOT="${HML3D_ROOT}"
 fi
-EVAL_DATA_ROOT="${HML3D_ROOT}" # evaluate needs texts/ + new_joints/ (smplh tgt-offset ref)
+EVAL_DATA_ROOT="${HML3D_ROOT}"
 
 OUTPUT_DIR="runs/${EXP_NAME}"
 CHECKPOINT="${OUTPUT_DIR}/checkpoint_latest"
@@ -95,24 +87,40 @@ EVAL_DIR="eval_results"
 # ----------------------------------------------------------------------
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 
-# ARCH=unet adds the U-Net depth flags; ARCH=dit passes none of them. Either way `arch`
-# (and the unet keys) are saved into the checkpoint's config.json, so generate/evaluate
-# rebuild the right backbone automatically — no arch flag is needed downstream.
+# ARCH=unet adds the depth flags; dit passes none. Saved in config.json either way, so
+# generate/evaluate rebuild the right backbone with no arch flag downstream.
 ARCH_ARGS=(--arch "${ARCH}")
 if [[ "${ARCH}" == "unet" ]]; then
   ARCH_ARGS+=(--unet_levels "${UNET_LEVELS}" --unet_blocks_per_level "${UNET_BLOCKS_PER_LEVEL}")
 fi
 
+# Grounding flags only when the weight is non-zero. Numeric test so 0 / 0.0 / 0e0 match.
+GROUND_ARGS=()
+if awk "BEGIN{exit !(${ATTN_GROUND_WEIGHT}>0)}"; then
+  GROUND_ARGS=(--attn_ground_weight        "${ATTN_GROUND_WEIGHT}"
+               --attn_ground_layers        "${ATTN_GROUND_LAYERS}"
+               --attn_ground_mirror        "${ATTN_GROUND_MIRROR}"
+               --attn_ground_margin        "${ATTN_GROUND_MARGIN}"
+               --attn_ground_warmup_epochs "${ATTN_GROUND_WARMUP_EPOCHS}")
+  [[ -n "${ATTN_GROUND_CACHE}" ]] && GROUND_ARGS+=(--attn_ground_cache "${ATTN_GROUND_CACHE}")
+  # Unquoted on purpose: these hold whole flags and must word-split.
+  GROUND_ARGS+=(${ATTN_GROUND_WINDOW} ${ATTN_GROUND_MONITOR})
+fi
+
 # ----------------------------------------------------------------------
 # 1. Train
 # ----------------------------------------------------------------------
-# Numeric test, not a string one, so 0 / 0.0 / 0e0 all report the same thing.
 if awk "BEGIN{exit !(${GEO_POS_WEIGHT}+${GEO_VEL_WEIGHT}+${GEO_FOOT_WEIGHT}==0)}"; then
   GEO_DESC="geo=OFF"
 else
   GEO_DESC="geo=${GEO_POS_WEIGHT}/${GEO_VEL_WEIGHT}/${GEO_FOOT_WEIGHT}"
 fi
-log "Training (arch=${ARCH}, predict=${PREDICT_TYPE}, lr=${LEARNING_RATE}, ${GEO_DESC}, out=${OUTPUT_DIR})"
+if awk "BEGIN{exit !(${ATTN_GROUND_WEIGHT}>0)}"; then
+  GROUND_DESC="ground=${ATTN_GROUND_WEIGHT}@${ATTN_GROUND_LAYERS}"
+else
+  GROUND_DESC="ground=OFF"
+fi
+log "Training (arch=${ARCH}, predict=${PREDICT_TYPE}, lr=${LEARNING_RATE}, ${GEO_DESC}, ${GROUND_DESC}, out=${OUTPUT_DIR})"
 python src/train.py \
   --data_root     "${FEAT_ROOT}" \
   --output_dir    "${OUTPUT_DIR}" \
@@ -134,6 +142,7 @@ python src/train.py \
   --hml3d_vel_weight  "${GEO_VEL_WEIGHT}" \
   --hml3d_foot_weight "${GEO_FOOT_WEIGHT}" \
   "${ARCH_ARGS[@]}" \
+  "${GROUND_ARGS[@]}" \
   ${ATTN_SINK} \
   ${GEO_CONF_WEIGHT} \
   --attn_entropy_weight "${ATTN_ENTROPY_WEIGHT}"

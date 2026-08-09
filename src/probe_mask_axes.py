@@ -39,7 +39,7 @@ from analysis.instructions import DEFAULT_INSTRUCTIONS
 from analysis.mask_axes import decompose, summary_row
 from analysis.mask_probe import collect_instruction_masks
 from data.clips import load_clip
-from editing import MotionEditor
+from editing import MotionEditor, masking
 from model.body_groups import group_names, resolve_group_context
 from model.schedule import NoiseSchedule
 from model.text_encoder import build_text_encoder
@@ -59,12 +59,23 @@ def parse_args():
     add_mask_args(p)
     p.add_argument("--clip", action="append", required=True,
                    help="Clip id in <data_root>/new_joint_vecs. Repeat for several.")
+    p.add_argument("--m1_readout", action="append", default=None,
+                   choices=list(masking.ALL_READOUTS),
+                   help="M1 per-cell readout; repeat to score several. All requested "
+                        "readouts are computed from ONE inversion per clip, so their "
+                        "numbers differ by readout alone (the inversion is stochastic, "
+                        "±0.02 on these metrics). Default: raw.")
     p.add_argument("--out_dir", default="eval_results/mask_axes")
     return p.parse_args()
 
 
-def probe_one(ckpt, clip, args, device) -> dict:
-    """All M1/M2 statistics for one checkpoint × one clip."""
+def probe_one(ckpt, clip, args, device) -> list[dict]:
+    """All M1/M2 statistics for one checkpoint × one clip, one dict per M1 readout.
+
+    Every requested readout is scored off the SAME inversion and the same stored
+    attention, so a readout-vs-readout contrast carries no inversion noise; M2 is
+    identical across them by construction and serves as the within-run control.
+    """
     model, config = load_model(ckpt, device=device, use_ema=not args.no_ema)
     feature_mode, is_group, group_mode, _ = resolve_group_context(config)
     if not is_group:
@@ -87,15 +98,18 @@ def probe_one(ckpt, clip, args, device) -> dict:
 
     # m1_only isolates what a grounded attention readout would drive; m2_only is the
     # editor default.
+    readouts = tuple(args.m1_readout or ("raw",))
+    col_stats = {}
     m1_maps, m2_maps, binaries = collect_instruction_masks(
         model, schedule, editor, state, text_encoder, DEFAULT_INSTRUCTIONS, valid,
         is_group, mask_modes=("m1_only", "m2_only"), lambda_attn=args.lambda_attn,
         lambda_noise=args.lambda_noise,
         sweeps=resolve_sweeps(args.mask_timesteps, schedule.T,
                               args.m1_window, args.m2_window),
-        per_step_norm=args.per_step_norm)
+        per_step_norm=args.per_step_norm, attn_readout=readouts,
+        stats_out=col_stats)
 
-    return {
+    return [{
         "checkpoint": ckpt, "clip": clip, "frames": F,
         "predict_type": config.get("predict_type", "eps"),
         # M2 is read in this space; ψ_ε and ψ_x0 are different mixtures across the
@@ -103,8 +117,13 @@ def probe_one(ckpt, clip, args, device) -> dict:
         "edit_space": editor.edit_space,
         "arch": config.get("arch", "dit"), "feature_mode": feature_mode,
         "group_mode": group_mode,
-        **decompose(m1_maps, m2_maps, binaries, src_act, glabels),
-    }
+        "attn_readout": r,
+        # Per-column-class attention mass and value norm; identical across readouts
+        # (it describes the stored attention, not the readout), carried on each record
+        # so a single JSON is self-contained.
+        "column_stats": col_stats,
+        **decompose(m1_maps[r], m2_maps, binaries[r], src_act, glabels),
+    } for r in readouts]
 
 
 def _target_label(d) -> str:
@@ -115,8 +134,8 @@ def _target_label(d) -> str:
     return d["predict_type"] if space == d["predict_type"] else f"{d['predict_type']}>{space}"
 
 
-def _format_row(label, target, values):
-    return (f"{label:8} | {target:7} | "
+def _format_row(label, readout, target, values):
+    return (f"{label:8} | {readout:8} | {target:7} | "
             + "   ".join(f"{v:.3f}" for v in values[:3]) + "   | "
             + "   ".join(f"{v:.3f}" for v in values[3:6]) + "   | "
             + "  ".join(f"{v:+.3f}" for v in values[6:8]) + "  | "
@@ -124,21 +143,21 @@ def _format_row(label, target, values):
 
 
 def print_table(results):
-    hdr = (f"{'clip':8} | {'target':7} | "
+    hdr = (f"{'clip':8} | {'readout':8} | {'target':7} | "
            + " ".join(f"{c:7}" for c in TABLE_COLUMNS[:3]) + " | "
            + " ".join(f"{c:7}" for c in TABLE_COLUMNS[3:6]) + " | "
            + " ".join(f"{c:7}" for c in TABLE_COLUMNS[6:8]) + " | "
            + " ".join(f"{c:6}" for c in TABLE_COLUMNS[8:]))
     print("\n" + hdr)
     print("-" * len(hdr))
-    per_target = {}
+    per_group = {}
     for d in results:
         row = summary_row(d)
-        per_target.setdefault(_target_label(d), []).append(row)
-        print(_format_row(d["clip"], _target_label(d), row))
+        per_group.setdefault((d["attn_readout"], _target_label(d)), []).append(row)
+        print(_format_row(d["clip"], d["attn_readout"], _target_label(d), row))
     print("-" * len(hdr))
-    for target, rows in per_target.items():
-        print(_format_row("MEAN", target, np.mean(rows, axis=0)))
+    for (readout, target), rows in per_group.items():
+        print(_format_row("MEAN", readout, target, np.mean(rows, axis=0)))
     print(f"\nchance alignment = {results[0]['align_chance']:.3f}   "
           f"(rcat → 1 = mask ignores arm-vs-leg;  rlat → 1 = mask ignores left-vs-right)")
 
@@ -146,8 +165,38 @@ def print_table(results):
     for d in results:
         for key in ("m1", "m2"):
             cc = d[f"{key}_category_contrast"]
-            print(f"  {d['clip']} {_target_label(d):7} {key}: "
+            print(f"  {d['clip']} {d['attn_readout']:8} {_target_label(d):7} {key}: "
                   f"arm {cc['arm_shift']:+.3f}   leg {cc['leg_shift']:+.3f}")
+
+    print_column_stats(results)
+
+
+def print_column_stats(results):
+    """Attention mass vs value norm per column class — the diagnostic that decides
+    whether the sink column a readout discards was carrying the contribution."""
+    # column_stats describes the stored attention, so it is identical across readouts
+    # of the same (checkpoint, clip) — keep the first of each.
+    seen, rows = set(), []
+    for d in results:
+        key = (d["checkpoint"], d["clip"])
+        if d.get("column_stats") and key not in seen:
+            seen.add(key)
+            rows.append(d)
+    if not rows:
+        return
+    print("\nattention mass vs value norm by column class "
+          "(sweep mean; mass is per row, rows sum to <= 1):")
+    print(f"  {'clip':8} {'class':8} {'mass':>8} {'|v|':>8} {'mass*|v|':>10}")
+    for d in rows:
+        agg = {}
+        for stats in d["column_stats"].values():           # one per instruction
+            for k, v in stats.items():
+                agg[k] = agg.get(k, 0.0) + v / len(d["column_stats"])
+        for cls in ("content", "eos", "pad"):
+            m, vn = agg.get(f"mass_{cls}"), agg.get(f"vnorm_{cls}")
+            if m is None or vn is None:
+                continue
+            print(f"  {d['clip']:8} {cls:8} {m:8.4f} {vn:8.4f} {m * vn:10.4f}")
 
 
 def main():
@@ -161,12 +210,16 @@ def main():
         tag = os.path.basename(os.path.dirname(ckpt.rstrip("/"))) or "ckpt"
         for clip in args.clip:
             print(f"\n── {tag}  clip {clip} ──")
-            res = probe_one(ckpt, clip, args, device)
-            out = os.path.join(args.out_dir, f"{tag}_{clip}.json")
-            with open(out, "w") as f:
-                json.dump(res, f, indent=2)
-            print(f"wrote {out}")
-            results.append(res)
+            for res in probe_one(ckpt, clip, args, device):
+                # The readout is part of the filename only when it isn't the historical
+                # default, so existing "<tag>_<clip>.json" baselines stay addressable.
+                r = res["attn_readout"]
+                name = f"{tag}_{clip}.json" if r == "raw" else f"{tag}_{clip}_{r}.json"
+                out = os.path.join(args.out_dir, name)
+                with open(out, "w") as f:
+                    json.dump(res, f, indent=2)
+                print(f"wrote {out}")
+                results.append(res)
 
     print_table(results)
 

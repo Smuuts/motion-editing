@@ -59,13 +59,59 @@ def build_parser():
                         "(GPT-OSS-style; default on). Gives queries that don't need "
                         "text a dump site instead of hijacking EOS, so stored attention "
                         "maps are sink-free by construction. Config-gated, so old "
-                        "checkpoints load with it off. Forces the explicit (non-fused) "
-                        "attention path — costs memory.")
+                        "checkpoints load with it off. Costs no extra memory: the sink "
+                        "is expressed as an SDPA-compatible extra key/value column, so "
+                        "training stays on the fused kernel.")
     p.add_argument("--attn_entropy_weight", type=float, default=0.0,
                    help="Cross-attention entropy regulariser: loss -= w * H(attn), "
                         "encouraging queries to spread over words instead of collapsing "
                         "onto one key. 0 disables (default); measured NEGATIVE at 0.01 "
                         "(docs/FINDINGS.md). Also forces the explicit attention path.")
+    # ── attention grounding (TokenCompose L_token, Option 1) ───────────────────
+    # All default off, so a run that does not pass --attn_ground_weight is byte-identical
+    # to one from before these flags existed. See src/training/grounding.py and
+    # docs/TokenCompose_Handoff.md.
+    p.add_argument("--attn_ground_weight", type=float, default=0.0,
+                   help="TokenCompose cross-attention grounding loss: the text columns "
+                        "spelling out a body part must put their attention on that "
+                        "part's group tokens, loss += w * (1 - mass_on_target)^2. 0 "
+                        "disables everything below (default). TokenCompose's released "
+                        "config uses 1e-3 summed over ~10 attention maps per step; this "
+                        "supervises ONE block per step, so 5e-3 is the starting point.")
+    p.add_argument("--attn_ground_layers", type=str, default="middle",
+                   help="Blocks eligible for grounding, one sampled per step: 'middle' "
+                        "(default, the middle 3/8 = blocks 3-5 of 8 — TokenCompose's own "
+                        "mid+decoder choice, and where this project's self-attention "
+                        "probe found body-part structure peaking), 'all', or an explicit "
+                        "list like '3,4,5'.")
+    p.add_argument("--attn_ground_mirror", type=float, default=1.0,
+                   help="Weight of the mirror-margin term, relu(mass_mirror - mass_target"
+                        " + margin), on lateralised (tier-1) items only. This is the "
+                        "term aimed at laterality — the axis no training-free fix has "
+                        "ever moved (M1 left/right invariance r=0.985). 0 disables it.")
+    p.add_argument("--attn_ground_margin", type=float, default=0.1,
+                   help="How far the target group must beat its left/right mirror.")
+    p.add_argument("--attn_ground_warmup_epochs", type=int, default=20,
+                   help="Epochs before the grounding loss switches on. From scratch, "
+                        "attention is random noise at epoch 0 (TokenCompose finetuned a "
+                        "converged model); the warmup also means no explicit-softmax "
+                        "memory cost until then.")
+    p.add_argument("--attn_ground_window", type=int, nargs=2, default=None,
+                   metavar=("LO", "HI"),
+                   help="Ablation: hard-gate grounding to timesteps in [LO, HI] instead "
+                        "of the default soft 1-alpha_bar_t weighting. Costs ~4x the "
+                        "grounded-sample rate ([750,999] fires on ~25%% of samples).")
+    p.add_argument("--attn_ground_cache", type=str, default=None,
+                   help="Caption->body-part label cache built by "
+                        "src/probe_ground_labels.py. Default "
+                        "<data_root>/ground_labels.json; built automatically if absent.")
+    p.add_argument("--attn_ground_monitor", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Log corr(supervised attention, source motion energy) each epoch "
+                        "(default on). Captions describe their clips, so the loss is "
+                        "partly satisfiable by a source-motion detector; this is how you "
+                        "see that happening. Kill the run if it passes ~0.5 and rises "
+                        "while m_S rises.")
     p.add_argument("--ctx_pad_mask", action=argparse.BooleanOptionalAction, default=True,
                    help="Mask padding keys in cross-attention (default on). Without it "
                         "zero-embedding pad columns absorb ~93%% of attention mass and "

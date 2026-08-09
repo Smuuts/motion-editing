@@ -9,17 +9,19 @@ Design (see docs/MotionCLR_UNet_Research.md, docs/ARCHITECTURE.md):
   - MotionCLR "CLR block" order: temporal Conv1d (timestep injected here via adaGN,
     and ONLY here — attention/FFN are timestep-free, unlike GroupDiT's adaLN-zero) →
     self-attention → cross-attention → FFN. The attention/FFN modules are reused
-    verbatim from model/layers.py, so attn_sink, ctx_pad_mask, store_attn and the
-    entropy regulariser all behave exactly as in the DiT.
+    verbatim from model/layers.py, so attn_sink, ctx_pad_mask, store_attn, the
+    entropy regulariser and the grounding supervision hook all behave exactly as in
+    the DiT.
   - Epsilon prediction (NOT MotionCLR's native x0/"sample"), so NoiseSchedule,
     Min-SNR, x0_confidence_weight, the geometric/FK losses, the sampler and the full
     LEDITS++ inversion/editing stack are reused with zero changes.
 
 Interface contract honoured (identical to GroupDiT):
   forward(motion (B,F,D), t (B,), context (B,L,C)|None,
-          store_attn=False, mask=(B,F)|None, entropy_layer=int|None) -> eps (B,F,D)
+          store_attn=False, mask=(B,F)|None, entropy_layer=int|None,
+          supervise_layer=int|None) -> eps (B,F,D)
   attributes: input_dim, group_channels, latent_dim, null_text_emb, blocks
-  methods:    get_attn_maps(), get_attn_entropy(idx)
+  methods:    get_attn_maps(), get_attn_entropy(idx), get_sup_attn(idx)
 
 The one U-Net-specific wrinkle: cross-attention lives at multiple frame resolutions,
 so each block's stored map has a different (F'·G) token count. get_attn_maps()
@@ -149,7 +151,7 @@ class CLRBlock(nn.Module):
 
     def forward(self, x, t_emb, context, G,
                 self_mask=None, store_attn=False, context_mask=None,
-                compute_entropy=False):
+                compute_entropy=False, supervise=False):
         B, Fp, _, _ = x.shape
 
         # ── temporal conv (B·G, C, F'), timestep injected here only ─────────
@@ -161,7 +163,8 @@ class CLRBlock(nn.Module):
         h = h + self.self_attn(self.norm1(h), mask=self_mask)
         h = h + self.cross_attn(self.norm2(h), context, store_attn=store_attn,
                                 context_mask=context_mask,
-                                compute_entropy=compute_entropy)
+                                compute_entropy=compute_entropy,
+                                supervise=supervise)
         h = h + self.ff(self.norm3(h))
         return h.reshape(B, Fp, G, Cout)
 
@@ -308,6 +311,33 @@ class GroupMotionUNet(nn.Module):
     def get_attn_entropy(self, block_idx: int) -> torch.Tensor:
         return self.blocks[block_idx].cross_attn.last_entropy
 
+    def get_sup_attn(self, block_idx: int) -> torch.Tensor:
+        """Head-averaged cross-attention (B, F, G, L_text) with graph, for the
+        grounding loss — the GroupDiT.get_sup_attn contract (model/dit.py).
+
+        A block below the top resolution attends over F' < F frames, so its map is
+        interpolated back to the original F exactly as get_attn_maps does. That keeps
+        the loss's (frame, group) grid the same object the caller's frame mask and
+        source-activity reference are indexed on. The interpolation is differentiable,
+        so gradient still reaches the coarse block — but the labels' frame axis is
+        smeared by the resample, which is one reason run 1 uses arch=dit.
+
+        Reading it clears it, same contract (and same reason) as GroupDiT.get_sup_attn.
+        """
+        cross = self.blocks[block_idx].cross_attn
+        attn, cross.last_sup_attn = cross.last_sup_attn, None       # (B, F'·G, L)
+        if attn is None:
+            return None
+        G, Fo = self.G, self._last_orig_F
+        B, NG, L = attn.shape
+        Fp = NG // G
+        a = attn.reshape(B, Fp, G, L)
+        if Fp == Fo:
+            return a
+        a = a.permute(0, 2, 3, 1).reshape(-1, 1, Fp)                # (B·G·L, 1, F')
+        a = F.interpolate(a, size=Fo, mode="linear", align_corners=False)
+        return a.reshape(B, G, L, Fo).permute(0, 3, 1, 2)           # (B, F, G, L)
+
     # ── forward ──────────────────────────────────────────────────────────────
     def forward(
         self,
@@ -317,6 +347,7 @@ class GroupMotionUNet(nn.Module):
         store_attn: bool = False,
         mask:       torch.Tensor | None = None,   # (B, F) per-frame
         entropy_layer: int | None = None,
+        supervise_layer: int | None = None,
     ) -> torch.Tensor:
         B, Fo, _ = motion.shape
         G = self.G
@@ -354,7 +385,8 @@ class GroupMotionUNet(nn.Module):
             x = block(x, t_emb, context, G,
                       self_mask=tok_mask,
                       store_attn=store_attn, context_mask=ctx_mask,
-                      compute_entropy=(gidx == entropy_layer))
+                      compute_entropy=(gidx == entropy_layer),
+                      supervise=(gidx == supervise_layer))
             gidx += 1
 
         # encoder

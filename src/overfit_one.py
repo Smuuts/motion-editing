@@ -173,7 +173,7 @@ def main():
         # CFG dropout and the objective come from training/epoch.py — the whole point
         # of this script is to reproduce train.py's conditions, which a local copy of
         # the loss could not guarantee.
-        context_in = apply_cfg_dropout(model, context, args.cfg_dropout)
+        context_in, _ = apply_cfg_dropout(model, context, args.cfg_dropout)
         with autocast(device_type=device.type):
             prediction = model(x_t, t, context_in, mask=attn_mask)
             # ε or x0 per predict_type; min_snr_weight flips form to match.
