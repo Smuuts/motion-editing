@@ -61,6 +61,7 @@ from editing import MotionEditor
 from model.body_groups import GROUP_NAMES, group_names, resolve_group_context
 from model.schedule import NoiseSchedule
 from model.text_encoder import build_text_encoder
+from training.grounding import resolve_readout_layers
 from utils.cli import add_data_args, add_mask_args, add_model_args, resolve_device
 from utils.decode import smplh_body_model
 from utils.model_io import load_model
@@ -122,7 +123,8 @@ def main():
           f"instructions: {instructions}")
 
     editor = MotionEditor(model, schedule, device, is_group=is_group,
-                          edit_space=args.edit_space)
+                          edit_space=args.edit_space, psi_readout=args.psi_readout,
+                          attn_layers=resolve_readout_layers(config, args.m1_layers))
     print(f"predict_type={schedule.predict_type}  edit_space={editor.edit_space} "
           f"(ψ read as {'|x̂0_c − x̂0_ref|' if editor.edit_space == 'x0' else '|ε_c − ε_ref|'})")
     glabels = group_names(group_mode) if is_group else ["all"]
@@ -136,12 +138,17 @@ def main():
         print(f"sweep: M1 {args.m1_window or 'full'}  M2 {args.m2_window or 'full'}  "
               f"per_step_norm={args.per_step_norm}")
 
+    columns = {}
     m1_maps, m2_maps, binaries = collect_instruction_masks(
         model, schedule, editor, state, text_encoder, instructions, valid_frames,
         is_group, mask_modes=(args.mask_mode,), lambda_attn=args.lambda_attn,
         lambda_noise=args.lambda_noise, attn_readout=args.m1_readout, sweeps=sweeps,
-        per_step_norm=args.per_step_norm)
+        per_step_norm=args.per_step_norm, column_mode=args.m1_columns, config=config,
+        group_mode=group_mode, columns_out=columns)
     bin_maps = binaries[args.mask_mode]
+    print(f"M1 columns ({args.m1_columns}): "
+          + ", ".join(f"{e!r}->{m}" for e, (m, _) in columns.items())
+          + f"   ψ read-out: {editor.psi_readout}")
     for e, b in zip(instructions, bin_maps):
         cells, frames = active_cells(b)
         print(f"  {e!r}: mask {cells} active cells, {frames}/{F} frames")
@@ -152,7 +159,9 @@ def main():
 
     base = os.path.join(args.out_dir, f"{clip_id}_mask_problem")
     plot_mask_problem(clip_id, caption, instructions, targets, m1_maps, m2_maps,
-                      bin_maps, src_act, glabels, args.mask_mode, base + ".png")
+                      bin_maps, src_act, glabels, args.mask_mode, base + ".png",
+                      invariance=(mean_off_diagonal(m1_corr), mean_off_diagonal(m2_corr))
+                      if len(instructions) > 1 else None)
     plot_mask_quant(clip_id, caption, instructions, m1_corr, m2_corr, m1_src, m2_src,
                     base + "_quant.png")
 

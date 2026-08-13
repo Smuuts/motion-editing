@@ -43,12 +43,13 @@ from editing import MotionEditor, masking
 from model.body_groups import group_names, resolve_group_context
 from model.schedule import NoiseSchedule
 from model.text_encoder import build_text_encoder
+from training.grounding import resolve_readout_layers
 from utils.cli import add_data_args, add_mask_args, add_model_args, resolve_device
 from utils.model_io import load_model
 from utils.probe import resolve_sweeps, source_activity
 
 TABLE_COLUMNS = ["M1 rcat", "M1 rlat", "M1 roff", "M2 rcat", "M2 rlat", "M2 roff",
-                 "M1~src", "M2~src", "algM1", "algM2"]
+                 "M1~src", "M2~src", "algM1", "algM2", "algM1nM2", "recM1nM2", "nCells"]
 
 
 def parse_args():
@@ -92,22 +93,24 @@ def probe_one(ckpt, clip, args, device) -> list[dict]:
     valid = torch.ones(F, dtype=torch.bool, device=device)
 
     editor = MotionEditor(model, schedule, device, is_group=is_group,
-                          edit_space=args.edit_space)
+                          edit_space=args.edit_space, psi_readout=args.psi_readout,
+                          attn_layers=resolve_readout_layers(config, args.m1_layers))
     state = editor.invert(x0)
     src_act = source_activity(x0, editor.group_channels)
 
     # m1_only isolates what a grounded attention readout would drive; m2_only is the
     # editor default.
     readouts = tuple(args.m1_readout or ("raw",))
-    col_stats = {}
+    col_stats, columns = {}, {}
     m1_maps, m2_maps, binaries = collect_instruction_masks(
         model, schedule, editor, state, text_encoder, DEFAULT_INSTRUCTIONS, valid,
-        is_group, mask_modes=("m1_only", "m2_only"), lambda_attn=args.lambda_attn,
-        lambda_noise=args.lambda_noise,
+        is_group, mask_modes=("m1_only", "m2_only", "attn"),
+        lambda_attn=args.lambda_attn, lambda_noise=args.lambda_noise,
         sweeps=resolve_sweeps(args.mask_timesteps, schedule.T,
                               args.m1_window, args.m2_window),
         per_step_norm=args.per_step_norm, attn_readout=readouts,
-        stats_out=col_stats)
+        stats_out=col_stats, column_mode=args.m1_columns, config=config,
+        group_mode=group_mode, columns_out=columns)
 
     return [{
         "checkpoint": ckpt, "clip": clip, "frames": F,
@@ -118,6 +121,11 @@ def probe_one(ckpt, clip, args, device) -> list[dict]:
         "arch": config.get("arch", "dit"), "feature_mode": feature_mode,
         "group_mode": group_mode,
         "attn_readout": r,
+        # Which columns/ψ read-out produced these numbers. Recorded per result for the
+        # same reason edit_space is: they change what M1/M2 mean, so a number without
+        # them is ambiguous once more than one setting has ever been run.
+        "m1_columns": {e: mode for e, (mode, _) in columns.items()},
+        "psi_readout": editor.psi_readout,
         # Per-column-class attention mass and value norm; identical across readouts
         # (it describes the stored attention, not the readout), carried on each record
         # so a single JSON is self-contained.
@@ -134,30 +142,42 @@ def _target_label(d) -> str:
     return d["predict_type"] if space == d["predict_type"] else f"{d['predict_type']}>{space}"
 
 
-def _format_row(label, readout, target, values):
-    return (f"{label:8} | {readout:8} | {target:7} | "
+def _run_tag(d) -> str:
+    """Short name of the run a row came from — the checkpoint's parent directory."""
+    return os.path.basename(os.path.dirname(d["checkpoint"].rstrip("/"))) or "ckpt"
+
+
+def _format_row(run, label, readout, target, values):
+    return (f"{run:20} | {label:8} | {readout:8} | {target:7} | "
             + "   ".join(f"{v:.3f}" for v in values[:3]) + "   | "
             + "   ".join(f"{v:.3f}" for v in values[3:6]) + "   | "
             + "  ".join(f"{v:+.3f}" for v in values[6:8]) + "  | "
-            + "  ".join(f"{v:.3f}" for v in values[8:]))
+            + "  ".join(f"{v:.3f}" for v in values[8:12]) + f"  {values[12]:6.0f}")
 
 
 def print_table(results):
-    hdr = (f"{'clip':8} | {'readout':8} | {'target':7} | "
+    hdr = (f"{'run':20} | {'clip':8} | {'readout':8} | {'target':7} | "
            + " ".join(f"{c:7}" for c in TABLE_COLUMNS[:3]) + " | "
            + " ".join(f"{c:7}" for c in TABLE_COLUMNS[3:6]) + " | "
            + " ".join(f"{c:7}" for c in TABLE_COLUMNS[6:8]) + " | "
            + " ".join(f"{c:6}" for c in TABLE_COLUMNS[8:]))
     print("\n" + hdr)
     print("-" * len(hdr))
+    # Group by RUN as well as readout/target. Grouping on `target` alone silently pools
+    # two checkpoints whenever they share a predict_type — which is exactly the case for
+    # the comparison this probe exists to make (a grounded x0 run against its x0 twin),
+    # so the MEAN row reported the average of the two models being contrasted.
     per_group = {}
     for d in results:
         row = summary_row(d)
-        per_group.setdefault((d["attn_readout"], _target_label(d)), []).append(row)
-        print(_format_row(d["clip"], d["attn_readout"], _target_label(d), row))
+        key = (_run_tag(d), d["attn_readout"], _target_label(d))
+        per_group.setdefault(key, []).append(row)
+        print(_format_row(_run_tag(d), d["clip"], d["attn_readout"],
+                          _target_label(d), row))
     print("-" * len(hdr))
-    for (readout, target), rows in per_group.items():
-        print(_format_row("MEAN", readout, target, np.mean(rows, axis=0)))
+    for (run, readout, target), rows in per_group.items():
+        print(_format_row(run, f"MEAN({len(rows)})", readout, target,
+                          np.mean(rows, axis=0)))
     print(f"\nchance alignment = {results[0]['align_chance']:.3f}   "
           f"(rcat → 1 = mask ignores arm-vs-leg;  rlat → 1 = mask ignores left-vs-right)")
 

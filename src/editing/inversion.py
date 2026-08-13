@@ -57,7 +57,8 @@ class InversionState:
 
 
 class MotionEditor:
-    def __init__(self, model, schedule, device, is_group: bool, edit_space="auto"):
+    def __init__(self, model, schedule, device, is_group: bool, edit_space="auto",
+                 attn_layers=None, psi_readout="abs"):
         """edit_space : "auto" (default) reads the space off the checkpoint's own
         `predict_type` via NoiseSchedule.resolve_space — an x0-trained checkpoint edits
         x0-natively, an ε-trained one keeps the historical ε-space path, and no caller
@@ -65,12 +66,34 @@ class MotionEditor:
         docstring). Forcing "x0" on an ε head is legal but does NOT remove the 1/√ᾱ_t
         amplification — it only moves it inside the difference — so keep a non-zero
         `guidance_alpha_floor` there.
+
+        attn_layers : block indices the M1 read-out averages over, or None for all of
+        them. Resolved by the caller from the checkpoint config
+        (`training.grounding.resolve_readout_layers`) for the same reason edit_space is:
+        the right value is a property of how the checkpoint was TRAINED, not something
+        a user should have to remember. A checkpoint trained with the grounding loss
+        supervised only 3 of its 8 blocks, so averaging all 8 dilutes what the read-out
+        exists to measure; a checkpoint trained without it has no such key and keeps
+        the historical all-blocks behaviour.
+
+        psi_readout : what the ψ/M2 contrast measures — "abs" (the LEDITS++ magnitude
+        |x̂0^c − x̂0^ref|, the default and the historical behaviour) or "energy" (the
+        SIGNED change in per-group motion energy). It sits here rather than on
+        `collect_masks` for the same reason `edit_space` does: it changes what ψ *means*,
+        so it must be one value for the whole edit, resolved once from a flag. Measured
+        effect inside M1 ∩ M2 at matched mask size: alignment 0.452 → 0.583 with recall
+        0.659 → 0.843 (docs/FINDINGS.md "ψ is a mixture"). The default stays "abs"
+        deliberately — the gain is measured on mask quality, and the standing MotionFix
+        negative it is meant to attack is an EDIT result, so the default flips only after
+        the end-to-end comparison.
         """
         self.model    = model
         self.schedule = schedule
         self.device   = device
         self.is_group = is_group
         self.edit_space = schedule.resolve_space(edit_space)
+        self.attn_layers = attn_layers
+        self.psi_readout = psi_readout
         # Feature layout is representation-specific: 263 (humanml3d) or 135 (smplh).
         # GroupDiT exposes both; fall back to 263 for legacy flat MotionDiT.
         self.feat_dim = getattr(model, "input_dim", 263)
@@ -179,6 +202,7 @@ class MotionEditor:
                 attn_readout=attn_readout, semantic_idxs=sem,
                 attn_timesteps=attn_timesteps, psi_timesteps=psi_timesteps,
                 per_step_norm=per_step_norm, psi_space=self.edit_space,
+                attn_layers=self.attn_layers, psi_readout=self.psi_readout,
             )
             masks.append(masking.build_mask(
                 attn_fg, psi_fg, valid_frames, self.is_group,

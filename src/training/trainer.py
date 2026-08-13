@@ -205,14 +205,26 @@ class Trainer:
             mirror_mat=mirror_matrix(c.get("group_mode", "parts")),
         )
         n_items = sum(len(v) for v in cache.values())
+        # Chance m_S is |S|/G averaged over ITEMS, not 1/G. Only a tier-1 item has a
+        # single target group; a tier-2 limb pair has two and a locomotion verb has
+        # three (legs + root), and a uniform attention map scores |S|/G on each. Printing
+        # 1/G understates chance by a lot once the label set is not all single-group —
+        # measured 0.203 for the nouns-only cache and 0.262 with verb labels, against the
+        # 0.143 this line used to print. Compute it from the cache that is actually
+        # loaded, so it can never drift from the labels again.
+        chance = sum(len(i["S"]) for v in cache.values() for i in v) / max(n_items, 1) \
+            / self.model.G
+        sizes = sorted({len(i["S"]) for v in cache.values() for i in v})
         gate = (f"hard timestep gate t in {list(window)}" if window
                 else "soft 1-alpha_bar_t weighting (pressure at HIGH noise)")
         print(f"Attention grounding ON (TokenCompose L_token): weight "
               f"{self.grounding.weight:g}, layers {layers} (one sampled per step), "
               f"mirror {self.grounding.mirror:g} @ margin {self.grounding.margin:g}, "
               f"warmup {self.grounding.warmup_epochs} epochs, {gate}.\n"
-              f"  Labels: {len(cache)} captions / {n_items} items from {cache_path}. "
-              f"Watch train/ground_m_S_epoch (chance ~ {1 / self.model.G:.3f}) and "
+              f"  Labels: {len(cache)} captions / {n_items} items from {cache_path} "
+              f"(target sizes |S| = {sizes}).\n"
+              f"  Watch train/ground_m_S_epoch (**chance {chance:.3f}** for this label "
+              f"mix, not 1/G = {1 / self.model.G:.3f}) and "
               f"train/ground_src_corr_epoch (kill above ~0.5 and rising).")
 
     def _ground_cache(self, path):
@@ -235,7 +247,8 @@ class Trainer:
                   f"over the captions; see src/probe_ground_labels.py for the audit).")
             return build_cache(self.config["data_root"], self.text_encoder,
                                group_mode=self.config.get("group_mode", "parts"),
-                               out_path=path)
+                               out_path=path,
+                               include_verbs=self.config.get("attn_ground_verbs", True))
         return load_cache(path)
 
     def _build_optim(self):

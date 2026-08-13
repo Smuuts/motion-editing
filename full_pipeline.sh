@@ -59,6 +59,12 @@ ATTN_GROUND_WINDOW=""
 # "" = log corr(supervised attention, source motion energy) per epoch.
 # KILL CRITERION: above ~0.5 and rising while m_S rises. "--no-attn_ground_monitor" off.
 ATTN_GROUND_MONITOR=""
+# "" = tier-3 verb labels ON (the default): locomotion/manipulation verbs are supervised
+# alongside nouns. 86.5% of captions with a leg verb never name a leg, so nouns-only
+# supervision misses where leg semantics live. Set to --no-attn_ground_verbs for the
+# nouns-only A/B control -- and point ATTN_GROUND_CACHE somewhere else when you do, since
+# the cache file is not keyed by this setting.
+ATTN_GROUND_VERBS=""
 ATTN_GROUND_CACHE=""             # "" = <FEAT_ROOT>/ground_labels.json, built on first use
 EMA_DECAY=0.9999
 SAVE_EVERY=250
@@ -104,7 +110,7 @@ if awk "BEGIN{exit !(${ATTN_GROUND_WEIGHT}>0)}"; then
                --attn_ground_warmup_epochs "${ATTN_GROUND_WARMUP_EPOCHS}")
   [[ -n "${ATTN_GROUND_CACHE}" ]] && GROUND_ARGS+=(--attn_ground_cache "${ATTN_GROUND_CACHE}")
   # Unquoted on purpose: these hold whole flags and must word-split.
-  GROUND_ARGS+=(${ATTN_GROUND_WINDOW} ${ATTN_GROUND_MONITOR})
+  GROUND_ARGS+=(${ATTN_GROUND_WINDOW} ${ATTN_GROUND_MONITOR} ${ATTN_GROUND_VERBS})
 fi
 
 # ----------------------------------------------------------------------

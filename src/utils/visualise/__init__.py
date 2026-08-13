@@ -18,8 +18,8 @@ from .animation import (
 from .diagnostics import plot_noise_level_sweep
 from .heatmaps import mean_off_diagonal
 from .masks import (
-    plot_gen_diff, plot_gen_diff_summary, plot_mask_problem, plot_mask_quant,
-    save_mask_heatmap,
+    plot_correction_sweep, plot_gen_diff, plot_gen_diff_summary, plot_mask_problem,
+    plot_mask_quant, plot_source_correction, save_mask_heatmap,
 )
 
 __all__ = [
@@ -28,4 +28,5 @@ __all__ = [
     "plot_noise_level_sweep", "mean_off_diagonal",
     "plot_gen_diff", "plot_gen_diff_summary",
     "plot_mask_problem", "plot_mask_quant", "save_mask_heatmap",
+    "plot_source_correction", "plot_correction_sweep",
 ]

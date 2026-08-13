@@ -46,6 +46,10 @@ if src_dir not in sys.path:
 from model.text_encoder import build_text_encoder
 from model.schedule import NoiseSchedule
 from editing import MotionEditor
+from data.body_part_labels import route_groups
+from model.body_groups import resolve_group_context
+from training.grounding import resolve_readout_columns, resolve_readout_layers
+from utils.cli import parse_group_mask
 from data.smplh_features import (
     smplh_to_features, features_to_smpl, smpl_to_gen_layout, resample_motion,
 )
@@ -69,8 +73,21 @@ def parse_args():
     p.add_argument("--scales", type=float, nargs="+", default=[0.0, 2.5, 5.0, 7.5],
                    help="SEGA guidance scales to sweep (one output folder each).")
     p.add_argument("--mask_mode", default="m2_only",
-                   choices=["none", "m2_only", "m1_only", "attn", "temporal"],
-                   help="Stage-2 mask source (default m2_only: automated, no LLM/attention).")
+                   choices=["none", "m2_only", "m1_only", "attn", "temporal", "groups"],
+                   help="Stage-2 mask source (default m2_only: automated, no LLM/attention). "
+                        "'groups' routes the instruction to its body-part groups with the "
+                        "caption parser (no LLM) — the correct-by-construction control. "
+                        "Clips whose instruction names no body part are SKIPPED and "
+                        "listed in the manifest, since a group mask has no answer there.")
+    p.add_argument("--m1_columns", default="auto",
+                   choices=["auto", "span", "semantic", "content"],
+                   help="Text columns the M1 read-out reads (--mask_mode attn/m1_only): "
+                        "'content' (all, the historical read), 'semantic' (stop words "
+                        "stripped, verb kept), 'span' (body-part words only). 'auto' = "
+                        "'semantic' on a grounded checkpoint. docs/FINDINGS.md.")
+    p.add_argument("--psi_readout", default="abs", choices=["abs", "energy"],
+                   help="ψ/M2 contrast: 'abs' (default, the LEDITS++ magnitude) or the "
+                        "SIGNED per-group energy change. The A/B this eval exists to run.")
     p.add_argument("--lambda_noise", type=float, default=70.0,
                    help="M2 percentile threshold (higher = sparser mask).")
     p.add_argument("--lambda_attn", type=float, default=70.0)
@@ -81,6 +98,11 @@ def parse_args():
                    help="Space for ψ/M2 and SEGA guidance. 'auto' (default) = the "
                         "checkpoint's predict_type, so an x0 checkpoint edits "
                         "x0-natively (docs/AttentionGrounding_Options.md §5.3).")
+    p.add_argument("--m1_layers", default="auto",
+                   help="Blocks the M1 read-out averages over (--mask_mode attn/m1_only). "
+                        "'auto' (default) = the checkpoint's own --attn_ground_layers if "
+                        "it was trained with the grounding loss, else all blocks; 'all' "
+                        "forces every block; '3,4,5' picks explicitly.")
     p.add_argument("--guidance_alpha_floor", type=float, default=None,
                    help="Skip guidance where sqrt(alpha_cumprod_t) < this. Default: "
                         "0.03 in eps space, 0 (guide every step) in x0 space.")
@@ -113,9 +135,12 @@ def main():
 
     text_encoder = build_text_encoder(config, device=device)
     schedule = NoiseSchedule.from_config(config, device=device)
+    _, is_group, group_mode, _ = resolve_group_context(config)
     editor = MotionEditor(model, schedule, device, is_group=True,
-                          edit_space=args.edit_space)
-    print(f"predict_type={schedule.predict_type}  edit_space={editor.edit_space}")
+                          edit_space=args.edit_space, psi_readout=args.psi_readout,
+                          attn_layers=resolve_readout_layers(config, args.m1_layers))
+    print(f"predict_type={schedule.predict_type}  edit_space={editor.edit_space}  "
+          f"psi_readout={editor.psi_readout}  m1_columns={args.m1_columns}")
 
     mask_ts = (torch.linspace(1, schedule.T - 1, args.mask_timesteps).long().tolist()
                if args.mask_timesteps else None)
@@ -134,6 +159,7 @@ def main():
     print(f"{len(keyids)} clips × {len(args.scales)} scales -> {args.out_root}")
 
     skipped = {}
+    routed, col_modes = {}, {}
     n_done = 0
     for k in tqdm(keyids, desc="Editing"):
         # which scales still need this clip?
@@ -159,15 +185,29 @@ def main():
         x0 = torch.from_numpy((A - mean) / std).float().unsqueeze(0).to(device)
         valid = torch.ones(T, dtype=torch.bool, device=device)
 
+        # The group router has no answer for an instruction naming no body part (~41% of
+        # this test set), so skip rather than fall back to a different mask — mixing two
+        # mask sources inside one score sheet would make the comparison unreadable.
+        group_masks = None
+        if args.mask_mode == "groups":
+            names = route_groups(text, group_mode)
+            if not names:
+                skipped[k] = "router found no body part in the instruction"
+                continue
+            routed[k] = names
+            group_masks = [parse_group_mask(" ".join(names), is_group, group_mode)]
+
         # invert + collect masks ONCE per clip (both independent of guidance scale)
         state = editor.invert(x0, show_progress=False)
         with torch.no_grad():
             ctx = text_encoder.encode([text])
-            toks = text_encoder.token_info(text)[0]
+            tok, sem, cmode = resolve_readout_columns(
+                text, text_encoder, config, args.m1_columns, group_mode)
+        col_modes[cmode] = col_modes.get(cmode, 0) + 1
         masks = editor.collect_masks(
-            state, [ctx], [toks], valid,
+            state, [ctx], [tok], valid, semantic_idxs_per_edit=[sem],
             lambda_attn=args.lambda_attn, lambda_noise=args.lambda_noise,
-            mask_mode=args.mask_mode, timesteps=mask_ts,
+            mask_mode=args.mask_mode, llm_group_masks=group_masks, timesteps=mask_ts,
         )
 
         for s in todo:
@@ -193,6 +233,11 @@ def main():
         "src_fps": args.src_fps, "edit_fps": args.edit_fps,
         "n_clips": len(keyids), "n_edited": n_done,
         "n_skipped": len(skipped), "skipped": skipped,
+        # What actually produced these masks. A score sheet without these is ambiguous
+        # now that M1 has a column axis and psi has two read-outs.
+        "m1_columns": args.m1_columns, "m1_columns_resolved": col_modes,
+        "psi_readout": editor.psi_readout,
+        "routed_groups": routed,
         "out_dirs": {f"{s:g}": out_dirs[s] for s in args.scales},
     }
     os.makedirs(args.out_root, exist_ok=True)

@@ -105,6 +105,17 @@ def build_parser():
                    help="Caption->body-part label cache built by "
                         "src/probe_ground_labels.py. Default "
                         "<data_root>/ground_labels.json; built automatically if absent.")
+    p.add_argument("--attn_ground_verbs", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Include TIER-3 verb labels (default on): map locomotion and "
+                        "manipulation verbs to their body-part groups, not just nouns. "
+                        "86.5%% of HumanML3D captions containing a leg verb never name a "
+                        "leg, so nouns-only supervision misses where leg semantics live; "
+                        "turning this on takes caption coverage 48.0%% -> 92.4%% and leg "
+                        "items 10,942 -> 58,218. --no-attn_ground_verbs reproduces the "
+                        "nouns-only label set (the A/B control). NOTE the label cache is "
+                        "keyed by file, so change --attn_ground_cache too, or delete the "
+                        "existing one, when flipping this.")
     p.add_argument("--attn_ground_monitor", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="Log corr(supervised attention, source motion energy) each epoch "

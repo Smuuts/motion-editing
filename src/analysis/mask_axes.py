@@ -78,6 +78,22 @@ def alignment(binary_maps, glabels, targets=DEFAULT_TARGETS) -> list[float]:
     return hits
 
 
+def recall(binary_maps, glabels, targets=DEFAULT_TARGETS) -> list[float]:
+    """Per instruction: the share of the TARGET group's cells the mask keeps.
+
+    `alignment` is precision, and precision is bought for free by shrinking a mask — so
+    the two must always be read together, with the cell count beside them. A mask
+    scoring 1.0 alignment on three cells has not solved anything: the editor needs
+    enough of the target region to actually change it.
+    """
+    out = []
+    for m, tgt in zip(binary_maps, targets):
+        idx = [glabels.index(g) for g in tgt if g in glabels]
+        cells = m[:, idx]
+        out.append(float(cells.sum() / cells.size) if idx and cells.size else 0.0)
+    return out
+
+
 def decompose(m1_maps, m2_maps, binaries, src_act, glabels,
               instructions=DEFAULT_INSTRUCTIONS, targets=DEFAULT_TARGETS) -> dict:
     """All per-clip statistics for one checkpoint × one clip, as a JSON-ready dict.
@@ -99,12 +115,21 @@ def decompose(m1_maps, m2_maps, binaries, src_act, glabels,
                     for k, v in axis_stats(maps, glabels, instructions, targets).items()})
     for mode, maps in binaries.items():
         res[f"align_{mode}"] = alignment(maps, glabels, targets)
+        res[f"recall_{mode}"] = recall(maps, glabels, targets)
+        res[f"cells_{mode}"] = [int(np.asarray(m).sum()) for m in maps]
     return res
 
 
 def summary_row(res: dict) -> list[float]:
-    """The comparison table's columns, in header order."""
+    """The comparison table's columns, in header order.
+
+    `align_attn` (M1 ∩ M2 — the composed mask the editor actually uses) is nan on
+    results written before it was collected, so old JSONs stay readable.
+    """
     return [res["m1_r_category"], res["m1_r_laterality"], res["m1_r_offdiag"],
             res["m2_r_category"], res["m2_r_laterality"], res["m2_r_offdiag"],
             float(np.mean(res["m1_src_corr"])), float(np.mean(res["m2_src_corr"])),
-            float(np.mean(res["align_m1_only"])), float(np.mean(res["align_m2_only"]))]
+            float(np.mean(res["align_m1_only"])), float(np.mean(res["align_m2_only"])),
+            float(np.mean(res["align_attn"])) if "align_attn" in res else float("nan"),
+            float(np.mean(res["recall_attn"])) if "recall_attn" in res else float("nan"),
+            float(np.mean(res["cells_attn"])) if "cells_attn" in res else float("nan")]

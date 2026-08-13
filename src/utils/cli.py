@@ -58,6 +58,32 @@ def add_mask_args(parser, *, mask_timesteps=40, thresholds=True, windows=True,
                                  "so an x0 checkpoint edits x0-natively "
                                  "(docs/AttentionGrounding_Options.md §5.3). Force a "
                                  "value to A/B the space against the checkpoint.")
+    parser.add_argument("--m1_layers", default="auto",
+                        help="Blocks the M1 read-out averages over. 'auto' (default) = "
+                             "the checkpoint's own --attn_ground_layers when it was "
+                             "trained with the grounding loss, else all blocks; 'all' "
+                             "forces every block (the historical behaviour); '3,4,5' "
+                             "picks explicitly. Averaging all 8 blocks on a checkpoint "
+                             "that supervised 3 dilutes the grounded signal ~8/3x.")
+    parser.add_argument("--m1_columns", default="auto",
+                        choices=["auto", "span", "semantic", "content"],
+                        help="Text columns the M1 read-out reads. 'content' = every "
+                             "content token, the historical read -- note this INCLUDES "
+                             "'a'/'person'/'the', since the default 'raw' readout never "
+                             "applied masking._STOP_WORDS. 'semantic' strips those stop "
+                             "words and keeps the verb. 'span' keeps only the body-part "
+                             "words the grounding loss supervised (best measured, but it "
+                             "uses the caption parser at inference). 'auto' (default) = "
+                             "'semantic' on a grounded checkpoint, 'content' otherwise. "
+                             "See docs/FINDINGS.md 'COLUMN dilution'.")
+    parser.add_argument("--psi_readout", default="abs", choices=["abs", "energy"],
+                        help="What the psi/M2 contrast measures: 'abs' (default) = "
+                             "|x0_c - x0_ref|, the LEDITS++ magnitude; 'energy' = the "
+                             "SIGNED change in per-group motion energy, which separates "
+                             "'the edit adds motion here' from 'the edit stills the "
+                             "source here'. Measured better inside M1 & M2 at matched "
+                             "mask size (0.452 -> 0.583); default stays 'abs' until the "
+                             "end-to-end MotionFix comparison.")
     parser.add_argument("--mask_timesteps", type=int, default=mask_timesteps,
                         help="Sweep this many evenly-spaced timesteps for mask "
                              "collection" + (" (default: all 1000; 40 is much faster "

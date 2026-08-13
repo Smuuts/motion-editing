@@ -42,12 +42,13 @@ import matplotlib
 matplotlib.use("Agg")
 from scipy.ndimage import gaussian_filter1d
 
+from data.body_part_labels import route_groups
 from data.clips import load_source
 from editing import MotionEditor
-from editing.masking import semantic_token_subset
 from model.body_groups import GROUP_NAMES, resolve_group_context
 from model.schedule import NoiseSchedule
 from model.text_encoder import build_text_encoder
+from training.grounding import resolve_readout_columns, resolve_readout_layers
 from utils.cli import (
     add_data_args, add_mask_args, add_model_args, parse_group_mask, per_edit_lookup,
     resolve_device,
@@ -82,7 +83,11 @@ def parse_args():
     p.add_argument("--target_groups", action="append", default=None,
                    help="--mask_mode groups only: space/comma-separated group names "
                         f"from {GROUP_NAMES}, once per --instruction or once for all. "
-                        "A group_mode=joints checkpoint also accepts joint names.")
+                        "A group_mode=joints checkpoint also accepts joint names. "
+                        "Pass 'auto' (or omit) to ROUTE the groups from the instruction "
+                        "text with the caption parser — no LLM, laterality-correct by "
+                        "construction; it errors out rather than guessing when the "
+                        "instruction names no body part.")
     p.add_argument("--m2_ref", default="null", choices=["null", "source"],
                    help="Reference for ψ = eps(c_edit) − eps(ref). 'null' = learned "
                         "null embedding (LEDITS++). 'source' = the clip's own caption "
@@ -145,7 +150,8 @@ def main():
 
     # ── invert ONCE (inversion depends only on the source, not the instruction) ──
     editor = MotionEditor(model, schedule, device, is_group=is_group,
-                          edit_space=args.edit_space)
+                          edit_space=args.edit_space, psi_readout=args.psi_readout,
+                          attn_layers=resolve_readout_layers(config, args.m1_layers))
     print(f"predict_type={schedule.predict_type}  edit_space={editor.edit_space}  "
           f"guidance_alpha_floor={editor.resolve_alpha_floor(args.guidance_alpha_floor):g}"
           + ("  (x0-native ψ/SEGA)" if editor.edit_space == "x0" else ""))
@@ -165,10 +171,26 @@ def main():
     scale_of = per_edit_lookup(args.scales, edits, "scales") or (lambda e: 5.0)
     group_spec_of = None
     if args.mask_mode == "groups":
-        if not args.target_groups:
-            raise SystemExit("--mask_mode groups requires --target_groups (one per "
-                             "--instruction, or a single value applied to all).")
-        group_spec_of = per_edit_lookup(args.target_groups, edits, "target_groups")
+        if not args.target_groups or args.target_groups == ["auto"]:
+            # Option 13's cheap tier: route the instruction to its groups with the same
+            # parser the grounding labels use — no LLM, no hand-typed groups, and
+            # laterality-correct by construction. Resolves 58.9% of MotionFix test
+            # instructions; the rest name no body part and get a clear error rather than
+            # a guessed mask (docs/FINDINGS.md "How much of MotionFix a group mask can
+            # even address").
+            routed = {e: route_groups(e, group_mode) for e in edits}
+            for e, g in routed.items():
+                print(f"  router {e!r} -> {g or 'NOTHING (no body part named)'}")
+            missing = [e for e, g in routed.items() if not g]
+            if missing:
+                raise SystemExit(
+                    f"--mask_mode groups --target_groups auto: the router found no body "
+                    f"part in {missing}. Name the groups explicitly with "
+                    f"--target_groups, or use --mask_mode temporal, which is the right "
+                    f"mask for manner/timing edits.")
+            group_spec_of = lambda e: " ".join(routed[e])
+        else:
+            group_spec_of = per_edit_lookup(args.target_groups, edits, "target_groups")
 
     mask_ts, m1_ts, m2_ts = resolve_sweeps(args.mask_timesteps, schedule.T,
                                            args.m1_window, args.m2_window)
@@ -181,7 +203,13 @@ def main():
             # One batched encode() for the whole job: same per-text embeddings (encoder
             # attention is intra-sequence only), fewer forward passes when composing.
             ctxs = list(text_encoder.encode(job).split(1, dim=0))
-            tok_info = [text_encoder.token_info(e) for e in job]
+            # (token_idxs, semantic_idxs) per edit — "content" is the historical read;
+            # "span"/auto restricts M1 to the columns the grounding loss supervised.
+            cols = [resolve_readout_columns(e, text_encoder, config, args.m1_columns,
+                                            group_mode) for e in job]
+        if args.mask_mode in ("attn", "m1_only"):
+            print("  M1 columns: "
+                  + ", ".join(f"{e!r}->{c[2]}" for e, c in zip(job, cols)))
 
         group_masks = None
         if group_spec_of is not None:
@@ -192,12 +220,12 @@ def main():
                       f"{[gnames[g] for g in gm.nonzero().flatten().tolist()]}")
 
         masks = editor.collect_masks(
-            state, ctxs, [ti[0] for ti in tok_info], valid_frames,
+            state, ctxs, [c[0] for c in cols], valid_frames,
             lambda_attn=args.lambda_attn, lambda_noise=args.lambda_noise,
             mask_mode=args.mask_mode, llm_group_masks=group_masks, timesteps=mask_ts,
             context_source=ctx_src, m2_group_norm=args.m2_group_norm,
             attn_readout=args.m1_readout,
-            semantic_idxs_per_edit=[semantic_token_subset(*ti) for ti in tok_info],
+            semantic_idxs_per_edit=[c[1] for c in cols],
             attn_timesteps=m1_ts, psi_timesteps=m2_ts, per_step_norm=args.per_step_norm,
         )
         x_edit = editor.edit(state, ctxs, masks, scales=scales,

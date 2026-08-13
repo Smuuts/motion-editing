@@ -11,14 +11,15 @@ import numpy as np
 import torch
 
 from editing import masking
-from editing.masking import semantic_token_subset
+from training.grounding import resolve_readout_columns
 
 
 def collect_instruction_masks(
     model, schedule, editor, state, text_encoder, instructions, valid_frames,
     is_group, *, mask_modes=("m2_only",), lambda_attn=70.0, lambda_noise=70.0,
     attn_readout="raw", sweeps=(None, None, None), per_step_norm=False,
-    context_ref=None, psi_group_norm=False, stats_out=None,
+    context_ref=None, psi_group_norm=False, stats_out=None, psi_readout=None,
+    column_mode="content", config=None, group_mode="parts", columns_out=None,
 ):
     """-> (m1_maps, m2_maps, {mode: [binary (F, G) maps]}), all numpy, one per instruction.
 
@@ -32,6 +33,17 @@ def collect_instruction_masks(
     else. `stats_out`, if given, receives the per-column-class attention mass / value
     norm diagnostic keyed by instruction.
 
+    `psi_readout` selects what the ψ contrast measures ("abs" or the signed "energy";
+    see masking.collect_statistics). ONE name only here, and None means "whatever the
+    editor was built with" — to compare ψ read-outs off a single sweep, call
+    `collect_statistics` directly with a sequence, the way `probe_psi_sign.py` does.
+
+    `column_mode` / `config` / `group_mode` choose WHICH TEXT COLUMNS M1 reads, via
+    `training.grounding.resolve_readout_columns` — "content" (every content token, the
+    historical read) or "span" (only the supervised body-part words). "auto" resolves it
+    from the checkpoint like `--m1_layers` does. `columns_out`, if given, is filled with
+    {instruction: (mode, columns)} so a caller can report what was actually read.
+
     ψ/M2 is read in `editor.edit_space` — so on an x0 checkpoint the probe measures the
     x0-native ψ the editor now actually uses, not the ε-space shim. M2 numbers are
     therefore only comparable across checkpoints trained with the same predict_type;
@@ -43,20 +55,27 @@ def collect_instruction_masks(
     readouts = (attn_readout,) if single else tuple(attn_readout)
     with torch.no_grad():
         ctxs = list(text_encoder.encode(instructions).split(1, dim=0))
-        tok_info = [text_encoder.token_info(e) for e in instructions]
+        # (token_idxs, semantic_idxs) per instruction — "content" reproduces the
+        # historical read exactly, so this is a no-op unless a caller asks for "span".
+        cols = [resolve_readout_columns(e, text_encoder, config, column_mode, group_mode)
+                for e in instructions]
+    if columns_out is not None:
+        columns_out.update({e: (c[2], c[0]) for e, c in zip(instructions, cols)})
 
     m1_maps = {r: [] for r in readouts}
     m2_maps = []
-    for instr, ctx, ti in zip(instructions, ctxs, tok_info):
+    for instr, ctx, (tok, sem, _) in zip(instructions, ctxs, cols):
         per_instr_stats = {} if stats_out is not None else None
         attn_fg, psi_fg = masking.collect_statistics(
-            model, schedule, state.xs, ctx, ti[0],
+            model, schedule, state.xs, ctx, tok,
             is_group=is_group, timesteps=shared_ts, need_attn=True,
             group_channels=editor.group_channels, valid_frames=valid_frames,
-            attn_readout=readouts, semantic_idxs=semantic_token_subset(*ti),
+            attn_readout=readouts, semantic_idxs=sem,
             attn_timesteps=m1_ts, psi_timesteps=m2_ts, per_step_norm=per_step_norm,
             context_ref=context_ref, psi_group_norm=psi_group_norm,
             psi_space=editor.edit_space, stats_out=per_instr_stats,
+            attn_layers=editor.attn_layers,
+            psi_readout=psi_readout or getattr(editor, "psi_readout", "abs"),
         )
         for r in readouts:
             m1_maps[r].append(attn_fg[r])

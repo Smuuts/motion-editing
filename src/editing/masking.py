@@ -103,6 +103,19 @@ def _group_aggregation_matrix(group_channels, device) -> torch.Tensor:
     return mat
 
 
+def _frame_energy(x: torch.Tensor, agg_matrix, is_group: bool) -> torch.Tensor:
+    """(F, D) motion → (F, G) per-(frame, group) motion energy, first frame zero.
+
+    Deliberately the same functional form as `utils.probe.source_activity` (per-channel
+    |Δ between consecutive frames|, then the group MEAN), so an energy read off a
+    model prediction and the source clip's own activity are the same quantity and can
+    be subtracted or correlated without a scale correction.
+    """
+    d = (x[1:] - x[:-1]).abs()                                   # (F-1, D)
+    e = d @ agg_matrix if is_group else d.mean(dim=-1, keepdim=True)
+    return torch.cat([e[:1] * 0, e], dim=0)                      # (F, G)
+
+
 def _group_motion_energy(x0: torch.Tensor, valid_frames, agg_matrix: torch.Tensor,
                          floor_frac: float = 0.25) -> torch.Tensor:
     """
@@ -153,6 +166,10 @@ def _attn_readout_value(avg: torch.Tensor, tok: torch.Tensor, sem: torch.Tensor,
 WEIGHT_READOUTS = ("raw", "renorm", "spatial", "renorm_spatial")
 VALUE_READOUTS = ("normw", "normsum")
 ALL_READOUTS = WEIGHT_READOUTS + VALUE_READOUTS
+# ψ read-outs. "abs" is the LEDITS++ form; "energy" keeps the SIGN of the change in
+# motion energy, which is what separates "the edit adds motion here" from "the edit
+# suppresses the source's motion here" (see collect_statistics).
+PSI_READOUTS = ("abs", "energy")
 
 
 def _value_weighted_map(stacked: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
@@ -239,7 +256,7 @@ def _column_class_stats(stacked: torch.Tensor, values: torch.Tensor,
     return out
 
 
-def _normalise_step(values: torch.Tensor, valid_frames) -> torch.Tensor:
+def _normalise_step(values: torch.Tensor, valid_frames, signed: bool = False) -> torch.Tensor:
     """
     Scale one timestep's (F, G) map to unit mean over valid frames.
 
@@ -251,9 +268,14 @@ def _normalise_step(values: torch.Tensor, valid_frames) -> torch.Tensor:
     contribute equally, which is what the even grid was meant to express. Relative
     structure within a step — the only thing the percentile threshold reads — is
     untouched.
+
+    `signed=True` scales by the mean ABSOLUTE value instead. A signed map (the "energy"
+    ψ read-out) has a mean near zero and of either sign, so dividing by it would blow up
+    the map and — where the mean is negative — flip it, which is not a normalisation but
+    a different map.
     """
     cells = values[valid_frames] if valid_frames is not None else values
-    scale = cells.mean().clamp_min(1e-12)
+    scale = (cells.abs() if signed else cells).mean().clamp_min(1e-12)
     return values / scale
 
 
@@ -303,7 +325,8 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
                        group_channels=None, context_ref=None, psi_group_norm=False,
                        valid_frames=None, attn_readout="raw", semantic_idxs=None,
                        attn_timesteps=None, psi_timesteps=None, per_step_norm=False,
-                       psi_space=None, stats_out=None):
+                       psi_space=None, stats_out=None, attn_layers=None,
+                       psi_readout="abs"):
     """
     Sweep the stored inversion sequence and accumulate the raw quantities for M1/M2.
 
@@ -368,6 +391,41 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
                     shared sweep cannot serve both; these two arguments let each mask
                     be read where its own signal is. None → use `timesteps`.
     psi_timesteps : sweep for M2 only, overriding `timesteps`. None → use `timesteps`.
+    psi_readout   : what the ψ contrast measures per (frame, group):
+                    "abs"    — mean |f_θ(x_t,c) − f_θ(x_t,ref)| (the original, default).
+                               Unsigned, so "the edit ADDS motion here" and "the edit
+                               REMOVES motion here" are the same large value.
+                    "energy" — SIGNED change in motion energy,
+                               E[f_θ(x_t,c)] − E[f_θ(x_t,ref)], where E is per-group
+                               |Δ between frames| (`_frame_energy`, the same quantity as
+                               `utils.probe.source_activity`). Positive = the instruction
+                               makes this group move MORE than the reference does,
+                               negative = less.
+                    Why the distinction is load-bearing: captions in HumanML3D describe a
+                    whole clip, so conditioning on "raise the right arm" pulls the
+                    prediction toward a clip where the right arm moves and the rest is
+                    still. Against a source clip that moves other parts, the largest
+                    ABSOLUTE differences then appear both at the target group (motion
+                    added) and at whatever the source moves (motion suppressed) — which
+                    is one mechanism behind ψ's ~+0.5 correlation with source dynamics.
+                    "abs" cannot separate those two; "energy" separates them by sign.
+                    May also be a SEQUENCE, in which case psi_fg is a {name: (F, G)} dict
+                    and every read-out comes from the same two forward passes.
+                    NOTE a signed map is not a magnitude: `psi_group_norm` divides it by
+                    a positive per-group energy (fine), but code that assumes ψ ≥ 0 —
+                    including any percentile threshold reasoning about "the top 30% of
+                    mass" — must be read as "the top 30% of values" instead.
+    attn_layers   : block indices to average M1 over, or None for ALL blocks (the
+                    historical behaviour). Only meaningful for M1 — ψ is a model output,
+                    not a per-layer quantity.
+                    This matters for a checkpoint trained with the TokenCompose grounding
+                    loss: only `attn_ground_layers` (3 of 8 by default) were ever
+                    supervised, so averaging all 8 mixes 3 grounded maps into 5
+                    ungrounded ones and dilutes the signal ~8/3×. The entry points
+                    resolve this from the checkpoint's own config via
+                    `training.grounding.resolve_readout_layers`, so a grounded checkpoint
+                    reads its own supervised blocks by default and every older checkpoint
+                    (no such config key) still averages all of them.
     per_step_norm : scale each timestep's map to unit mean before accumulating, so the
                     returned average weights every swept t equally instead of by its
                     magnitude (see _normalise_step). Default False = historical
@@ -431,8 +489,14 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
     device = context_edit.device
     # ψ reference: source-caption embedding if given, else None → the model falls
     # back to its learned null_text_emb (original behaviour).
+    psi_single = isinstance(psi_readout, str)
+    psi_readouts = (psi_readout,) if psi_single else tuple(psi_readout)
+    unknown = [r for r in psi_readouts if r not in PSI_READOUTS]
+    if unknown:
+        raise ValueError(f"unknown psi_readout {unknown}, expected {PSI_READOUTS}")
+
     attn_accum = {r: torch.zeros(F, G, device=device) for r in readouts}
-    psi_accum  = torch.zeros(F, G, device=device)
+    psi_accum  = {r: torch.zeros(F, G, device=device) for r in psi_readouts}
     col_stats  = {}
     n_attn = n_psi = 0
 
@@ -455,8 +519,16 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
         if want_attn:
             # M1 contribution
             layer_maps = model.get_attn_maps()                # list of (1, h, N, L)
+            layer_vals = model.get_attn_values() if need_values else None
+            if attn_layers is not None:
+                # Read only the requested blocks. Indices are into the model's block
+                # order, which is exactly what get_attn_maps() returns — and the same
+                # indexing `--attn_ground_layers` supervised, so the two cannot drift.
+                layer_maps = [layer_maps[i] for i in attn_layers]
+                if layer_vals is not None:
+                    layer_vals = [layer_vals[i] for i in attn_layers]
             stacked = torch.stack(layer_maps, dim=0).float()  # (Lyr, 1, h, N, L)
-            values = (torch.stack(model.get_attn_values(), dim=0).float()
+            values = (torch.stack(layer_vals, dim=0).float()
                       if need_values else None)              # (Lyr, 1, h, L, hd)
             for r, v in _attn_step_readouts(stacked, values, tok, sem, readouts).items():
                 step = v.reshape(F, G)
@@ -472,19 +544,27 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
             # a contrast of noise estimates ("eps") or of clean-motion predictions ("x0").
             f_c = schedule.to_space(out_c, x_t, t_b, psi_space)
             f_r = schedule.to_space(model(x_t, t_b, context_ref), x_t, t_b, psi_space)
-            psi = (f_c - f_r)[0].abs()                        # (F, D)
-            step = psi @ agg_matrix if is_group else psi.mean(dim=-1, keepdim=True)
-            psi_accum += _normalise_step(step, valid_frames) if per_step_norm else step
+            for r in psi_readouts:
+                if r == "abs":
+                    psi = (f_c - f_r)[0].abs()                # (F, D)
+                    step = (psi @ agg_matrix if is_group
+                            else psi.mean(dim=-1, keepdim=True))
+                else:                                          # "energy" — SIGNED
+                    step = (_frame_energy(f_c[0], agg_matrix, is_group)
+                            - _frame_energy(f_r[0], agg_matrix, is_group))
+                psi_accum[r] += (_normalise_step(step, valid_frames, signed=r != "abs")
+                                 if per_step_norm else step)
             n_psi += 1
 
-    psi_fg = psi_accum / max(n_psi, 1)
+    psi_fg = {r: p / max(n_psi, 1) for r, p in psi_accum.items()}
     if psi_group_norm and is_group:
         energy = _group_motion_energy(xs[0][0].to(device), valid_frames, agg_matrix)
-        psi_fg = psi_fg / energy[None, :]
+        psi_fg = {r: p / energy[None, :] for r, p in psi_fg.items()}
     if stats_out is not None and col_stats:
         stats_out.update({k: v / max(n_attn, 1) for k, v in col_stats.items()})
     attn_fg = {r: a / max(n_attn, 1) for r, a in attn_accum.items()}
-    return (attn_fg[readouts[0]] if single else attn_fg), psi_fg
+    return ((attn_fg[readouts[0]] if single else attn_fg),
+            (psi_fg[psi_readouts[0]] if psi_single else psi_fg))
 
 
 # mask_mode -> (semantic source | None, use_m2). The two mask components are
