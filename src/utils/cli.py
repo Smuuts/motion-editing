@@ -49,8 +49,13 @@ def add_data_args(parser, *, split=True, source=False, max_frames=196, smplh=Fal
 
 
 def add_mask_args(parser, *, mask_timesteps=40, thresholds=True, windows=True,
-                  edit_space=True):
-    """The Stage-2 mask-collection knobs (see editing/masking.collect_statistics)."""
+                  edit_space=True, alpha_floor=False):
+    """The Stage-2 mask-collection knobs (see editing/masking.collect_statistics).
+
+    `alpha_floor=True` additionally defines --guidance_alpha_floor, which is a Stage-3
+    guidance knob rather than a mask one — opt-in for the same reason `thresholds`/`windows`
+    are, so the probes that only build masks do not carry a flag they never read.
+    """
     if edit_space:
         parser.add_argument("--edit_space", default="auto", choices=["auto", "eps", "x0"],
                             help="Space the editor does ψ/M2 and SEGA guidance in. "
@@ -76,22 +81,63 @@ def add_mask_args(parser, *, mask_timesteps=40, thresholds=True, windows=True,
                              "uses the caption parser at inference). 'auto' (default) = "
                              "'semantic' on a grounded checkpoint, 'content' otherwise. "
                              "See docs/FINDINGS.md 'COLUMN dilution'.")
-    parser.add_argument("--psi_readout", default="abs", choices=["abs", "energy"],
-                        help="What the psi/M2 contrast measures: 'abs' (default) = "
-                             "|x0_c - x0_ref|, the LEDITS++ magnitude; 'energy' = the "
-                             "SIGNED change in per-group motion energy, which separates "
-                             "'the edit adds motion here' from 'the edit stills the "
-                             "source here'. Measured better inside M1 & M2 at matched "
-                             "mask size (0.452 -> 0.583); default stays 'abs' until the "
-                             "end-to-end MotionFix comparison.")
+    parser.add_argument("--psi_readout", default="energy", choices=["abs", "energy"],
+                        help="What the psi/M2 contrast measures: 'energy' (default since "
+                             "2026-08-15) = the SIGNED change in per-group motion energy, "
+                             "which separates 'the edit adds motion here' from 'the edit "
+                             "stills the source here'; 'abs' = |x0_c - x0_ref|, the "
+                             "LEDITS++ magnitude and the historical default (pass it to "
+                             "reproduce any result recorded before that date). Size-"
+                             "matched M2-alone comparison on 9 clips x 3 checkpoints, "
+                             "identical 327 cells: alignment 0.24 -> 0.33, recall 0.50 -> "
+                             "0.69, instruction-invariance 0.69 -> 0.13, source coupling "
+                             "+0.42 -> -0.21. See docs/FINDINGS.md 'psi is a mixture'.")
     parser.add_argument("--mask_timesteps", type=int, default=mask_timesteps,
                         help="Sweep this many evenly-spaced timesteps for mask "
                              "collection" + (" (default: all 1000; 40 is much faster "
                                              "and nearly identical)." if mask_timesteps is None
                                              else "."))
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Seed for the Stage-1 inversion noise. The inversion draws "
+                             "an independent x_t ladder per call, so an UNSEEDED probe "
+                             "reports a sample, not a value -- two identical runs on clip "
+                             "005675 differed by 0.48 in per-clip align_attn. Fixed at 42 "
+                             "by default so probe runs are comparable; vary it to measure "
+                             "the spread. Paired within-run contrasts were never affected "
+                             "(one inversion is shared by all instructions).")
+    parser.add_argument("--m1_select", default="percentile",
+                        choices=["percentile", "rank"],
+                        help="How M1's GROUP component is cut. 'percentile' (default) = "
+                             "one global quantile at --lambda_attn over every (frame, "
+                             "group) cell; bit-identical to results recorded before "
+                             "2026-08-15, but it is a cell BUDGET, not a selector -- at "
+                             "70 it must hand out 0.30*G = 2.1 group-rows whatever the "
+                             "map says, so a one-group instruction always spills into the "
+                             "runner-up. 'rank' = keep the groups holding at least "
+                             "--m1_rank_ratio of the top group's mass (capped at "
+                             "--m1_rank_max), then threshold psi INSIDE those rows only. "
+                             "Rank adapts to how many groups the instruction actually "
+                             "names instead of being told. docs/FINDINGS.md 'Two mask "
+                             "defects with different causes'.")
+    parser.add_argument("--m1_rank_ratio", type=float, default=0.5,
+                        help="--m1_select rank: keep a group if its total M1 mass is at "
+                             "least this fraction of the top group's. ->1 = top-1 only.")
+    parser.add_argument("--m1_rank_max", type=int, default=3,
+                        help="--m1_select rank: hard cap on selected groups. Stops a flat "
+                             "(ungrounded) map from selecting the whole body.")
+    if alpha_floor:
+        parser.add_argument("--guidance_alpha_floor", type=float, default=None,
+                            help="Apply edit guidance only where sqrt(alpha_cumprod_t) >= "
+                                 "this. Default resolves per space (MotionEditor."
+                                 "resolve_alpha_floor): 0.03 in eps space, where reaching x0 "
+                                 "divides by a vanishing sqrt(alpha_cumprod_t) and guidance "
+                                 "at the highest-noise steps diverges; 0 in x0 space, which "
+                                 "has no such factor to gate and where an x0-trained model's "
+                                 "text conditioning is strongest.")
     if thresholds:
         parser.add_argument("--lambda_attn", type=float, default=70.0,
-                            help="M1 percentile threshold (higher = sparser mask).")
+                            help="M1 percentile threshold (higher = sparser mask). "
+                                 "Unused when --m1_select rank.")
         parser.add_argument("--lambda_noise", type=float, default=70.0,
                             help="M2 percentile threshold (higher = sparser mask).")
     if windows:

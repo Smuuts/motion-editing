@@ -95,7 +95,7 @@ def probe_one(ckpt, clip, args, device) -> list[dict]:
     editor = MotionEditor(model, schedule, device, is_group=is_group,
                           edit_space=args.edit_space, psi_readout=args.psi_readout,
                           attn_layers=resolve_readout_layers(config, args.m1_layers))
-    state = editor.invert(x0)
+    state = editor.invert(x0, seed=args.seed)
     src_act = source_activity(x0, editor.group_channels)
 
     # m1_only isolates what a grounded attention readout would drive; m2_only is the
@@ -110,7 +110,9 @@ def probe_one(ckpt, clip, args, device) -> list[dict]:
                               args.m1_window, args.m2_window),
         per_step_norm=args.per_step_norm, attn_readout=readouts,
         stats_out=col_stats, column_mode=args.m1_columns, config=config,
-        group_mode=group_mode, columns_out=columns)
+        group_mode=group_mode, columns_out=columns,
+        m1_select=args.m1_select, m1_rank_ratio=args.m1_rank_ratio,
+        m1_rank_max=args.m1_rank_max)
 
     return [{
         "checkpoint": ckpt, "clip": clip, "frames": F,

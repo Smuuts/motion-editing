@@ -35,17 +35,23 @@ def pairwise_corr(maps) -> np.ndarray:
 
 
 def source_activity(x0, group_channels, is_group=True) -> np.ndarray:
-    """(F, G) per-(frame, group) source motion energy |Δx0|, with a zero first frame.
+    """(F, G) per-(frame, group) source motion energy |Δx0|, first frame REPEATED.
 
     This is the reference every mask is compared against: it depends only on the source
     clip, so a mask that correlates with it is a source-dynamics detector.
+
+    Must stay the same functional form as `editing.masking._frame_energy` — that parity is
+    what makes "did the edit change this cell" and "was the source already moving here"
+    like-for-like (docs/ARCHITECTURE.md). Frame 0 repeats frame 1 rather than being zeroed
+    (2026-08-16, changed in both functions together); see `_frame_energy` for why the zero
+    was a structural hole rather than a neutral convention.
     """
     diff = (x0[0][1:] - x0[0][:-1]).abs()                        # (F-1, D)
     if is_group:
         act = torch.stack([diff[:, ch].mean(dim=-1) for ch in group_channels], dim=-1)
     else:
         act = diff.mean(dim=-1, keepdim=True)                    # (F-1, 1)
-    return torch.cat([act[:1] * 0, act], dim=0).cpu().numpy()    # (F, G)
+    return torch.cat([act[:1], act], dim=0).cpu().numpy()        # (F, G)
 
 
 def group_profile(fg) -> np.ndarray:

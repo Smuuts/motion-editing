@@ -20,6 +20,7 @@ def collect_instruction_masks(
     attn_readout="raw", sweeps=(None, None, None), per_step_norm=False,
     context_ref=None, psi_group_norm=False, stats_out=None, psi_readout=None,
     column_mode="content", config=None, group_mode="parts", columns_out=None,
+    m1_select="percentile", m1_rank_ratio=0.5, m1_rank_max=3,
 ):
     """-> (m1_maps, m2_maps, {mode: [binary (F, G) maps]}), all numpy, one per instruction.
 
@@ -75,7 +76,7 @@ def collect_instruction_masks(
             context_ref=context_ref, psi_group_norm=psi_group_norm,
             psi_space=editor.edit_space, stats_out=per_instr_stats,
             attn_layers=editor.attn_layers,
-            psi_readout=psi_readout or getattr(editor, "psi_readout", "abs"),
+            psi_readout=psi_readout or getattr(editor, "psi_readout", "energy"),
         )
         for r in readouts:
             m1_maps[r].append(attn_fg[r])
@@ -90,6 +91,8 @@ def collect_instruction_masks(
                     a, p, valid_frames, is_group,
                     lambda_attn=lambda_attn, lambda_noise=lambda_noise, mask_mode=mode,
                     group_channels=editor.group_channels, feat_dim=editor.feat_dim,
+                    m1_select=m1_select, m1_rank_ratio=m1_rank_ratio,
+                    m1_rank_max=m1_rank_max,
                 )["m_group"].float().cpu().numpy()
                 for a, p in zip(maps, m2_maps)
             ]

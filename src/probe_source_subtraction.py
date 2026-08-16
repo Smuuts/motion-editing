@@ -88,7 +88,13 @@ def parse_args():
                    help="Percentile the source is clamped at from below before a "
                         "division (bounds the amplification of still regions, which is "
                         "div's specific failure mode). Only affects --mode div.")
-    p.add_argument("--seed", type=int, default=0, help="Seed for the shuffled controls.")
+    # NB: --seed comes from add_mask_args (it seeds the Stage-1 inversion). This probe
+    # needs a SECOND, independent seed for its shuffled-source controls — sharing one
+    # would tie the null distribution to the inversion draw it is supposed to be a null
+    # for. Named separately rather than reused.
+    p.add_argument("--control_seed", type=int, default=0,
+                   help="Seed for the shuffled-source controls (independent of --seed, "
+                        "which fixes the inversion noise).")
     p.add_argument("--no_figures", action="store_true")
     p.add_argument("--out_dir", default="eval_results/source_correction")
     return p.parse_args()
@@ -142,7 +148,7 @@ def probe_one(ckpt, clip, args, device) -> dict:
                           attn_layers=resolve_readout_layers(config, args.m1_layers))
     print(f"  predict_type={schedule.predict_type}  edit_space={editor.edit_space}  "
           f"attn_layers={editor.attn_layers or 'all'}")
-    state = editor.invert(x0)
+    state = editor.invert(x0, seed=args.seed)
     src_act = source_activity(x0, editor.group_channels)
     valid_np = valid.cpu().numpy()
 
@@ -157,7 +163,7 @@ def probe_one(ckpt, clip, args, device) -> dict:
         per_step_norm=args.per_step_norm)
     base_maps = m2_maps if args.mask == "m2" else m1_maps
 
-    rng = np.random.default_rng(args.seed)
+    rng = np.random.default_rng(args.control_seed)
     modes = tuple(args.mode or MODES)
     norms = tuple(args.norm or ("z",))
     grid, cached_maps = {}, {}

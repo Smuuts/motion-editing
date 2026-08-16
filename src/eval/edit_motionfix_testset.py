@@ -17,6 +17,17 @@ Pipeline per clip (see docs / plan for the why):
 The scale=0 config reconstructs the source and doubles as the plumbing calibration
 (expected R@1_s2t ~ 100). This script is SMPL-H only (feature_mode=="smplh").
 
+The Stage-2 mask flags come from `utils.cli.add_mask_args`, i.e. the SAME definitions
+`edit_motion.py` and the probes use — so `--m1_select rank`, `--per_step_norm` and the
+`--m1_window`/`--m2_window` sweeps are runnable here and cannot drift from their defaults
+elsewhere.
+
+⚠ **The TMR gallery is whatever you generate.** MotionFix's `retrieval()` builds its
+retrieval set as `MotionFixLoader(keys_to_load=<the keyids you supplied>)`, so a `--limit 320`
+run is scored as 320-way retrieval, not 1013-way, and its "full" R@k is NOT comparable to any
+published MotionFix number nor to a run that skipped a different number of clips. The
+batches-of-32 protocol is fixed at 32-way and is comparable. See run_motionfix_metrics.py.
+
 Score the output with (MotionFix venv):
     data/motionfix/mfix-env/bin/python src/eval/run_motionfix_metrics.py \
         --smpl_dir "$PWD"/data/motionfix/motionfix_smpl/m2_only_s0 \
@@ -33,6 +44,7 @@ Example (smoke test on 16 clips):
 import os
 import sys
 import json
+import random
 import argparse
 
 import numpy as np
@@ -45,11 +57,13 @@ if src_dir not in sys.path:
 
 from model.text_encoder import build_text_encoder
 from model.schedule import NoiseSchedule
-from editing import MotionEditor
+from editing import MotionEditor, derive_seed
+from editing.masking import mask_mode_components
 from data.body_part_labels import route_groups
 from model.body_groups import resolve_group_context
 from training.grounding import resolve_readout_columns, resolve_readout_layers
-from utils.cli import parse_group_mask
+from utils.cli import add_mask_args, add_model_args, parse_group_mask, resolve_device
+from utils.probe import resolve_sweeps
 from data.smplh_features import (
     smplh_to_features, features_to_smpl, smpl_to_gen_layout, resample_motion,
 )
@@ -60,8 +74,11 @@ def parse_args():
     repo = os.path.dirname(src_dir)
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--checkpoint", required=True,
-                   help="Checkpoint dir with config.json + ema.pt/model.pt (feature_mode=smplh).")
+    # --checkpoint / --no_ema / --device, and the whole Stage-2 mask block (thresholds,
+    # windows, --m1_select rank, --per_step_norm, --psi_readout, --seed, --edit_space …)
+    # shared verbatim with edit_motion.py and the probes.
+    add_model_args(p)
+    add_mask_args(p, mask_timesteps=40, alpha_floor=True)
     p.add_argument("--smplh_data_root", required=True,
                    help="SMPL-H training root with the 135-d Mean.npy / Std.npy.")
     p.add_argument("--testset",
@@ -69,7 +86,10 @@ def parse_args():
                                               "motionfix_test.pth.tar"),
                    help="MotionFix test joblib dump (id -> {motion_source, motion_target, text}).")
     p.add_argument("--out_root", default=os.path.join(repo, "data/motionfix/motionfix_smpl"),
-                   help="Root for the per-scale output folders.")
+                   help="Root for the per-scale output folders. NOTE the default root "
+                        "already holds legacy m2_only_s* dirs from an older, differently "
+                        "configured run; the fingerprint guard will refuse to resume on "
+                        "top of them. Point this at a per-configuration subdirectory.")
     p.add_argument("--scales", type=float, nargs="+", default=[0.0, 2.5, 5.0, 7.5],
                    help="SEGA guidance scales to sweep (one output folder each).")
     p.add_argument("--mask_mode", default="m2_only",
@@ -79,47 +99,118 @@ def parse_args():
                         "caption parser (no LLM) — the correct-by-construction control. "
                         "Clips whose instruction names no body part are SKIPPED and "
                         "listed in the manifest, since a group mask has no answer there.")
-    p.add_argument("--m1_columns", default="auto",
-                   choices=["auto", "span", "semantic", "content"],
-                   help="Text columns the M1 read-out reads (--mask_mode attn/m1_only): "
-                        "'content' (all, the historical read), 'semantic' (stop words "
-                        "stripped, verb kept), 'span' (body-part words only). 'auto' = "
-                        "'semantic' on a grounded checkpoint. docs/FINDINGS.md.")
-    p.add_argument("--psi_readout", default="abs", choices=["abs", "energy"],
-                   help="ψ/M2 contrast: 'abs' (default, the LEDITS++ magnitude) or the "
-                        "SIGNED per-group energy change. The A/B this eval exists to run.")
-    p.add_argument("--lambda_noise", type=float, default=70.0,
-                   help="M2 percentile threshold (higher = sparser mask).")
-    p.add_argument("--lambda_attn", type=float, default=70.0)
-    p.add_argument("--mask_timesteps", type=int, default=None,
-                   help="Use this many evenly-spaced timesteps for mask collection "
-                        "(default: all). Small values (e.g. 40) speed up the run a lot.")
-    p.add_argument("--edit_space", default="auto", choices=["auto", "eps", "x0"],
-                   help="Space for ψ/M2 and SEGA guidance. 'auto' (default) = the "
-                        "checkpoint's predict_type, so an x0 checkpoint edits "
-                        "x0-natively (docs/AttentionGrounding_Options.md §5.3).")
-    p.add_argument("--m1_layers", default="auto",
-                   help="Blocks the M1 read-out averages over (--mask_mode attn/m1_only). "
-                        "'auto' (default) = the checkpoint's own --attn_ground_layers if "
-                        "it was trained with the grounding loss, else all blocks; 'all' "
-                        "forces every block; '3,4,5' picks explicitly.")
-    p.add_argument("--guidance_alpha_floor", type=float, default=None,
-                   help="Skip guidance where sqrt(alpha_cumprod_t) < this. Default: "
-                        "0.03 in eps space, 0 (guide every step) in x0 space.")
     p.add_argument("--src_fps", type=float, default=30.0, help="MotionFix native fps.")
     p.add_argument("--edit_fps", type=float, default=20.0, help="Editor (HumanML3D) fps.")
     p.add_argument("--max_frames", type=int, default=196)
     p.add_argument("--min_frames", type=int, default=16)
-    p.add_argument("--limit", type=int, default=0, help="Only the first N clips (0 = all). Smoke test.")
+    p.add_argument("--limit", type=int, default=0, help="Only N clips (0 = all). Smoke test.")
+    p.add_argument("--limit_mode", default="random", choices=["random", "first"],
+                   help="How --limit subsamples. 'random' (default) = a SEEDED random "
+                        "sample, reproducible from --limit_seed. 'first' = the first N "
+                        "sorted keyids, the pre-2026-08-16 behaviour — note MotionFix "
+                        "keyids inherit AMASS/BABEL subject/sequence ordering, so that is "
+                        "a contiguous block of the corpus, not a sample of it.")
+    p.add_argument("--limit_seed", type=int, default=0,
+                   help="Seed for --limit_mode random. Separate from --seed so the clip "
+                        "SET and the inversion noise can be varied independently.")
     p.add_argument("--overwrite", action="store_true", help="Recompute clips whose .npy exists.")
-    p.add_argument("--no_ema", action="store_true", help="Load model.pt instead of ema.pt.")
-    p.add_argument("--device", default=None)
+    p.add_argument("--ignore_fingerprint", action="store_true",
+                   help="Resume even when the existing manifest's settings disagree with "
+                        "this invocation's. Produces a score sheet mixing two "
+                        "configurations — only for deliberately continuing an interrupted "
+                        "run whose flags you have since edited cosmetically.")
     return p.parse_args()
+
+
+# Settings that change the CONTENT of a generated .npy, hence what may not silently differ
+# between the files already in an output dir and the ones about to join them. Conditioned on
+# mask_mode so that changing an inert knob (lambda_attn under m2_only, say) is not a false
+# mismatch. --scales and --limit are deliberately absent: adding a scale or more clips is a
+# legitimate resume, since each lands in its own file.
+def mask_fingerprint(args, editor, config) -> dict:
+    fp = {
+        "checkpoint":   os.path.abspath(args.checkpoint),
+        "weights":      "model" if args.no_ema else "ema",
+        "mask_mode":    args.mask_mode,
+        "edit_space":   editor.edit_space,
+        "alpha_floor":  editor.resolve_alpha_floor(args.guidance_alpha_floor),
+        "seed":         args.seed,
+        "mask_timesteps": args.mask_timesteps,
+        "src_fps": args.src_fps, "edit_fps": args.edit_fps,
+        "max_frames": args.max_frames, "min_frames": args.min_frames,
+    }
+    # Which components this mode actually uses comes from masking's own table, so adding a
+    # mask mode cannot leave the fingerprint silently omitting that mode's live flags —
+    # which would let the guard pass a genuinely mixed run.
+    semantic_source, uses_m2 = mask_mode_components(args.mask_mode)
+    uses_m1 = semantic_source == "attn"
+    if uses_m1:
+        fp.update({
+            "m1_columns": args.m1_columns,
+            "m1_layers":  resolve_readout_layers(config, args.m1_layers),
+            "m1_select":  args.m1_select,
+            "m1_window":  args.m1_window,
+        })
+        if args.m1_select == "rank":
+            fp.update({"m1_rank_ratio": args.m1_rank_ratio,
+                       "m1_rank_max": args.m1_rank_max})
+        else:
+            fp["lambda_attn"] = args.lambda_attn
+    if uses_m2:
+        fp.update({"psi_readout": editor.psi_readout,
+                   "lambda_noise": args.lambda_noise,
+                   "m2_window": args.m2_window,
+                   "per_step_norm": args.per_step_norm})
+    return fp
+
+
+def check_resumable(args, out_dirs, fingerprint, manifest_path):
+    """Refuse to add files to an output dir whose existing generations came from different
+    settings. The resume rule is "skip a clip whose .npy exists", which is only sound while
+    those files mean the same thing — otherwise one score sheet silently mixes two
+    configurations and the manifest, rewritten at the end, describes only the newer one."""
+    if args.overwrite:                    # every file is recomputed; nothing stale survives
+        return
+    present = [d for d in out_dirs.values()
+               if os.path.isdir(d) and any(f.endswith(".npy") for f in os.listdir(d))]
+    if not present:
+        return
+    old = {}
+    if os.path.exists(manifest_path):
+        with open(manifest_path) as f:
+            old = json.load(f).get("fingerprint", {})
+    if old == fingerprint:
+        return
+    diff = [f"    {k}: on disk {old.get(k, '<absent>')!r} -> now {fingerprint[k]!r}"
+            for k in sorted(fingerprint) if old.get(k) != fingerprint[k]]
+    msg = (f"\nRefusing to resume: {len(present)} output dir(s) under {args.out_root} already "
+           f"hold generations made with different settings.\n"
+           + ("\n".join(diff) if diff else "    (no fingerprint recorded — a pre-2026-08-16 run)")
+           + "\n\nThose .npy files would be kept as-is and mixed with new ones in the same "
+             "score sheet.\nPick one:\n"
+             "  --out_root <a fresh dir>   keep both runs (recommended)\n"
+             "  --overwrite                 recompute everything with the new settings\n"
+             "  --ignore_fingerprint        proceed anyway, accepting the mixture\n")
+    if args.ignore_fingerprint:
+        print(msg + "\n--ignore_fingerprint given: proceeding with a MIXED output set.\n")
+        return
+    raise SystemExit(msg)
+
+
+def select_keyids(data, args):
+    """The clips to edit. `--limit_mode random` samples with its own seeded RNG and then
+    restores sorted order, so the SET is a sample while the iteration order stays stable."""
+    keyids = sorted(data.keys())
+    if not args.limit or args.limit >= len(keyids):
+        return keyids
+    if args.limit_mode == "first":
+        return keyids[:args.limit]
+    return sorted(random.Random(args.limit_seed).sample(keyids, args.limit))
 
 
 def main():
     args = parse_args()
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    device = resolve_device(args.device)
     print(f"Device: {device}")
 
     model, config = load_model(args.checkpoint, device=device, use_ema=not args.no_ema)
@@ -136,30 +227,43 @@ def main():
     text_encoder = build_text_encoder(config, device=device)
     schedule = NoiseSchedule.from_config(config, device=device)
     _, is_group, group_mode, _ = resolve_group_context(config)
-    editor = MotionEditor(model, schedule, device, is_group=True,
+    editor = MotionEditor(model, schedule, device, is_group=is_group,
                           edit_space=args.edit_space, psi_readout=args.psi_readout,
                           attn_layers=resolve_readout_layers(config, args.m1_layers))
     print(f"predict_type={schedule.predict_type}  edit_space={editor.edit_space}  "
-          f"psi_readout={editor.psi_readout}  m1_columns={args.m1_columns}")
+          f"psi_readout={editor.psi_readout}  m1_columns={args.m1_columns}  "
+          f"m1_select={args.m1_select}")
 
-    mask_ts = (torch.linspace(1, schedule.T - 1, args.mask_timesteps).long().tolist()
-               if args.mask_timesteps else None)
+    # Per-mask sweeps: shared unless --m1_window/--m2_window narrow one of them.
+    mask_ts, m1_ts, m2_ts = resolve_sweeps(args.mask_timesteps, schedule.T,
+                                           args.m1_window, args.m2_window)
 
     scale_tag = lambda s: f"{args.mask_mode}_s{s:g}"
     out_dirs = {s: os.path.join(args.out_root, scale_tag(s)) for s in args.scales}
+    fingerprint = mask_fingerprint(args, editor, config)
+    manifest_path = os.path.join(args.out_root, f"edit_manifest_{args.mask_mode}.json")
+    check_resumable(args, out_dirs, fingerprint, manifest_path)
     for d in out_dirs.values():
         os.makedirs(d, exist_ok=True)
+    # Stamp the fingerprint BEFORE editing anything, so a run killed halfway leaves files
+    # that are still identifiable and can be resumed. Writing it only at the end would make
+    # every interrupted run look, to the guard, like generations of unknown provenance.
+    with open(manifest_path, "w") as f:
+        json.dump({"fingerprint": fingerprint, "status": "in-progress"}, f, indent=2)
 
     import joblib
     print(f"Loading test set: {args.testset}")
     data = joblib.load(args.testset)
-    keyids = sorted(data.keys())
-    if args.limit:
-        keyids = keyids[:args.limit]
-    print(f"{len(keyids)} clips × {len(args.scales)} scales -> {args.out_root}")
+    keyids = select_keyids(data, args)
+    limit_note = ""
+    if len(keyids) < len(data):
+        seed_note = f", limit_seed={args.limit_seed}" if args.limit_mode == "random" else ""
+        limit_note = f" ({args.limit_mode} subsample of {len(data)}{seed_note})"
+    print(f"{len(keyids)} clips{limit_note} × {len(args.scales)} scales -> {args.out_root}")
 
+    need_attn = mask_mode_components(args.mask_mode)[0] == "attn"
     skipped = {}
-    routed, col_modes = {}, {}
+    routed, col_modes, col_fallback = {}, {}, []
     n_done = 0
     for k in tqdm(keyids, desc="Editing"):
         # which scales still need this clip?
@@ -198,16 +302,26 @@ def main():
             group_masks = [parse_group_mask(" ".join(names), is_group, group_mode)]
 
         # invert + collect masks ONCE per clip (both independent of guidance scale)
-        state = editor.invert(x0, show_progress=False)
+        state = editor.invert(x0, show_progress=False, seed=derive_seed(args.seed, k))
         with torch.no_grad():
             ctx = text_encoder.encode([text])
-            tok, sem, cmode = resolve_readout_columns(
-                text, text_encoder, config, args.m1_columns, group_mode)
-        col_modes[cmode] = col_modes.get(cmode, 0) + 1
+            # Only M1 reads text columns; resolving them under m2_only/groups would cost a
+            # parse per clip and report a read-out nothing uses.
+            if need_attn:
+                tok, sem, cmode = resolve_readout_columns(
+                    text, text_encoder, config, args.m1_columns, group_mode)
+                col_modes[cmode] = col_modes.get(cmode, 0) + 1
+                if cmode.startswith("content (no body-part span)"):
+                    col_fallback.append(k)
+            else:
+                tok, sem = None, None
         masks = editor.collect_masks(
             state, [ctx], [tok], valid, semantic_idxs_per_edit=[sem],
             lambda_attn=args.lambda_attn, lambda_noise=args.lambda_noise,
             mask_mode=args.mask_mode, llm_group_masks=group_masks, timesteps=mask_ts,
+            attn_timesteps=m1_ts, psi_timesteps=m2_ts, per_step_norm=args.per_step_norm,
+            m1_select=args.m1_select, m1_rank_ratio=args.m1_rank_ratio,
+            m1_rank_max=args.m1_rank_max,
         )
 
         for s in todo:
@@ -220,6 +334,11 @@ def main():
             np.save(os.path.join(out_dirs[s], f"{k}.npy"), gen)
         n_done += 1
 
+    # Files ON DISK, not files written by this invocation — a resumed run edits only the
+    # clips it found missing, so n_edited alone under-reports what the scorer will read.
+    n_present = {f"{s:g}": len([f for f in os.listdir(out_dirs[s]) if f.endswith(".npy")])
+                 for s in args.scales}
+
     manifest = {
         "checkpoint": os.path.abspath(args.checkpoint),
         "feature_mode": feature_mode,
@@ -231,21 +350,37 @@ def main():
         "guidance_alpha_floor": editor.resolve_alpha_floor(args.guidance_alpha_floor),
         "scales": args.scales,
         "src_fps": args.src_fps, "edit_fps": args.edit_fps,
-        "n_clips": len(keyids), "n_edited": n_done,
+        "n_clips": len(keyids), "n_edited_this_run": n_done, "n_present": n_present,
         "n_skipped": len(skipped), "skipped": skipped,
+        "limit": args.limit, "limit_mode": args.limit_mode, "limit_seed": args.limit_seed,
         # What actually produced these masks. A score sheet without these is ambiguous
-        # now that M1 has a column axis and psi has two read-outs.
+        # now that M1 has a column axis and psi has two read-outs. `fingerprint` is the
+        # subset that must match for a resume to be sound (see check_resumable).
+        "fingerprint": fingerprint,
         "m1_columns": args.m1_columns, "m1_columns_resolved": col_modes,
+        "m1_columns_fallback": col_fallback,
         "psi_readout": editor.psi_readout,
+        "seed": args.seed, "seed_mode": "per-clip (seed*1000003 + crc32(keyid))",
         "routed_groups": routed,
         "out_dirs": {f"{s:g}": out_dirs[s] for s in args.scales},
+        "status": "complete",
     }
-    os.makedirs(args.out_root, exist_ok=True)
-    with open(os.path.join(args.out_root, f"edit_manifest_{args.mask_mode}.json"), "w") as f:
+    with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
-    print(f"\nDone: edited {n_done} clips, skipped {len(skipped)}.")
+
+    print(f"\nDone: edited {n_done} clips this run, skipped {len(skipped)}; "
+          f"{min(n_present.values()) if n_present else 0} on disk per scale.")
     if skipped:
         print("Skipped (first few):", dict(list(skipped.items())[:5]))
+    if col_fallback:
+        n_m1 = sum(col_modes.values())
+        print(f"\n{'=' * 78}\nWARNING: --m1_columns {args.m1_columns!r} fell back to the "
+              f"all-content-token read on\n{len(col_fallback)}/{n_m1} clips "
+              f"({len(col_fallback) / max(n_m1, 1):.1%}) — those instructions name no body "
+              f"part, so\nthere is no supervised span to restrict M1 to. This score sheet "
+              f"therefore mixes\nTWO M1 read-outs. Report it split, or re-run with "
+              f"--m1_columns semantic for one\nread-out throughout. The affected keyids are "
+              f"in the manifest as m1_columns_fallback.\n{'=' * 78}")
     print("Output folders:", ", ".join(out_dirs.values()))
 
 

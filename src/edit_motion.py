@@ -66,7 +66,7 @@ def parse_args():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     add_model_args(p)
     add_data_args(p, source=True, smplh=True)
-    add_mask_args(p, mask_timesteps=None)
+    add_mask_args(p, mask_timesteps=None, alpha_floor=True)
     p.add_argument("--instruction", action="append", required=True, dest="instructions",
                    help="Edit instruction. Repeat for one video per instruction, or "
                         "with --compose for a single multi-edit.")
@@ -101,11 +101,6 @@ def parse_args():
                         "(sink-dominated). 'renorm' = semantic share of it "
                         "(Attend-and-Excite). 'spatial' = per-token spatial profile "
                         "(DAAM). 'renorm_spatial' = both.")
-    p.add_argument("--guidance_alpha_floor", type=float, default=None,
-                   help="Skip edit guidance where sqrt(alpha_cumprod_t) < this "
-                        "(prevents x0-space divergence at high noise). Default: 0.03 "
-                        "in eps space, 0 (guide every step) in x0 space, which has no "
-                        "1/sqrt(alpha_cumprod_t) amplification to gate.")
     p.add_argument("--smooth_sigma", type=float, default=1.5)
     p.add_argument("--out_dir", default="eval_results/edit_demo")
     return p.parse_args()
@@ -156,7 +151,7 @@ def main():
           f"guidance_alpha_floor={editor.resolve_alpha_floor(args.guidance_alpha_floor):g}"
           + ("  (x0-native ψ/SEGA)" if editor.edit_space == "x0" else ""))
     print("Stage 1: inversion …")
-    state = editor.invert(x0)
+    state = editor.invert(x0, seed=args.seed)
 
     ctx_src = None
     if args.m2_ref == "source":
@@ -227,6 +222,8 @@ def main():
             attn_readout=args.m1_readout,
             semantic_idxs_per_edit=[c[1] for c in cols],
             attn_timesteps=m1_ts, psi_timesteps=m2_ts, per_step_norm=args.per_step_norm,
+            m1_select=args.m1_select, m1_rank_ratio=args.m1_rank_ratio,
+            m1_rank_max=args.m1_rank_max,
         )
         x_edit = editor.edit(state, ctxs, masks, scales=scales,
                              guidance_alpha_floor=args.guidance_alpha_floor)  # (1,F,D)

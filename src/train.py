@@ -89,6 +89,17 @@ def build_parser():
                         " + margin), on lateralised (tier-1) items only. This is the "
                         "term aimed at laterality — the axis no training-free fix has "
                         "ever moved (M1 left/right invariance r=0.985). 0 disables it.")
+    p.add_argument("--attn_ground_even", type=float, default=0.1,
+                   help="Weight of the tier-2 EVENNESS term, the mirror margin's twin. "
+                        "L_token constrains only the SUM over a tier-2 item's target set "
+                        "{left_X, right_X}, so every split of it — 50/50 or 100/0 — is an "
+                        "exact optimum and the model parks the split arbitrarily "
+                        "(measured: 'raise' leans left-arm, 'kick' leans right-leg, same "
+                        "direction on 9/9 clips). This penalises deviation from an even "
+                        "split. It does NOT teach a verb a side; it teaches it no side, "
+                        "which is what 'verbs never lateralise' always meant. Disjoint "
+                        "from --attn_ground_mirror (that runs on tier 1, this on tier 2). "
+                        "0 reproduces the pre-2026-08-15 loss exactly — the A/B control.")
     p.add_argument("--attn_ground_margin", type=float, default=0.1,
                    help="How far the target group must beat its left/right mirror.")
     p.add_argument("--attn_ground_warmup_epochs", type=int, default=20,

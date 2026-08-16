@@ -104,16 +104,27 @@ def _group_aggregation_matrix(group_channels, device) -> torch.Tensor:
 
 
 def _frame_energy(x: torch.Tensor, agg_matrix, is_group: bool) -> torch.Tensor:
-    """(F, D) motion → (F, G) per-(frame, group) motion energy, first frame zero.
+    """(F, D) motion → (F, G) per-(frame, group) motion energy, first frame REPEATED.
 
     Deliberately the same functional form as `utils.probe.source_activity` (per-channel
     |Δ between consecutive frames|, then the group MEAN), so an energy read off a
     model prediction and the source clip's own activity are the same quantity and can
-    be subtracted or correlated without a scale correction.
+    be subtracted or correlated without a scale correction. That parity is load-bearing
+    — see docs/ARCHITECTURE.md — so the first-frame convention below is changed in BOTH
+    functions or neither.
+
+    **Frame 0 repeats frame 1's energy rather than being zeroed (2026-08-16).** Energy is
+    defined on the transition into a frame, so frame 0 has no value of its own. Zeroing it
+    made ψ[0, :] = E_c[0] − E_ref[0] = 0 − 0 = 0 *exactly*, for every clip and every
+    timestep, so with a positive percentile cut the first frame could never enter M2 and
+    was pinned to the source in every edit. Repeating is the cheapest convention that
+    removes the structural hole without inventing a value: frame 0 inherits the motion it
+    is about to undergo, which is also what makes `source_activity`'s "was this group
+    already moving" answer non-degenerate at the clip boundary.
     """
     d = (x[1:] - x[:-1]).abs()                                   # (F-1, D)
     e = d @ agg_matrix if is_group else d.mean(dim=-1, keepdim=True)
-    return torch.cat([e[:1] * 0, e], dim=0)                      # (F, G)
+    return torch.cat([e[:1], e], dim=0)                          # (F, G)
 
 
 def _group_motion_energy(x0: torch.Tensor, valid_frames, agg_matrix: torch.Tensor,
@@ -302,21 +313,72 @@ def build_sweep(num_steps, T, lo=1, hi=None):
     return torch.linspace(lo, hi, num_steps).long().tolist()
 
 
-def percentile_threshold(values: torch.Tensor, valid_frames: torch.Tensor,
+def percentile_threshold(values: torch.Tensor, scope: torch.Tensor,
                          percentile: float) -> torch.Tensor:
     """
     Binarise (F, G) values, keeping entries above the given percentile of the
-    distribution over valid (non-padding) frames. percentile=70 keeps the top 30%.
+    distribution over the cells `scope` selects. percentile=70 keeps the top 30%.
+
+    `scope` is usually the (F,) valid-frame mask — "rank every cell in a real frame" —
+    but a (F, G) cell mask works identically and is what `m1_select="rank"` passes to
+    take the ψ percentile *within the selected group rows only*. Both shapes index
+    `values` down to the same flat set of in-scope cells.
 
     Public because the probes binarise candidate mask maps of their own (Option 6's
     generation-space divergence, say) and their alignment numbers are only comparable to
-    the editor's if the mask is cut the same way.
+    the editor's if the mask is cut the same way — so every cut in this file goes through
+    here rather than re-deriving the quantile.
     """
-    valid_vals = values[valid_frames].flatten()
+    valid_vals = values[scope].flatten()
     if valid_vals.numel() == 0:
         return torch.zeros_like(values, dtype=torch.bool)
     thr = torch.quantile(valid_vals.float(), percentile / 100.0)
     return values >= thr
+
+
+def rank_group_select(attn_fg: torch.Tensor, valid_frames: torch.Tensor,
+                      ratio: float = 0.5, k_max: int = 3) -> torch.Tensor:
+    """(G,) bool — the groups M1 actually names, chosen by RANK instead of a percentile.
+
+    `percentile_threshold` is a cell budget, not a selector: at `lambda_attn=70` it must
+    hand out `0.30 · G = 2.10` group-rows' worth of cells whatever the map looks like, so
+    a one-group instruction spills into the runner-up row and a perfect selector caps at
+    `1/2.10 = 0.476` alignment (docs/FINDINGS.md "Two mask defects"). Deriving the
+    percentile from a known target count fixes that, but the count is not known — "raise
+    the left arm" wants one group and "wave" genuinely wants two.
+
+    So let the map say. Rank the groups by their total mass over valid frames and keep
+    every group holding at least `ratio` of the top group's mass:
+
+        keep g  ⟺  w[g] ≥ ratio · max(w)          (then truncate to k_max)
+
+    **Why a ratio and not an elbow.** The largest-gap/elbow rule needs no parameter but is
+    unstable when two gaps are close, and it cannot express "keep one" — the biggest gap
+    in a flat map is meaningless. The ratio is monotone, scale-free, has one parameter
+    with a plain reading ("at least half as much as the winner"), and degrades to the
+    top-1 group as ratio → 1.
+
+    **The property that makes this the right rule here**, on `exp_smplh_verbs` span
+    read-out, 9 clips: "raise the left arm" gives left 0.94 / right 0.04, a ratio of
+    0.04 → one group. A bilateral instruction leaves the pair near-equal → two groups. So
+    the same rule reads a confident lateralisation as "one" and a genuinely two-sided
+    instruction as "two", without being told which it is. A lopsided-but-close pair (the
+    tier-2 split defect, `semantic` read-out: 0.36/0.47 → ratio 0.77) correctly keeps
+    BOTH, which is the honest answer when the model is not confident about the side.
+
+    k_max caps the damage when the map is flat — an ungrounded checkpoint has all seven
+    groups within a few percent of each other and would otherwise select the whole body.
+    """
+    if not 0.0 < ratio <= 1.0:
+        raise ValueError(f"ratio must be in (0, 1], got {ratio}")
+    w = attn_fg[valid_frames].sum(dim=0)                          # (G,) total mass
+    if w.numel() == 0 or float(w.max()) <= 0.0:
+        return torch.ones_like(w, dtype=torch.bool)               # degenerate: keep all
+    keep = w >= ratio * w.max()
+    if int(keep.sum()) > k_max:                                   # truncate by rank
+        cut = torch.topk(w, k_max).values[-1]
+        keep = keep & (w >= cut)
+    return keep
 
 
 @torch.no_grad()
@@ -326,7 +388,7 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
                        valid_frames=None, attn_readout="raw", semantic_idxs=None,
                        attn_timesteps=None, psi_timesteps=None, per_step_norm=False,
                        psi_space=None, stats_out=None, attn_layers=None,
-                       psi_readout="abs"):
+                       psi_readout="energy"):
     """
     Sweep the stored inversion sequence and accumulate the raw quantities for M1/M2.
 
@@ -392,15 +454,19 @@ def collect_statistics(model, schedule, xs, context_edit, token_idxs,
                     be read where its own signal is. None → use `timesteps`.
     psi_timesteps : sweep for M2 only, overriding `timesteps`. None → use `timesteps`.
     psi_readout   : what the ψ contrast measures per (frame, group):
-                    "abs"    — mean |f_θ(x_t,c) − f_θ(x_t,ref)| (the original, default).
-                               Unsigned, so "the edit ADDS motion here" and "the edit
-                               REMOVES motion here" are the same large value.
+                    "abs"    — mean |f_θ(x_t,c) − f_θ(x_t,ref)| (the original; the
+                               default until 2026-08-15). Unsigned, so "the edit ADDS
+                               motion here" and "the edit REMOVES motion here" are the
+                               same large value.
                     "energy" — SIGNED change in motion energy,
                                E[f_θ(x_t,c)] − E[f_θ(x_t,ref)], where E is per-group
                                |Δ between frames| (`_frame_energy`, the same quantity as
                                `utils.probe.source_activity`). Positive = the instruction
                                makes this group move MORE than the reference does,
-                               negative = less.
+                               negative = less. **The default since 2026-08-15**, on a
+                               size-matched M2-alone comparison (identical 327-cell
+                               budget, 9 clips × 3 checkpoints) where it wins every axis
+                               on every checkpoint — see MotionEditor.__init__.
                     Why the distinction is load-bearing: captions in HumanML3D describe a
                     whole clip, so conditioning on "raise the right arm" pulls the
                     prediction toward a clip where the right arm moves and the rest is
@@ -580,10 +646,27 @@ _MASK_MODE_COMPONENTS = {
 }
 
 
+def mask_mode_components(mask_mode: str) -> tuple[str | None, bool]:
+    """(semantic_source, use_m2) for a mask mode — the single source of truth for which
+    mask components a mode actually uses.
+
+    Public because the answer was being re-derived as literal tuples by every caller that
+    needed only half of it: `"attn" in (...)` to decide whether to capture cross-attention,
+    or to decide which flags are live for a given mode. Those copies silently fall out of
+    date when a mode is added — which is what the table's "one-line change" comment
+    promises they will not — and a stale copy fails open: a new M1-using mode would simply
+    not capture attention, or would drop M1's flags from a provenance fingerprint.
+    """
+    if mask_mode not in _MASK_MODE_COMPONENTS:
+        raise ValueError(f"unknown mask_mode {mask_mode!r}")
+    return _MASK_MODE_COMPONENTS[mask_mode]
+
+
 def build_mask(attn_fg, psi_fg, valid_frames, is_group,
                lambda_attn=70.0, lambda_noise=70.0,
                mask_mode="m2_only", llm_group_mask=None,
-               group_channels=None, feat_dim=263):
+               group_channels=None, feat_dim=263,
+               m1_select="percentile", m1_rank_ratio=0.5, m1_rank_max=3):
     """
     Build the per-edit (F, G) mask according to `mask_mode`.
 
@@ -618,6 +701,22 @@ def build_mask(attn_fg, psi_fg, valid_frames, is_group,
                       groups an instruction targets (also optionally intersected in
                       "temporal"). A (G,) vector is broadcast over frames.
 
+    m1_select       : how M1's group component is cut.
+                      "percentile" — the historical single global quantile over all
+                                     (F, G) cells at `lambda_attn`. Bit-identical to
+                                     every result recorded before 2026-08-15.
+                      "rank"       — `rank_group_select`: keep the top-ranked groups by
+                                     total mass, then threshold M2 **within those rows
+                                     only**. This splits a threshold that was doing two
+                                     jobs — one global cut cannot both pick groups and
+                                     pick frames — into a rank on the group axis and a
+                                     percentile on the time axis. `lambda_attn` is unused
+                                     in this mode; `lambda_noise` becomes "what fraction
+                                     of the SELECTED rows' frames to keep", which is the
+                                     reading it should always have had.
+    m1_rank_ratio   : keep groups holding ≥ this fraction of the top group's mass.
+    m1_rank_max     : hard cap on how many groups "rank" may select.
+
     group_channels  : representation channel partition (263-d default, or 135-d smplh)
     feat_dim        : total feature width D matching group_channels (263 or 135)
 
@@ -626,9 +725,7 @@ def build_mask(attn_fg, psi_fg, valid_frames, is_group,
       m_channel : (F, D) float  — group mask scattered to feature channels (for Eq. 1)
       edited    : (F,) bool      — frame has any active group (drives hard inpainting)
     """
-    if mask_mode not in _MASK_MODE_COMPONENTS:
-        raise ValueError(f"unknown mask_mode {mask_mode!r}")
-    semantic_source, use_m2 = _MASK_MODE_COMPONENTS[mask_mode]
+    semantic_source, use_m2 = mask_mode_components(mask_mode)
 
     valid = valid_frames[:, None]
 
@@ -656,7 +753,13 @@ def build_mask(attn_fg, psi_fg, valid_frames, is_group,
     if semantic_source is None:
         m_sem = None
     elif semantic_source == "attn":
-        m_sem = percentile_threshold(attn_fg, valid_frames, lambda_attn)
+        if m1_select == "rank":
+            keep = rank_group_select(attn_fg, valid_frames, m1_rank_ratio, m1_rank_max)
+            m_sem = keep[None, :].expand(attn_fg.shape[0], -1)
+        elif m1_select == "percentile":
+            m_sem = percentile_threshold(attn_fg, valid_frames, lambda_attn)
+        else:
+            raise ValueError(f"m1_select must be 'percentile' or 'rank', got {m1_select!r}")
     else:  # "groups"
         if llm_group_mask is None:
             raise ValueError(f"mask_mode={mask_mode!r} requires llm_group_mask (F, G) or (G,).")
@@ -664,8 +767,20 @@ def build_mask(attn_fg, psi_fg, valid_frames, is_group,
         if m_sem.dim() == 1:
             m_sem = m_sem[None, :].expand(valid_frames.shape[0], -1)
 
-    # noise component (M2)
-    m2 = percentile_threshold(psi_fg, valid_frames, lambda_noise) if use_m2 else None
+    # noise component (M2). Under "rank" the ψ percentile is taken over the SELECTED
+    # rows only, which is the other half of the same fix: a global cut spends its budget
+    # ranking cells in groups the instruction never named, so the frames it keeps inside
+    # the target group depend on how busy the rest of the body is. It also removes the
+    # arm/leg recall inversion at source — arm instructions produce a negative ΔE at
+    # their own target, so under a global cut fewer arm cells clear it (recall 0.345 vs
+    # legs' 0.662); ranked within the selected rows the comparison is limb-relative.
+    if not use_m2:
+        m2 = None
+    elif m1_select == "rank" and m_sem is not None:
+        sel = valid & m_sem                                   # (F, G) cells in scope
+        m2 = percentile_threshold(psi_fg, sel, lambda_noise) & sel
+    else:
+        m2 = percentile_threshold(psi_fg, valid_frames, lambda_noise)
 
     m_group = valid.expand(-1, attn_fg.shape[1]).clone()
     if m_sem is not None:

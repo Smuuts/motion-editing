@@ -15,7 +15,7 @@ Typical flow (single source motion x0, one or more edit instructions):
     x_edit = editor.edit(state, ctxs, masks, scales=[5.0])           # Stage 3
 """
 
-from editing.inversion import MotionEditor, InversionState
+from editing.inversion import MotionEditor, InversionState, derive_seed
 from editing import masking
 
-__all__ = ["MotionEditor", "InversionState", "masking"]
+__all__ = ["MotionEditor", "InversionState", "derive_seed", "masking"]

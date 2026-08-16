@@ -109,9 +109,11 @@ def correct(fg, src_act, lam, mode="sub", norm="z", valid=None, floor_q=5.0):
 
     For "div" the normalisation is forced positive ("z" would put negatives inside a
     log), and `floor_q` clamps the source at its q-th percentile over valid cells first:
-    without it the still regions (S ≈ 0, including frame 0, which `source_activity` sets
-    to exactly 0) divide up to arbitrarily large values and the mask inverts onto
-    whatever the clip does NOT move.
+    without it the still regions (S ≈ 0) divide up to arbitrarily large values and the
+    mask inverts onto whatever the clip does NOT move. (Frame 0 used to be an *exact* 0
+    here — `source_activity` zeroed it — and so was the worst case for this division; since
+    2026-08-16 it repeats frame 1, which removes that particular guaranteed-zero cell but
+    not the need for the floor.)
     """
     if mode not in MODES:
         raise ValueError(f"unknown mode {mode!r}, expected one of {MODES}")

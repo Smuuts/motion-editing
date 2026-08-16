@@ -175,7 +175,7 @@ def probe_one(ckpt, clip, args, device) -> dict:
     editor = MotionEditor(model, schedule, device, is_group=is_group,
                           edit_space=args.edit_space,
                           attn_layers=resolve_readout_layers(config, args.m1_layers))
-    state = editor.invert(x0)
+    state = editor.invert(x0, seed=args.seed)
     src_act = source_activity(x0, editor.group_channels)
     valid_np = valid.cpu().numpy()
 

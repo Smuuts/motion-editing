@@ -196,6 +196,7 @@ class Trainer:
             weight=c["attn_ground_weight"],
             layers=layers,
             mirror=c.get("attn_ground_mirror", 1.0),
+            even=c.get("attn_ground_even", 0.1),
             margin=c.get("attn_ground_margin", 0.1),
             warmup_epochs=c.get("attn_ground_warmup_epochs", 20),
             window=tuple(window) if window else None,
@@ -219,7 +220,8 @@ class Trainer:
                 else "soft 1-alpha_bar_t weighting (pressure at HIGH noise)")
         print(f"Attention grounding ON (TokenCompose L_token): weight "
               f"{self.grounding.weight:g}, layers {layers} (one sampled per step), "
-              f"mirror {self.grounding.mirror:g} @ margin {self.grounding.margin:g}, "
+              f"mirror {self.grounding.mirror:g} @ margin {self.grounding.margin:g} "
+              f"(tier 1), even {self.grounding.even:g} (tier 2), "
               f"warmup {self.grounding.warmup_epochs} epochs, {gate}.\n"
               f"  Labels: {len(cache)} captions / {n_items} items from {cache_path} "
               f"(target sizes |S| = {sizes}).\n"

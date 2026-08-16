@@ -36,6 +36,7 @@ follow-up; the DDPM form already provides the exact-reconstruction guarantee tha
 Stages 2–3 rely on. Inversion runs on the full timestep grid for that reason.
 """
 
+import zlib
 from dataclasses import dataclass
 
 import torch
@@ -49,6 +50,28 @@ from editing import masking
 EPS_GUIDANCE_ALPHA_FLOOR = 0.03
 
 
+def derive_seed(base_seed: int, item_id: str) -> int:
+    """Per-item inversion seed from a run-level seed and an item's identity.
+
+    Lives beside `invert` because it is a property of how `invert` draws noise, not of any
+    one caller. `invert` builds its `x_t` ladder from a fresh `Generator(seed)`, so the draw
+    depends only on `(seed, shape)` — which means a batch job passing one seed to every item
+    gives **any two items of equal frame count a bit-identical noise realisation**. On the
+    MotionFix test set that is 1013 clips over ~60 distinct lengths, i.e. ~17 clips per
+    length sharing their whole trajectory noise, and the metric consuming them is retrieval,
+    where generations are scored against each other.
+
+    Deriving keeps a run exactly reproducible from one `--seed` (which still moves every item
+    together, so seed-spread measurements work unchanged) while making the draws independent
+    across items. `crc32` rather than `hash()` because Python string hashing is salted per
+    process, so `hash()` would not be reproducible across runs.
+
+    NOTE any multi-item caller wants this — the probes still pass a bare `--seed` across
+    their clip loops and therefore still share ladders between equal-length clips.
+    """
+    return (base_seed * 1_000_003 + zlib.crc32(item_id.encode())) % (2 ** 31 - 1)
+
+
 @dataclass
 class InversionState:
     """Output of invert(): the noisy trajectory and its edit-friendly noise maps."""
@@ -58,7 +81,7 @@ class InversionState:
 
 class MotionEditor:
     def __init__(self, model, schedule, device, is_group: bool, edit_space="auto",
-                 attn_layers=None, psi_readout="abs"):
+                 attn_layers=None, psi_readout="energy"):
         """edit_space : "auto" (default) reads the space off the checkpoint's own
         `predict_type` via NoiseSchedule.resolve_space — an x0-trained checkpoint edits
         x0-natively, an ε-trained one keeps the historical ε-space path, and no caller
@@ -76,16 +99,21 @@ class MotionEditor:
         exists to measure; a checkpoint trained without it has no such key and keeps
         the historical all-blocks behaviour.
 
-        psi_readout : what the ψ/M2 contrast measures — "abs" (the LEDITS++ magnitude
-        |x̂0^c − x̂0^ref|, the default and the historical behaviour) or "energy" (the
-        SIGNED change in per-group motion energy). It sits here rather than on
-        `collect_masks` for the same reason `edit_space` does: it changes what ψ *means*,
-        so it must be one value for the whole edit, resolved once from a flag. Measured
-        effect inside M1 ∩ M2 at matched mask size: alignment 0.452 → 0.583 with recall
-        0.659 → 0.843 (docs/FINDINGS.md "ψ is a mixture"). The default stays "abs"
-        deliberately — the gain is measured on mask quality, and the standing MotionFix
-        negative it is meant to attack is an EDIT result, so the default flips only after
-        the end-to-end comparison.
+        psi_readout : what the ψ/M2 contrast measures — "energy" (the SIGNED change in
+        per-group motion energy, the default since 2026-08-15) or "abs" (the LEDITS++
+        magnitude |x̂0^c − x̂0^ref|, the historical default; pass it to reproduce any
+        result recorded before that date). It sits here rather than on `collect_masks`
+        for the same reason `edit_space` does: it changes what ψ *means*, so it must be
+        one value for the whole edit, resolved once from a flag.
+
+        **Why the default flipped**, since it reverses a recorded decision: the earlier
+        "stays abs until the end-to-end MotionFix run" was hedging against a gain measured
+        only inside M1 ∩ M2, where a sparser mask can buy precision for free. The
+        size-matched M2-ALONE comparison removes that objection — at an identical 327-cell
+        budget, over 9 clips × 3 checkpoints, energy wins every axis on every checkpoint:
+        alignment 0.24 → 0.33, recall 0.50 → 0.69, instruction-invariance 0.69 → 0.13,
+        category invariance +0.59 → −0.25, source coupling +0.42 → −0.21. There is no
+        remaining axis on which "abs" is the better read-out.
         """
         self.model    = model
         self.schedule = schedule
@@ -102,10 +130,21 @@ class MotionEditor:
 
     # ── Stage 1 ────────────────────────────────────────────────────────────────
     @torch.no_grad()
-    def invert(self, x0: torch.Tensor, show_progress: bool = True) -> InversionState:
+    def invert(self, x0: torch.Tensor, show_progress: bool = True,
+               seed: int | None = None) -> InversionState:
         """
         x0 : (1, F, D) normalised source motion (same space the model trained in),
              D = 263 (humanml3d) or 135 (smplh).
+        seed : fixes the noise realisation of the x_t ladder below. **Pass one for any
+             measurement.** Until 2026-08-15 this was always unseeded, and that is a
+             bigger deal than it looks: `xs` is an independent draw per call, so every
+             mask number downstream of it is a sample, not a value. Measured on clip
+             005675, two runs of the identical probe command: per-clip `align_attn`
+             differed by **0.48** and `cells_attn` by 43 — the same magnitude as the
+             effects being measured. Within ONE call the instructions share `xs`, so the
+             paired contrasts (laterality, category, off-diagonal r) were always clean;
+             it is absolute per-clip numbers and cross-run/cross-checkpoint A/Bs that
+             carry the variance, and 9-clip means that average it down.
         Returns the InversionState consumed by collect_masks() and edit().
         """
         s = self.schedule
@@ -114,13 +153,21 @@ class MotionEditor:
         D = x0.shape[2]
         x0 = x0.to(self.device)
 
-        # 1. independent noisy sequence x_t (xs[0] = x0)
+        # 1. independent noisy sequence x_t (xs[0] = x0). A LOCAL generator, not
+        # torch.manual_seed: seeding globally here would silently re-align every other
+        # random draw in the caller's process (CFG dropout in a training loop, the noise
+        # of a second clip in a sweep), which is a much larger side effect than this
+        # function is entitled to have.
+        gen = None
+        if seed is not None:
+            gen = torch.Generator(device=self.device).manual_seed(int(seed))
         xs = torch.empty(T, 1, F, D, device=self.device)
         xs[0] = x0
         for t in range(1, T):
             sqrt_acp   = s.sqrt_alphas_cumprod[t]
             sqrt_omacp = s.sqrt_one_minus_alphas_cumprod[t]
-            xs[t] = sqrt_acp * x0 + sqrt_omacp * torch.randn_like(x0)
+            eps = torch.randn(x0.shape, device=self.device, dtype=x0.dtype, generator=gen)
+            xs[t] = sqrt_acp * x0 + sqrt_omacp * eps
 
         # 2. edit-friendly noise maps z_t (for t in [1, T))
         zs = torch.zeros(T, 1, F, D, device=self.device)
@@ -148,7 +195,8 @@ class MotionEditor:
                       mask_mode="m2_only", llm_group_masks=None,
                       context_source=None, m2_group_norm=False,
                       attn_readout="raw", semantic_idxs_per_edit=None,
-                      attn_timesteps=None, psi_timesteps=None, per_step_norm=False):
+                      attn_timesteps=None, psi_timesteps=None, per_step_norm=False,
+                      m1_select="percentile", m1_rank_ratio=0.5, m1_rank_max=3):
         """
         Build one mask dict per edit instruction (see masking.build_mask).
 
@@ -174,6 +222,12 @@ class MotionEditor:
                                masking.collect_statistics). None → shared `timesteps`.
         per_step_norm        : weight every swept timestep equally instead of by its
                                magnitude (see masking._normalise_step).
+        m1_select            : "percentile" (default, bit-identical to everything
+                               recorded before 2026-08-15) or "rank" — pick M1's groups
+                               by rank instead of a cell budget, and threshold ψ inside
+                               the selected rows. See masking.rank_group_select and
+                               masking.build_mask.
+        m1_rank_ratio / m1_rank_max : the "rank" mode's two parameters.
 
         ψ/M2 is computed in this editor's `edit_space`, so an x0 checkpoint contrasts
         clean-signal predictions (ψ_x0) instead of noise estimates (ψ_ε). Same mask at
@@ -181,7 +235,7 @@ class MotionEditor:
         threshold can see — but a different mixture across the sweep; see
         masking.collect_statistics's `psi_space`.
         """
-        need_attn = mask_mode in ("attn", "m1_only")
+        need_attn = masking.mask_mode_components(mask_mode)[0] == "attn"
         if token_idxs_per_edit is None:
             token_idxs_per_edit = [None] * len(edit_contexts)
         if llm_group_masks is None:
@@ -209,6 +263,8 @@ class MotionEditor:
                 lambda_attn=lambda_attn, lambda_noise=lambda_noise,
                 mask_mode=mask_mode, llm_group_mask=llm_m,
                 group_channels=self.group_channels, feat_dim=self.feat_dim,
+                m1_select=m1_select, m1_rank_ratio=m1_rank_ratio,
+                m1_rank_max=m1_rank_max,
             ))
         return masks
 
@@ -247,6 +303,14 @@ class MotionEditor:
         out = base
         if guide:
             for ctx, m_ch, scale in zip(edit_contexts, m_channels, scales):
+                # A zero scale contributes `0 · m ⊙ (out_c − base)` = 0, so the conditional
+                # forward that produces out_c is pure waste — and scale 0 is not a corner
+                # case here, it is the source-reconstruction calibration every sweep runs.
+                # Skipping it saves one model call per step, i.e. ~11% of a MotionFix run
+                # (999 of ~9,100 forwards per clip at four scales). Output is unchanged for
+                # any finite out_c; a NaN there would already have poisoned `base`.
+                if scale == 0:
+                    continue
                 out_c = s.to_space(self.model(x, t_b, ctx), x, t_b, space)
                 out = out + scale * m_ch * (out_c - base)
         # NB the result is NOT clamped — normalised HumanML3D features legitimately

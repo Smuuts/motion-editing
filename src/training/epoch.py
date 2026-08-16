@@ -144,7 +144,7 @@ def _add_grounding_loss(loss, A, batch, motion, attn_mask, kept, t, schedule, cf
     l_ground, stats = grounding.grounding_loss(
         A.float(), batch["text"], cfg.cache, attn_mask, valid,
         sample_weight=w_t, lambda_mirror=cfg.mirror, margin=cfg.margin,
-        source_act=src, mirror_mat=cfg.mirror_mat)
+        source_act=src, mirror_mat=cfg.mirror_mat, lambda_even=cfg.even)
     return loss + cfg.weight * l_ground, l_ground, stats
 
 
@@ -157,7 +157,7 @@ class _GroundingAccumulator:
     would let the handful of caption-dense batches set the epoch's number.
     """
 
-    KEYS = ("m_S", "m_S_tier1", "m_mirror", "src_corr")
+    KEYS = ("m_S", "m_S_tier1", "m_mirror", "split_max", "src_corr")
 
     def __init__(self):
         self.sums = {k: 0.0 for k in self.KEYS}

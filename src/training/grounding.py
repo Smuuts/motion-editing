@@ -196,7 +196,8 @@ class GroundingConfig:
     """
     weight:         float = 0.0            # λ; 0 = the whole feature is off
     layers:         list[int] = field(default_factory=list)
-    mirror:         float = 1.0            # λ_mirror
+    mirror:         float = 1.0            # λ_mirror  — tier 1, "beat your mirror"
+    even:           float = 0.1            # λ_even    — tier 2, "do not pick a side"
     margin:         float = 0.1
     warmup_epochs:  int = 20
     window:         tuple[int, int] | None = None   # hard timestep gate, if used
@@ -268,10 +269,16 @@ def batched_source_activity(motion: torch.Tensor, group_channels,
     This is the reference the shortcut monitor correlates against: it depends only on
     the clip, never on the caption, so an attention map that tracks it is a motion
     detector rather than a word→group router.
+
+    Frame 0 repeats frame 1 rather than being zeroed (2026-08-16), matching
+    `utils.probe.source_activity` and `editing.masking._frame_energy` — the three are one
+    definition and are changed together (docs/ARCHITECTURE.md). This shifts the logged
+    `src_corr` slightly: it removes one artificially-zero cell per clip that was shared by
+    both correlands and therefore inflated their agreement.
     """
     diff = (motion[:, 1:] - motion[:, :-1]).abs()                   # (B, F-1, D)
     act = torch.stack([diff[:, :, ch].mean(dim=-1) for ch in group_channels], dim=-1)
-    act = torch.cat([act[:, :1] * 0, act], dim=1)                   # (B, F, G)
+    act = torch.cat([act[:, :1], act], dim=1)                       # (B, F, G)
     return act * frame_mask[:, :, None].to(act.dtype)
 
 
@@ -306,7 +313,7 @@ def collect_items(texts, cache, valid_sample) -> list[tuple[int, dict]]:
 
 def grounding_loss(A, texts, cache, frame_mask, valid_sample,
                    sample_weight=None, lambda_mirror=1.0, margin=0.1,
-                   source_act=None, mirror_mat=None):
+                   source_act=None, mirror_mat=None, lambda_even=0.1):
     """TokenCompose L_token (+ the mirror margin) on the supervised text columns.
 
     A            : (B, F, G, L) head-averaged cross-attention, GRAPH KEPT.
@@ -321,6 +328,8 @@ def grounding_loss(A, texts, cache, frame_mask, valid_sample,
                    normalise, so the loss stays comparable as the weight distribution
                    shifts.
     source_act   : (B, F, G) optional; enables the src_corr shortcut monitor.
+    lambda_even  : weight of the tier-2 evenness term (see the block that computes it).
+                   0 reproduces the pre-2026-08-15 loss exactly, which is the A/B control.
 
     Returns (loss, stats). Averaging is over supervised TOKENS, not samples: a caption
     naming two parts exerts twice the pressure of one naming a single part, which is
@@ -382,6 +391,39 @@ def grounding_loss(A, texts, cache, frame_mask, valid_sample,
         loss_tok = loss_tok + lambda_mirror * is_t1 * torch.relu(
             m_mirror - m_S + margin)
 
+    # ── the tier-2 evenness term (the mirror term's twin) ─────────────────────────
+    # L_token constrains the SUM over S and nothing else, so for a tier-2 item
+    # S = {left_X, right_X} every split of that sum is an exact global optimum: 50/50
+    # and 100/0 score identically. That is not a weak constraint, it is no constraint,
+    # and gradient descent parks the split wherever the token's initialisation happened
+    # to point and never corrects it. Measured consequence on `exp_smplh_verbs`: `raise`
+    # leans left-arm and `kick` leans right-leg, in the SAME direction on 9/9 clips,
+    # absent from the source clips' own energy and gone when the verb column is dropped
+    # (docs/FINDINGS.md "Two mask defects with different causes").
+    #
+    # This does NOT teach a verb a side — that would break "verbs never lateralise" and
+    # put supervision on both halves of the axis the mirror margin exists to sharpen. It
+    # teaches it NO side, which is what that rule always meant; the rule was only ever
+    # enforced by *omitting* a laterality term, and omitting a constraint on a free
+    # parameter yields an arbitrary value, not a neutral one. The two terms are disjoint
+    # by construction: mirror runs on tier 1, this runs on tier 2.
+    split_max = torch.zeros_like(m_S)
+    if lambda_even > 0.0:
+        n_S = S.sum(-1).clamp_min(1.0)                               # (n,) = |S|
+        p = mass_g * S                                               # (n, G), 0 off S
+        # Deviation from an even split of whatever mass has arrived. Unnormalised on
+        # purpose: dividing by m_S would blow up early in training when m_S ≈ 0, whereas
+        # this scales WITH m_S — no pressure before the mass is there, full pressure once
+        # L_token has done its job. Free annealing, no schedule.
+        dev = (p - (m_S / n_S)[:, None]) * S                         # (n, G)
+        # |S| = 1 makes this identically zero, so the tier-1 gate is belt-and-braces —
+        # but it is the gate that states the intent, and it is what stops a future
+        # multi-group LATERALISED item from being forced flat.
+        loss_tok = loss_tok + lambda_even * (1.0 - is_t1) * dev.pow(2).sum(-1)
+        # Monitor: the largest share of the on-target mass held by any one group.
+        # 1/|S| is perfect (0.5 for a limb pair), 1.0 is "all of it on one side".
+        split_max = p.max(dim=-1).values / m_S.clamp_min(1e-8)
+
     w = (torch.ones_like(m_S) if sample_weight is None
          else sample_weight[b_idx].to(a.dtype))
     loss = (w * loss_tok).mean()
@@ -398,6 +440,11 @@ def grounding_loss(A, texts, cache, frame_mask, valid_sample,
             # The tier-1 split is the one that answers the laterality question; tier 2
             # ({left_X, right_X}) is satisfiable without ever reading the side word.
             stats["m_S_tier1"] = (m_S * is_t1).sum().item() / n1.item()
+        n2 = (1.0 - is_t1).sum()
+        if n2 > 0 and lambda_even > 0.0:
+            # Tier-2 items only — a tier-1 item's |S| is 1, so its split_max is 1.0 by
+            # definition and averaging it in would hide the number this stat exists for.
+            stats["split_max"] = (split_max * (1.0 - is_t1)).sum().item() / n2.item()
         if source_act is not None:
             valid_cells = frame_mask[b_idx][:, :, None].expand(-1, -1, G).reshape(
                 len(b_idx), -1)

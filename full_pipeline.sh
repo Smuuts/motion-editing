@@ -50,6 +50,7 @@ ATTN_ENTROPY_WEIGHT=0.0          # 0 disables; try 0.01 (experiment knob, keep r
 ATTN_GROUND_WEIGHT=0.0           # 0 = off (whole block). The run: 5e-3
 ATTN_GROUND_LAYERS="middle"      # "middle" (blocks 3-5 of 8) | "all" | "3,4,5"
 ATTN_GROUND_MIRROR=1.0           # weight of the left/right mirror margin (tier-1 items)
+ATTN_GROUND_EVEN=0.1             # weight of the evenness term (tier-2 items); 0 = old loss
 ATTN_GROUND_MARGIN=0.1           # how far the target group must beat its mirror
 ATTN_GROUND_WARMUP_EPOCHS=20     # from-scratch attention is noise before this
 # "" = soft 1-alpha_bar_t weighting (pressure at HIGH noise — the defence against the
@@ -106,6 +107,7 @@ if awk "BEGIN{exit !(${ATTN_GROUND_WEIGHT}>0)}"; then
   GROUND_ARGS=(--attn_ground_weight        "${ATTN_GROUND_WEIGHT}"
                --attn_ground_layers        "${ATTN_GROUND_LAYERS}"
                --attn_ground_mirror        "${ATTN_GROUND_MIRROR}"
+               --attn_ground_even          "${ATTN_GROUND_EVEN}"
                --attn_ground_margin        "${ATTN_GROUND_MARGIN}"
                --attn_ground_warmup_epochs "${ATTN_GROUND_WARMUP_EPOCHS}")
   [[ -n "${ATTN_GROUND_CACHE}" ]] && GROUND_ARGS+=(--attn_ground_cache "${ATTN_GROUND_CACHE}")

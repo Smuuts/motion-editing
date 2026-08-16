@@ -131,7 +131,7 @@ def main():
     src_act = source_activity(x0, editor.group_channels, is_group)   # (F, G) reference
 
     print("Stage 1: inversion …")
-    state = editor.invert(x0)
+    state = editor.invert(x0, seed=args.seed)
 
     sweeps = resolve_sweeps(args.mask_timesteps, schedule.T, args.m1_window, args.m2_window)
     if args.m1_window or args.m2_window or args.per_step_norm:

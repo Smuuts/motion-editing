@@ -197,6 +197,21 @@ def smpl_to_gen_layout(rots, trans) -> np.ndarray:
     return torch.cat([trans, go6d, bp6d], dim=-1).numpy().astype(np.float32)
 
 
+def gen_layout_to_rotmats(feat) -> torch.Tensor:
+    """MotionFix gen layout (T,135) -> rotation matrices (T,22,3,3); [0] = global orient.
+
+    The reader for `smpl_to_gen_layout`, and it lives next to it so the two halves of the
+    layout contract stay in one module. NOTE the offsets differ from the TRAINING layout that
+    `features_to_rotmats` decodes — gen is [trans(3) | global_orient_6d(6) | body_pose_6d(126)],
+    training is [trans_delta(3) | body_pose_6d(126) | global_orient_6d(6)] — so reading one
+    with the other silently scrambles the joints.
+    """
+    f = torch.as_tensor(np.asarray(feat), dtype=torch.float32)
+    go = rotation_6d_to_matrix(f[:, 3:9]).unsqueeze(1)                  # (T,1,3,3)
+    bp = rotation_6d_to_matrix(f[:, 9:135].reshape(-1, 21, 6))          # (T,21,3,3)
+    return torch.cat([go, bp], dim=1)
+
+
 def mirror_smplh(rots, trans):
     """Sagittal (left<->right) mirror of raw SMPL-H, matching HumanML3D's `M`-clips.
 

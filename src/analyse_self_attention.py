@@ -188,7 +188,7 @@ def main():
           f"N = F*G = {N}")
 
     print("Stage 1: inversion …")
-    state = editor.invert(x0)
+    state = editor.invert(x0, seed=args.seed)
 
     # Primary readout: NULL context — self-attention with no text at all, the honest
     # "text-free structure" measurement Family A is about.

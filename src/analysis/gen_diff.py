@@ -89,15 +89,21 @@ def joint_divergence(pa: np.ndarray, pb: np.ndarray) -> np.ndarray:
 
 def temporal_activity(divergence_fn, clip) -> np.ndarray:
     """The same divergence applied between consecutive frames of ONE clip → its own
-    (F, G) motion energy, with a zero first frame.
+    (F, G) motion energy, first frame REPEATED.
 
     This is the control that keeps Option 6 honest: if a generation's plain motion energy
     localises the instruction just as well as the paired difference does, then the
     differencing — and the shared noise it needs — buys nothing, and what is really being
     measured is "the generator moves the named limb".
+
+    Frame 0 repeats frame 1 rather than being zeroed (2026-08-16), matching the other three
+    copies of this convention — `masking._frame_energy`, `utils.probe.source_activity`,
+    `grounding.batched_source_activity`. They are one definition and are changed together, so
+    that "this map vs the source's own activity" stays a comparison of like with like
+    (docs/ARCHITECTURE.md).
     """
     d = divergence_fn(clip[1:], clip[:-1])
-    return np.concatenate([d[:1] * 0, d], axis=0)
+    return np.concatenate([d[:1], d], axis=0)
 
 
 # ── scoring ──────────────────────────────────────────────────────────────────────
