@@ -36,9 +36,9 @@
 # + 4 x 2 x 999 for the edits), so MASK_TIMESTEPS is ~1 % of the bill and there is no reason to
 # economise on it. **The number of scales is the main cost lever, not the number of clips.**
 # Budget:
-#   scan  (16 clips x 8 scales x 2 modes)  ~55 min
+#   scan  (16 clips x 8 scales x 3 modes)  ~85 min
 #   subsample (320 clips x 4 scales)       ~3.5 h per mask_mode   [LIMIT=320, not reportable]
-#   DEFAULT (1013 clips x 4 scales)        ~11 h  per mask_mode   -> ~22 h for the default pair
+#   DEFAULT (1013 clips x 4 scales)        ~11 h  per mask_mode   -> ~33 h for the default three
 # The default is the full set on purpose (see LIMIT): a subsampled gallery is biased, not
 # merely noisy. Budget it as an overnight-plus run, or cut SCALES rather than clips.
 # Re-running is safe and resumes: clips whose .npy already exists are skipped unless
@@ -62,14 +62,46 @@ MFIX_PY="data/motionfix/mfix-env/bin/python"     # MotionFix's own venv, for the
 SCALE_SCAN=0
 
 # ── the scored run ────────────────────────────────────────────────────────────────
-# m2_only = the historical mask, the only mode with recorded sweeps to compare against.
-# attn    = M1 ∩ M2, i.e. what the grounding loss was for. This pair IS the experiment.
+# The mask is M = M1 ∩ M2, with M1 owning the GROUP axis and M2 the TEMPORAL one, so the
+# three listed modes are a clean decomposition: each component alone, then the composition.
+# m2_only = M2 alone: the right frames, every body-part group. The historical mask and the
+#           only mode with recorded sweeps to compare against.
+# attn    = M1 ∩ M2: what the grounding loss was for. THIS IS THE PRIMARY ARM — listed
+#           second so an interrupted run still has the m2_only/attn comparison.
+# m1_only = M1 alone: the right groups, EVERY FRAME. M1 scores far better than M2 on the
+#           group axis (alignment 0.447 / recall 0.940 vs 0.318 / 0.668) but it is
+#           "largely flat in time" by construction — docs/FINDINGS.md "What grounded M1
+#           actually became: a text→group selector". Under M1_SELECT=rank it is exactly
+#           flat: m_sem is a (G,) vector broadcast over all frames, so this mode edits the
+#           selected 1-3 groups for the WHOLE clip and neither LAMBDA_ applies (lambda_attn
+#           is inert under rank, lambda_noise inert with no M2). Expect it to trade
+#           preservation (R@k_s2t) away for edit-following; that is the point of having it.
 # groups  = the no-LLM router control. NOT in the default list because it SKIPS clips it
 #           cannot route (~17 % name no body part) — that both changes the clip set AND
 #           shrinks its retrieval gallery, which inflates its R@k. Stage B scores on the
 #           common subset (COMMON_SUBSET=1) so a mixed list stays comparable.
-MASK_MODES="m2_only attn"
-SCALES="0 2.5 5 7.5"             # scale 0 reconstructs the source: the plumbing check
+MASK_MODES="m2_only attn m1_only"
+
+# Guidance scales, PER MODE — because a given scale does wildly different things depending on
+# how many cells the mask lets through. Measured on the 16-clip scan
+# (eval_results/motionfix/exp_smplh_verbs_energy_scan.json), degrees of rotation on the
+# most-moved joint per unit of scale: attn 0.45, m2_only 1.6, m1_only ~8-12. So reaching the
+# SAME edit magnitude needs attn 16, m2_only 4.8, m1_only 0.67 — a 24x spread.
+#
+# Running one list across all three would compare a mode that barely moves the body against
+# one that wrecks the pose, and the TMR gap would be a magnitude artefact rather than a
+# statement about mask quality. Same trap as buying mask precision by shrinking the mask,
+# which docs/FINDINGS.md already controls for with size-matching.
+#
+# These target rotmax ~= 3 / 8 / 15 degrees in each mode, so the three sweeps span a
+# comparable slice of the preservation-vs-edit curve. Scale 0 reconstructs the source in
+# every mode: the plumbing check.
+declare -A SCALES_BY_MODE=(
+  [m2_only]="0 2 5 12"
+  [attn]="0 6 16 30"          # 16 and 30 are EXTRAPOLATED past the s=12 scan; re-scan to confirm
+  [m1_only]="0 0.25 0.7 1.4"  # saturating: 40 deg already at s=5, so its band is below 1.5
+)
+SCALES="0 2.5 5 7.5"             # fallback for any mode not listed above
 # 0 = the full 1013-clip test set, and it is the default deliberately. A subsample is not
 # just noisier, it is BIASED in a known direction: `retrieval()` sizes its gallery to the
 # clips you generate, so a 320-clip run is a 320-way retrieval whose R@k reads high against
@@ -78,19 +110,20 @@ SCALES="0 2.5 5 7.5"             # scale 0 reconstructs the source: the plumbing
 LIMIT=0
 
 # ── the scan (used only when SCALE_SCAN=1) ────────────────────────────────────────
-# Both mask modes, because the useful scale band is mask-dependent: attn produces a smaller
-# mask than m2_only and so moves the body less at the same s. 16 clips, because a
-# magnitude-vs-scale curve is a strong, low-variance signal — the shape is already
-# unambiguous at n=6. Do NOT read quality off this many clips; that is what the scored run
-# is for.
-SCAN_MASK_MODES="m2_only attn"
+# All three modes, because the useful scale band is mask-dependent and they differ a lot in
+# mask SIZE: attn (M1 ∩ M2) is the smallest and moves the body least at a given s, m1_only
+# edits its groups across every frame and so moves it most. One band picked on m2_only would
+# be wrong for both others. 16 clips, because a magnitude-vs-scale curve is a strong,
+# low-variance signal — the shape is already unambiguous at n=6. Do NOT read quality off this
+# many clips; that is what the scored run is for. Cost ~28 min per mode.
+SCAN_MASK_MODES="m2_only attn m1_only"
 SCAN_SCALES="0 0.5 1 2 3 5 8 12"
 SCAN_LIMIT=16
 
 # ── mask read-out settings ────────────────────────────────────────────────────────
 # See the NOTE at the bottom of this script for what changed and when.
 PSI_READOUT="energy"      # 'abs' reproduces every pre-2026-08-15 sweep
-M1_COLUMNS="auto"         # only used by mask_mode=attn. 'auto' (=semantic on a grounded
+M1_COLUMNS="auto"         # used by mask_mode=attn and m1_only. 'auto' (=semantic on a grounded
                           # checkpoint) is the no-parser default. 'span' measures best but
                           # runs the caption parser at inference AND falls back to the
                           # all-token read on the ~30 % of instructions naming no body part,
@@ -124,15 +157,19 @@ EXTRA=""                  # extra flags for the editor, e.g. "--overwrite"
 # ----------------------------------------------------------------------
 if [[ "${SCALE_SCAN}" == "1" ]]; then
   MASK_MODES="${SCAN_MASK_MODES}"
-  SCALES="${SCAN_SCALES}"
   LIMIT="${SCAN_LIMIT}"
+  # The scan is exploratory: one wide net for every mode is the point, since its whole job is
+  # to find where each mode's band actually is.
+  SCALES="${SCAN_SCALES}"
+  SCALES_BY_MODE=()
 fi
 
-# Normalise the scale strings through Python's %g, which is what names the output dirs
-# ({mask_mode}_s{scale:g}). Without this, SCALES="0.0 2.50" makes the shell look for
-# _s0.0/_s2.50 while the editor wrote _s0/_s2.5, and `realpath` does not fail on a missing
-# leaf — so the mismatch surfaces much later as a crash inside the scorer.
-SCALES=$(python -c 'import sys; print(" ".join(f"{float(x):g}" for x in sys.argv[1:]))' ${SCALES})
+# Normalise scale strings through Python's %g, which is what names the output dirs
+# ({mask_mode}_s{scale:g}). Without this, "0.0 2.50" makes the shell look for _s0.0/_s2.50
+# while the editor wrote _s0/_s2.5, and `realpath` does not fail on a missing leaf — so the
+# mismatch surfaces much later as a crash inside the scorer.
+norm_scales() { python -c 'import sys; print(" ".join(f"{float(x):g}" for x in sys.argv[1:]))' $1; }
+scales_for()  { norm_scales "${SCALES_BY_MODE[$1]:-${SCALES}}"; }
 
 # TAG carries the run AND the read-out settings, so a new configuration can never overwrite a
 # recorded sweep — the per-scale dirs are named {mask_mode}_s{scale} and would collide
@@ -174,7 +211,9 @@ PY
 mkdir -p "$(dirname "${METRICS}")" "${OUT_ROOT}"
 
 echo "  mask modes    ${MASK_MODES}"
-echo "  scales        ${SCALES}"
+for MODE in ${MASK_MODES}; do
+  printf '  scales        %-9s %s\n' "${MODE}" "$(scales_for "${MODE}")"
+done
 echo "  psi_readout   ${PSI_READOUT}    m1_columns ${M1_COLUMNS}    m1_select ${M1_SELECT}"
 if [[ "${M1_SELECT}" == "rank" ]]; then
   echo "  rank          ratio ${M1_RANK_RATIO}  max ${M1_RANK_MAX}   (lambda_attn unused)"
@@ -202,13 +241,14 @@ fi
 # ----------------------------------------------------------------------
 SMPL_DIRS=()
 for MODE in ${MASK_MODES}; do
-  log "Editing: mask_mode=${MODE}"
+  MODE_SCALES="$(scales_for "${MODE}")"
+  log "Editing: mask_mode=${MODE}  scales=${MODE_SCALES}"
   python src/eval/edit_motionfix_testset.py \
     --checkpoint       "${CHECKPOINT}" \
     --smplh_data_root  "${DATA_ROOT}" \
     --out_root         "${OUT_ROOT}" \
     --mask_mode        "${MODE}" \
-    --scales           ${SCALES} \
+    --scales           ${MODE_SCALES} \
     --psi_readout      "${PSI_READOUT}" \
     --m1_columns       "${M1_COLUMNS}" \
     --m1_select        "${M1_SELECT}" \
@@ -222,7 +262,7 @@ for MODE in ${MASK_MODES}; do
     --limit_seed       "${LIMIT_SEED}" \
     --limit            "${LIMIT}" \
     ${EXTRA}
-  for S in ${SCALES}; do
+  for S in ${MODE_SCALES}; do
     SMPL_DIRS+=(--smpl_dir "$(realpath "${OUT_ROOT}/${MODE}_s${S}")")
   done
 done
