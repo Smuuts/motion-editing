@@ -159,6 +159,15 @@ def build_parser():
     p.add_argument("--diff_max", type=int, default=2,
                    help="Diff labels: hard cap on |S|. 2, because top-2 was where measured set "
                         "accuracy plateaued (83.7 %%) while the shuffled control kept rising.")
+    p.add_argument("--diff_temporal", type=float, default=0.5,
+                   help="Diff labels: make the L_token target SPATIOTEMPORAL by keeping only the "
+                        "busiest this-fraction of frames inside the selected groups. 1.0 disables "
+                        "it and supervises the whole group row (the group-set behaviour, and "
+                        "bit-identical to it). ⚠ Measured: the temporal axis of the velocity "
+                        "difference carries a real-vs-shuffled gap of only +0.012, against "
+                        "+0.19..+0.25 on the group axis — so this mostly sharpens the target "
+                        "around frames where EITHER clip moves fast, not where the edit is. "
+                        "0.5 is deliberately loose for that reason. docs/MaskOptions.md §20.1d.")
     p.add_argument("--diff_tier1", action="store_true",
                    help="Let diff-derived items be tier 1 (adds the left/right mirror margin). OFF "
                         "by default: a wrong side would actively teach the wrong laterality, and "
@@ -351,23 +360,57 @@ class LengthBucketSampler(torch.utils.data.Sampler):
 
 # ── grounding labels ────────────────────────────────────────────────────────────
 
-def velocity_diff_groups(S, T, group_channels, ratio, kmax):
-    """Groups whose VELOCITY differs most between source and target.
+def velocity_diff_map(S, T, group_channels):
+    """(F-1, G) per-(frame, group) velocity difference between source and target.
 
     Velocity, not pose: a constant per-performer rest-pose offset cancels in the derivative,
     and 94.6 % of MotionFix pairs are two different captures. Measured best of six readouts
-    (docs/MaskOptions.md §20.1c): 77-78 % top-1 vs 75.4 % for the raw pose difference.
+    on the GROUP axis (docs/MaskOptions.md §20.1c): 77-78 % top-1 vs 75.4 % for raw pose.
     """
     n = min(len(S), len(T))
     dv = np.abs(np.diff(S[:n], axis=0) - np.diff(T[:n], axis=0))
     if not len(dv):
-        return []
-    mass = np.array([dv[:, ch].mean() for ch in group_channels])
+        return None
+    return np.stack([dv[:, ch].mean(1) for ch in group_channels], 1)
+
+
+def diff_groups(vmap, ratio, kmax):
+    """Group set: everything within `ratio` of the top group's mass, capped at `kmax`."""
+    mass = vmap.mean(0)
     if mass.max() <= 0:
         return []
     keep = np.where(mass >= ratio * mass.max())[0]
-    keep = keep[np.argsort(-mass[keep])][:kmax]
-    return [int(g) for g in keep]
+    return [int(g) for g in keep[np.argsort(-mass[keep])][:kmax]]
+
+
+def diff_region(vmap, groups, keep_frac):
+    """(F, G) BINARY region for the spatiotemporal L_token target.
+
+    Inside the selected group rows, keep the busiest `keep_frac` of frames; everything else
+    is 0. Binary on purpose — a soft target caps m below 1 and leaves (1 - m)^2 with an
+    irreducible floor, i.e. permanent gradient toward an unreachable optimum.
+
+    ⚠ THE TEMPORAL AXIS IS MEASURED TO CARRY ALMOST NO PAIR-SPECIFIC SIGNAL. Share of mass
+    in the busiest 20 % of frames: real pair 0.358 vs a SHUFFLED pair 0.346 — a gap of
+    +0.012, against +0.19..+0.25 for the group axis. Two corrected read-outs were tried and
+    neither helped (normalised +0.013, excess +0.021). Both real and shuffled sit well above
+    uniform (0.200), so motion differences are genuinely bursty — but a random pairing is
+    equally bursty, which means the burstiness tracks "where either clip moves fast", not
+    "where the edit happened". `keep_frac=1.0` disables the temporal restriction and
+    reproduces the group-set behaviour exactly.
+    """
+    F, G = vmap.shape
+    M = np.zeros((F, G), dtype=np.float32)
+    if not groups:
+        return M
+    if keep_frac >= 1.0:
+        M[:, groups] = 1.0
+        return M
+    activity = vmap[:, groups].sum(1)
+    k = max(1, int(round(keep_frac * F)))
+    frames = np.argsort(-activity)[:k]
+    M[np.ix_(frames, groups)] = 1.0
+    return M
 
 
 def build_label_cache(args, keys, cache_dir, texts, encoder, config, group_mode, group_channels):
@@ -389,14 +432,18 @@ def build_label_cache(args, keys, cache_dir, texts, encoder, config, group_mode,
         elif args.ground_labels in ("parser_first", "diff_only"):
             S = np.load(os.path.join(cache_dir, f"{k}_s.npy"))
             T = np.load(os.path.join(cache_dir, f"{k}_t.npy"))
-            groups = velocity_diff_groups(S, T, group_channels, args.diff_ratio, args.diff_max)
+            vmap = velocity_diff_map(S, T, group_channels)
+            groups = diff_groups(vmap, args.diff_ratio, args.diff_max) if vmap is not None else []
             pos, lab = encoder.token_info(text)
             cols = semantic_token_subset(pos, lab)          # supervise the content words
             if groups and cols:
                 tier1 = (args.diff_tier1 and len(groups) == 1
                          and GROUP_NAMES[groups[0]] in lat_names)
-                items = [{"W": list(cols), "S": list(groups),
-                          "tier": 1 if tier1 else 2, "lat": bool(tier1)}]
+                item = {"W": list(cols), "S": list(groups),
+                        "tier": 1 if tier1 else 2, "lat": bool(tier1)}
+                if args.diff_temporal < 1.0:
+                    item["M"] = diff_region(vmap, groups, args.diff_temporal)
+                items = [item]
                 stats["diff"] += 1
             else:
                 stats["none"] += 1

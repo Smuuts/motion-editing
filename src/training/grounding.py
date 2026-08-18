@@ -355,8 +355,11 @@ def grounding_loss(A, texts, cache, frame_mask, valid_sample,
         return A.sum() * 0.0, {"n_items": 0, "n_tokens": 0}
 
     device, G = A.device, A.shape[2]
-    b_idx, w_idx, s_rows, tier1 = [], [], [], []
+    b_idx, w_idx, s_rows, tier1, st_rows = [], [], [], [], []
+    any_st = False
     for b, item in picks:
+        st = item.get("M")          # optional (F, G) spatiotemporal target; see below
+        any_st = any_st or st is not None
         for w in item["W"]:
             b_idx.append(b)
             w_idx.append(w)
@@ -364,6 +367,7 @@ def grounding_loss(A, texts, cache, frame_mask, valid_sample,
             row[list(item["S"])] = 1.0
             s_rows.append(row)
             tier1.append(bool(item["lat"]))
+            st_rows.append(st)
 
     b_idx = torch.as_tensor(b_idx, device=device)
     w_idx = torch.as_tensor(w_idx, device=device)
@@ -379,7 +383,31 @@ def grounding_loss(A, texts, cache, frame_mask, valid_sample,
     mass_g = a.sum(dim=1) / denom[:, None]                           # (n, G), sums to 1
     m_S = (mass_g * S).sum(-1)                                       # (n,)
 
-    loss_tok = (1.0 - m_S).pow(2)                                    # TokenCompose L_token
+    # L_token's target is normally the group set S, applied at every frame. An item may
+    # instead carry "M", a binary (F, G) REGION — then the token is asked for its mass
+    # inside that region rather than inside those group rows. The group form is exactly
+    # the special case M[f, g] = S[g], so this generalises rather than branches:
+    #
+    #     m = sum_{f,g} (a[f,g] / denom) * M[f,g]        with M = S  =>  m == m_S
+    #
+    # verified bit-identical when no item supplies M, which is why the fast path below is
+    # kept: it avoids building an (n, F, G) tensor for the overwhelmingly common case.
+    # NOTE M must be BINARY. A soft target caps m below 1 and leaves (1 - m)^2 with an
+    # irreducible floor, i.e. permanent gradient toward an unreachable optimum.
+    if any_st:
+        Fdim = a.shape[1]
+        M = S[:, None, :].expand(-1, Fdim, -1).clone()               # (n, F, G) default
+        for i, st in enumerate(st_rows):
+            if st is None:
+                continue
+            t = torch.as_tensor(st, device=device, dtype=A.dtype)
+            f = min(t.shape[0], Fdim)
+            M[i, :f], M[i, f:] = t[:f], 0.0
+        m_tok = ((a / denom[:, None, None]) * M).sum(dim=(1, 2))     # (n,)
+    else:
+        m_tok = m_S
+
+    loss_tok = (1.0 - m_tok).pow(2)                                  # TokenCompose L_token
 
     m_mirror = torch.zeros_like(m_S)
     if lambda_mirror > 0.0:
@@ -434,6 +462,7 @@ def grounding_loss(A, texts, cache, frame_mask, valid_sample,
             "n_items":  len(picks),
             "n_tokens": int(m_S.numel()),
             "m_S":      m_S.mean().item(),
+            "m_tok":    m_tok.mean().item(),
             "m_mirror": m_mirror.mean().item(),
         }
         if n1 > 0:
