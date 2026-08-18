@@ -8,13 +8,15 @@ Metrics (MotionFix benchmark standard, higher is better, %):
 
 The `*_s0` (identity) row is the plumbing calibration: R@1_s2t should be ~100.
 
-**The batches-of-32 columns are the headline, and the gallery-wide ones are not comparable
-unless every config generated all 1013 clips.** MotionFix's `retrieval()` restricts its
-retrieval set to the keyids you hand it, so the gallery-wide R@k of a subsampled run is an
-N-way retrieval that reads systematically higher than the published 1013-way protocol — and
-two configs with different coverage cannot be compared on it at all. Batches-of-32 is 32-way
-whatever N is. This script flags both conditions from the `n_gallery` field
-run_motionfix_metrics.py records.
+**Which column to lead with depends on coverage.** MotionFix's `retrieval()` restricts its
+retrieval set to the keyids you hand it, so the gallery-wide R@k of a SUBSAMPLED run is an
+N-way retrieval that reads systematically higher than the published 1013-way protocol, and two
+configs with different coverage cannot be compared on it at all — there, batches-of-32 (32-way
+whatever N is) is the only comparable column. On a FULL 1013-clip run both are comparable,
+because the published MotionFix table reports both protocols, and the gallery column is then
+the better one to lead with: the 32-way protocol is nearly saturated by copying the source
+unchanged (do-nothing ~73.6 vs a supervised SOTA of 77.3, so ~3.7 pp of range), while the full
+protocol has ~14.5 pp. This script flags the subsampled and mixed-coverage cases from `n`.
 
 Runs in any env (stdlib only).
 
@@ -35,9 +37,14 @@ FULL_TEST_SET = 1013
 
 
 def _scale_key(cfg):
-    """Sort configs by their trailing _s<scale> value (e.g. m2_only_s2.5 -> 2.5)."""
-    m = re.search(r"_s(-?\d+(?:\.\d+)?)$", cfg)
-    return (0, float(m.group(1))) if m else (1, cfg)
+    """Sort key for a config dir name: (mask_mode, scale), e.g. m2_only_s2.5 -> ("m2_only", 2.5).
+
+    Grouped by MODE first, then by scale within it. Sorting on scale alone interleaved the
+    modes, which became unreadable once each mode got its own scale list — the modes need
+    ~24x different scales to reach the same edit magnitude, so their sweeps barely overlap.
+    """
+    m = re.search(r"^(.*)_s(-?\d+(?:\.\d+)?)$", cfg)
+    return (m.group(1), 0, float(m.group(2))) if m else (cfg, 1, 0.0)
 
 
 def _num(v):
@@ -86,8 +93,10 @@ def main():
     mixed = len(galleries) > 1
     on_subset = any(m.get("common_subset") for m in tmr.values())
 
-    # Flag the best instruction-following on the COMPARABLE protocol. Ranking on the
-    # gallery-wide column would let a config win by having generated fewer clips.
+    # Flag the best on the 32-way protocol: it is the one column that is comparable no matter
+    # how many clips a config generated, so the flag never rewards a config for having skipped
+    # clips. On a FULL run the _g column is the more informative one to read (see the header),
+    # but it is not safe to RANK on, because coverage differences would confound it.
     best = max((r for r in rows if r["R@1_b"] is not None),
                key=lambda r: r["R@1_b"], default=None)
 
@@ -106,10 +115,13 @@ def main():
         "source<->generated (**motion preservation**). Higher is better; there is a "
         "preservation/edit trade-off across scales. The `_s0` row is the identity "
         "calibration (R@1_s2t should be ~100).\n",
-        "**`_b` = batches-of-32 — the headline.** 32-way retrieval whatever the run size, so "
-        "comparable across configs and against published MotionFix numbers. "
-        "**`_g` = whole gallery** — an `n`-way retrieval, where `n` is that config's own clip "
-        "count.\n",
+        "**`_b` = batches-of-32**, 32-way retrieval whatever the run size. **`_g` = whole "
+        "gallery**, an `n`-way retrieval where `n` is that config's own clip count. The published "
+        "MotionFix table reports BOTH protocols, so at the full 1013 clips both columns are "
+        "comparable — and `_g` is the more informative one, because the 32-way protocol is nearly "
+        "saturated by copying the source (do-nothing scores ~73.6 against a supervised SOTA of "
+        "77.3, vs ~17.6 against 32.0 on the full set). Lead with `_g` on a full run; `_b` is the "
+        "only comparable column on a subsampled one.\n",
     ]
     if subsampled:
         lines.append(
