@@ -11,6 +11,9 @@ import os
 import sys
 
 import torch
+from utils.logger import get_logger
+
+log = get_logger(__name__)
 
 # --amp_dtype name -> torch dtype. fp32 disables autocast's reduced precision entirely
 # (the GradScaler is disabled with it, since there is nothing to scale).
@@ -25,7 +28,7 @@ def resolve_amp_dtype(name: str) -> torch.dtype:
     exponent range (max ~3.4e38) where fp16 saturates at 65504 — so an activation that
     merely grows large produces a finite number instead of an `inf` that turns the loss
     non-finite and the step into a no-op. This project has lost two runs to exactly that
-    (see docs/FINDINGS.md "fp16 activation overflow"), so "auto" deliberately does not
+    (fp16 activation overflow), so "auto" deliberately does not
     mean "whatever the previous default was".
 
     Resumed runs keep whatever they trained with (config.py's compat default is fp16),
@@ -51,11 +54,10 @@ def _apply_x0_defaults(config, cli_keys):
 
     Min-SNR weights ‖x̂0 − x0‖² by min(SNR_t, γ), which at high t IS the ε-objective's
     weighting — so applying it under an x0 head reproduces the ε baseline almost
-    exactly (3.0% of training weight on t ≥ 600) and cancels the entire point of
-    Option 5, which is that the model must reconstruct the clip at EVERY noise level,
+    exactly (3.0% of training weight on t >= 600) and cancels the entire point of the
+    x0 head, which is that the model must reconstruct the clip at EVERY noise level —
     the regime where the caption is the only information available. Plain unweighted x0
-    loss puts 40% of the weight on t ≥ 600, and is what MDM and MotionCLR do.
-    See docs/AttentionGrounding_Options.md §5.4 (corrected 2026-07-30).
+    loss puts 40% of the weight on t >= 600, and is what MDM and MotionCLR do.
     """
     if config["predict_type"] == "x0" and "snr_gamma" not in cli_keys:
         config["snr_gamma"] = 0.0
@@ -70,7 +72,7 @@ def _merge_resumed(config, cli_keys, output_dir):
     """
     saved_path = os.path.join(output_dir, "config.json")
     if not os.path.exists(saved_path):
-        print(f"Resume: no saved config at {saved_path}, using CLI args only.")
+        log.info(f"Resume: no saved config at {saved_path}, using CLI args only.")
         return
 
     with open(saved_path) as f:
@@ -84,9 +86,9 @@ def _merge_resumed(config, cli_keys, output_dir):
                         ("predict_type", "eps"), ("amp_dtype", "fp16")):
         if key not in saved and key not in cli_keys:
             config[key] = legacy
-            print(f"Resume: saved config predates {key} — keeping {legacy!r} to match "
+            log.info(f"Resume: saved config predates {key} — keeping {legacy!r} to match "
                   f"how this run trained (pass --{key} to override).")
-    print(f"Resume: loaded config from {saved_path} "
+    log.info(f"Resume: loaded config from {saved_path} "
           f"(overridden by CLI args: {sorted(cli_keys - {'resume', 'output_dir'})})")
 
 
@@ -116,6 +118,6 @@ def save_config(config, output_dir):
 
 def print_config(config):
     arch = "GroupMotionUNet" if config.get("arch") == "unet" else "MotionDiT"
-    print(f"Training {arch} with config:")
+    log.info(f"Training {arch} with config:")
     for k, v in config.items():
-        print(f"  {k}: {v}")
+        log.info(f"  {k}: {v}")

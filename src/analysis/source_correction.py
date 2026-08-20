@@ -15,8 +15,8 @@ because they fail differently:
 Both nest the baseline at λ=0, which is what makes a λ-sweep readable as "does removing
 the source help at all?" rather than as a comparison between two different pipelines.
 
-TWO THINGS THAT MAKE OR BREAK A RESULT HERE, both learned the hard way (docs/FINDINGS.md
-"Subtracting the source-motion map from M1/M2 does not help", 2026-08-01):
+TWO THINGS THAT MAKE OR BREAK A RESULT HERE, both learned the hard way (2026-08-01,
+when subtracting the source-motion map from M1/M2 was measured not to help):
 
 1. **A shuffled control is mandatory.** `S` is instruction-independent, so subtracting
    *anything* correlated with the masks' common component moves the instruction-

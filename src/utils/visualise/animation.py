@@ -11,6 +11,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from mpl_toolkits.mplot3d import Axes3D    # noqa: F401 (registers the 3d projection)
+from utils.logger import get_logger
+
+log = get_logger(__name__)
 
 
 # HumanML3D / SMPL 22-joint ordering — each list is one chain drawn as one colour.
@@ -120,7 +123,7 @@ def _animate_one(joints, title, fps, figsize, save_path):
 
     _run(fig, update, init, joints.shape[0], fps, save_path)
     if save_path is not None:
-        print(f"Saved animation: {save_path}")
+        log.info(f"Saved animation: {save_path}")
 
 
 def _ellipsis(s, n):
@@ -229,4 +232,4 @@ def save_comparison_animation(
         return [l for _, l in lines_gen] + [l for _, l in lines_gt] + [mpjpe_txt] + extra
 
     _run(fig, update, init, max(T_gen, T_gt), fps, save_path)
-    print(f"Saved comparison: {save_path}")
+    log.info(f"Saved comparison: {save_path}")

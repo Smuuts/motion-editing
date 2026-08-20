@@ -20,7 +20,7 @@ from model.layers import SelfAttention
 # ── capture ──────────────────────────────────────────────────────────────────────
 # The model API exposes get_attn_maps() for CROSS-attention only; self-attention
 # capture is an inference-only diagnostic flag on the SelfAttention modules themselves
-# (see model/layers.py and docs/ARCHITECTURE.md). Walking model.modules() yields them
+# (see model/layers.py). Walking model.modules() yields them
 # in registration order, which is block order for both GroupDiT and GroupMotionUNet.
 
 def self_attn_modules(model) -> list[SelfAttention]:

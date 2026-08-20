@@ -1,8 +1,8 @@
 """
 Argument definitions and parsing shared by the entry-point scripts in src/.
 
-The `add_*_args` helpers define the flag groups that several scripts have in common,
-so a default can't drift between two scripts that claim to do the same thing. The rest
+The `add_*_args` helpers define the flag groups that several scripts have in common, so
+a default cannot drift between two scripts that claim to do the same thing. The rest
 parses the shared CLI shapes (a device string, a "one value or one per edit" list, a
 body-part group spec) identically everywhere.
 """
@@ -10,6 +10,13 @@ body-part group spec) identically everywhere.
 import torch
 
 from model.body_groups import group_names, parse_axis_spec
+# Re-exported: the logging flags live in utils.logger so the stdlib-only scripts can
+# take them without importing torch, but every entry point reaches them through here.
+from utils.logger import add_logging_args, configure_logging
+
+__all__ = ["add_data_args", "add_logging_args", "add_mask_args", "add_model_args",
+           "configure_logging", "parse_group_mask", "parse_group_names",
+           "per_edit_lookup", "resolve_device"]
 
 
 # ── shared flag groups ───────────────────────────────────────────────────────────
@@ -60,9 +67,8 @@ def add_mask_args(parser, *, mask_timesteps=40, thresholds=True, windows=True,
         parser.add_argument("--edit_space", default="auto", choices=["auto", "eps", "x0"],
                             help="Space the editor does ψ/M2 and SEGA guidance in. "
                                  "'auto' (default) = the checkpoint's own predict_type, "
-                                 "so an x0 checkpoint edits x0-natively "
-                                 "(docs/AttentionGrounding_Options.md §5.3). Force a "
-                                 "value to A/B the space against the checkpoint.")
+                                 "so an x0 checkpoint edits x0-natively. Force a value "
+                                 "to A/B the space against the checkpoint.")
     parser.add_argument("--m1_layers", default="auto",
                         help="Blocks the M1 read-out averages over. 'auto' (default) = "
                              "the checkpoint's own --attn_ground_layers when it was "
@@ -79,8 +85,7 @@ def add_mask_args(parser, *, mask_timesteps=40, thresholds=True, windows=True,
                              "words and keeps the verb. 'span' keeps only the body-part "
                              "words the grounding loss supervised (best measured, but it "
                              "uses the caption parser at inference). 'auto' (default) = "
-                             "'semantic' on a grounded checkpoint, 'content' otherwise. "
-                             "See docs/FINDINGS.md 'COLUMN dilution'.")
+                             "'semantic' on a grounded checkpoint, 'content' otherwise.")
     parser.add_argument("--psi_readout", default="energy", choices=["abs", "energy"],
                         help="What the psi/M2 contrast measures: 'energy' (default since "
                              "2026-08-15) = the SIGNED change in per-group motion energy, "
@@ -91,7 +96,7 @@ def add_mask_args(parser, *, mask_timesteps=40, thresholds=True, windows=True,
                              "matched M2-alone comparison on 9 clips x 3 checkpoints, "
                              "identical 327 cells: alignment 0.24 -> 0.33, recall 0.50 -> "
                              "0.69, instruction-invariance 0.69 -> 0.13, source coupling "
-                             "+0.42 -> -0.21. See docs/FINDINGS.md 'psi is a mixture'.")
+                             "+0.42 -> -0.21.")
     parser.add_argument("--mask_timesteps", type=int, default=mask_timesteps,
                         help="Sweep this many evenly-spaced timesteps for mask "
                              "collection" + (" (default: all 1000; 40 is much faster "
@@ -117,8 +122,7 @@ def add_mask_args(parser, *, mask_timesteps=40, thresholds=True, windows=True,
                              "--m1_rank_ratio of the top group's mass (capped at "
                              "--m1_rank_max), then threshold psi INSIDE those rows only. "
                              "Rank adapts to how many groups the instruction actually "
-                             "names instead of being told. docs/FINDINGS.md 'Two mask "
-                             "defects with different causes'.")
+                             "names instead of being told.")
     parser.add_argument("--m1_rank_ratio", type=float, default=0.5,
                         help="--m1_select rank: keep a group if its total M1 mass is at "
                              "least this fraction of the top group's. ->1 = top-1 only.")
@@ -145,8 +149,7 @@ def add_mask_args(parser, *, mask_timesteps=40, thresholds=True, windows=True,
                             default=None,
                             help="Restrict M1's sweep to [LO, HI], resampled to "
                                  "--mask_timesteps steps INSIDE the window. M1 and M2 "
-                                 "do not carry their signal at the same noise levels — "
-                                 "see docs/FINDINGS.md.")
+                                 "do not carry their signal at the same noise levels.")
         parser.add_argument("--m2_window", type=int, nargs=2, metavar=("LO", "HI"),
                             default=None, help="Same, for M2/ψ.")
         parser.add_argument("--per_step_norm", action="store_true",

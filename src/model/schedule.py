@@ -1,5 +1,4 @@
 import torch
-import numpy as np
 
 
 def cosine_beta_schedule(timesteps: int, s: float = 0.008):
@@ -23,8 +22,8 @@ class NoiseSchedule:
     """
 
     # Which quantity the network's output head represents. "eps" is the original
-    # (and default) parameterisation; "x0" is Option 5 of
-    # docs/AttentionGrounding_Options.md — see `to_eps` and `min_snr_weight`.
+    # (and default) parameterisation; "x0" makes the head emit the clean signal
+    # directly. See `to_eps` and `min_snr_weight`.
     PREDICT_TYPES = ("eps", "x0")
 
     @classmethod
@@ -115,10 +114,10 @@ class NoiseSchedule:
     def predict_eps_from_x0(self, x_t, t, x0):
         """Inverse of `predict_x0_from_eps`: ε = (x_t − √ᾱ_t·x0) / √(1−ᾱ_t).
 
-        The conversion shim for an x0-prediction network (Option 5). Exact, and affine
+        The conversion shim for an x0-prediction network. Exact, and affine
         in the network output with (x_t, t) held fixed — which is why SEGA guidance and
         the scale-0 exact-reconstruction property survive the switch unchanged
-        (docs/AttentionGrounding_Options.md §5.3). Ill-conditioned only as t→0, where
+        Ill-conditioned only as t→0, where
         √(1−ᾱ_t)→0; clamped, and inversion/guidance barely matter there.
         """
         sqrt_acp   = self.sqrt_alphas_cumprod[t][:, None, None]
@@ -128,7 +127,7 @@ class NoiseSchedule:
     def to_eps(self, model_out, x_t, t):
         """Interpret a raw network output as ε, whatever the network predicts.
 
-        THE inference-side boundary for Option 5: every consumer that treats the model
+        THE inference-side boundary for an x0 head: every consumer that treats the model
         output as a noise estimate (sampler, verify_backbone) routes through here, so an
         x0-trained checkpoint runs the entire existing pipeline unchanged. Identity in
         "eps" mode — the default path is byte-for-byte what it was.
@@ -137,7 +136,7 @@ class NoiseSchedule:
         need for `guidance_alpha_floor`). The editing stack no longer routes through it
         unconditionally: it picks its space via `resolve_space`/`to_space`, so an
         x0-trained checkpoint takes the x0-native path of
-        docs/AttentionGrounding_Options.md §5.3 instead.
+        `to_space` instead.
         """
         if self.predict_type == "eps":
             return model_out
@@ -159,7 +158,7 @@ class NoiseSchedule:
 
         "auto" (or None) resolves to the checkpoint's own `predict_type`, which is the
         intended way to select it: an x0-trained checkpoint then runs the x0-native
-        LEDITS++ path (docs/AttentionGrounding_Options.md §5.3) and an ε-trained one the
+        LEDITS++ path and an ε-trained one the
         historical ε-space path, with nothing to pass. An explicit "eps"/"x0" forces the
         other space — that is the control needed to attribute a measured change to the
         space rather than to the checkpoint, and the escape hatch for running the
@@ -195,7 +194,7 @@ class NoiseSchedule:
 
         Min-SNR clamps the *effective* weight on the clean-signal error ‖x̂0 − x0‖² to
         min(SNR_t, γ). What that costs depends on the parameterisation, because the two
-        objectives are reweightings of one another (docs/AttentionGrounding_Options.md
+        objectives are reweightings of one another
         §5.2):
 
             ‖ε̂ − ε‖² = SNR_t · ‖x̂0 − x0‖²
@@ -205,7 +204,7 @@ class NoiseSchedule:
 
         The two differ by exactly SNR_t. **Leaving the eps form in place under an x0
         head double-applies the correction and re-suppresses high noise — i.e. undoes
-        the entire point of Option 5**, which is why this is parameterisation-aware
+        the entire point of the x0 head**, which is why this is parameterisation-aware
         rather than a caller's responsibility.
 
         In eps mode this only suppresses low-noise/low-t samples (SNR ≫ γ there) and
@@ -231,7 +230,7 @@ class NoiseSchedule:
         **Only meaningful for an eps-head.** With predict_type="x0" the network outputs
         x̂0 directly, there is no division by √ᾱ_t and so no error amplification to damp
         — applying this weight would just fade out the geometric losses at high noise
-        for no reason (docs/AttentionGrounding_Options.md §5.4). train.py resolves this
+        for no reason. train.py resolves this
         automatically; `--geo_conf_weight` overrides it.
         """
         return self.alphas_cumprod[t]  # (B,)
@@ -264,7 +263,7 @@ class NoiseSchedule:
         `noise` overrides the posterior noise draw z_t (broadcast against x_t). Passing
         ONE z shared by every batch element denoises a batch of prompts along a single
         noise path, so the samples differ only through their text — the paired-sample
-        trick Option 6 rests on (docs/AttentionGrounding_Options.md; the caller is
+        trick the generation-space mask rests on (the caller is
         DDPMSampler.sample_paired).
         """
         x0_pred = self.predict_x0_from_eps(x_t, t, eps_pred).clamp(-5, 5)

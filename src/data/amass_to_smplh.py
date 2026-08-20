@@ -19,15 +19,23 @@ dataset dir is self-contained once you copy `texts/` and the `train/val/test.txt
 """
 
 import os
-import csv
+import sys
+
+# These scripts live one level below src/, so src/ is not on the path when they are run
+# directly. Put it there before any project import.
+_SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+
 import argparse
+import csv
 
 import numpy as np
-from tqdm import tqdm
 
-import sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # -> src/
-from data.smplh_features import smplh_to_features, mirror_smplh
+from data.smplh_features import mirror_smplh, smplh_to_features
+from utils.logger import add_logging_args, configure_logging, get_logger
+
+log = get_logger(__name__)
 
 EX_FPS = 20
 
@@ -75,7 +83,8 @@ def main():
                     help="Also save raw {rots,trans} alongside the 135-d feature.")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--overwrite", action="store_true")
-    args = ap.parse_args()
+    add_logging_args(ap)
+    args = configure_logging(ap.parse_args())
 
     # Mirror the HumanML3D layout: features live in new_joint_vecs/ so the smplh dataset dir
     # has the same structure as the processed HumanML3D dir (texts/, Mean/Std, splits alongside).
@@ -91,7 +100,7 @@ def main():
 
     cache = {}
     n_ok = n_skip_ha = n_skip_bad = 0
-    for r in tqdm(rows, desc="clips"):
+    for r in log.progress(rows, desc="clips", leave=True):
         base = r["new_name"][:-4] if r["new_name"].endswith(".npy") else r["new_name"]
         if keep is not None and base not in keep:
             continue
@@ -128,9 +137,9 @@ def main():
                 np.save(os.path.join(args.out_dir, "raw", f"M{base}.npy"), {"rots": mr, "trans": mt})
         n_ok += 1
 
-    print(f"Done: {n_ok} clips ({'no mirror' if args.no_mirror else '×2 with mirror'}) -> {args.out_dir}")
-    print(f"Skipped: {n_skip_ha} HumanAct12 (no SMPL), {n_skip_bad} unreadable/too-short.")
-    print("Next: compute stats →  python src/data/smplh_stats.py "
+    log.info(f"Done: {n_ok} clips ({'no mirror' if args.no_mirror else '×2 with mirror'}) -> {args.out_dir}")
+    log.info(f"Skipped: {n_skip_ha} HumanAct12 (no SMPL), {n_skip_bad} unreadable/too-short.")
+    log.info("Next: compute stats →  python src/data/smplh_stats.py "
           f"--feat_dir {args.out_dir} --split data/HumanML3D/train.txt")
 
 

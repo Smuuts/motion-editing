@@ -1,12 +1,10 @@
 """
 Frozen text↔motion scorers behind one interface.
 
-Option 10 ([AttentionGrounding_Options.md](../../docs/AttentionGrounding_Options.md))
-proposes taking the edit's localisation from an *external* frozen model instead of from
-this project's own denoiser, whose attention is measured not to be body-part grounded.
-Every experiment in that family reduces to one primitive: `s(motion, text)`. This module
-supplies it, so the probes never touch an encoder directly and a second scorer can be
-added without editing them.
+Taking an edit's localisation from an *external* frozen model, instead of from this
+project's own denoiser whose attention is measured not to be body-part grounded, reduces
+to one primitive: `s(motion, text)`. This module supplies it, so the probes never touch
+an encoder directly and a second scorer can be added without editing them.
 
 Only `t2m` exists today (the HumanML3D evaluator already in the repo). `tmr` — MotionFix's
 retrieval model, the scorer the benchmark reports — is the intended next one; see

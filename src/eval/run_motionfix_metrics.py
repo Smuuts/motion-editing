@@ -37,8 +37,19 @@ to the keyids all of them share before scoring.
 
 import os
 import sys
-import json
+
+# These scripts live one level below src/, so src/ is not on the path when they are run
+# directly. Put it there before any project import.
+_SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+
 import argparse
+import json
+
+from utils.logger import add_logging_args, configure_logging, get_logger
+
+log = get_logger(__name__)
 
 # The published protocol's size, and the evaluator's batch size. Duplicated in
 # aggregate_summary.py (which renders the warning) because that module runs in the PROJECT
@@ -75,7 +86,8 @@ def main():
                          "configs face an identically-sized gallery. Required for a fair "
                          "comparison whenever the configs skip different clips.")
     ap.add_argument("--out", default=None, help="Write the collected metrics as JSON here.")
-    args = ap.parse_args()
+    add_logging_args(ap)
+    args = configure_logging(ap.parse_args())
 
     here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root
     mfix = os.path.abspath(args.motionfix_dir or os.path.join(here, "data", "motionfix"))
@@ -90,13 +102,12 @@ def main():
     sizes = {len(v) for v in keysets.values()}
     common = set.intersection(*keysets.values())
     if len(sizes) > 1:
-        print("WARNING: the --smpl_dir sets have DIFFERENT clip counts "
-              f"({sorted(sizes)}). Retrieval gets easier as the gallery shrinks, so their "
-              f"'full' R@k are not comparable.\n"
-              f"         Intersection = {len(common)} clips. "
-              + ("Scoring on it (--common_subset given)."
-                 if args.common_subset else "Pass --common_subset to score on it."),
-              flush=True)
+        action = ("Scoring on it (--common_subset given)." if args.common_subset
+                  else "Pass --common_subset to score on it.")
+        log.warning("the --smpl_dir sets have DIFFERENT clip counts (%s). Retrieval gets "
+                    "easier as the gallery shrinks, so their 'full' R@k are not "
+                    "comparable.\n         Intersection = %d clips. %s",
+                    sorted(sizes), len(common), action)
 
     # Guard before the heavy import below: retrieval() batches with `range(len(keyids) // 32)`,
     # so under 32 it builds ZERO batches and dies on `result[0]` with an opaque IndexError from
@@ -137,12 +148,12 @@ def main():
         gen = {k: torch.from_numpy(np.load(os.path.join(d, f"{k}.npy"))).float()
                for k in sorted(keep)}
         n = len(gen)
-        print(f"\n===== {cfg}  ({n} generations -> {n}-way gallery) =====", flush=True)
+        log.section(f"{cfg}  ({n} generations -> {n}-way gallery)")
         metrs_batches, metrs_full = retrieval(gen)
-        print("  batches-of-32 (32-way, COMPARABLE):", metrs_batches)
-        print(f"  whole gallery ({n}-way):", metrs_full)
+        log.info("  batches-of-32 (32-way, COMPARABLE): %s", metrs_batches)
+        log.info("  whole gallery (%d-way): %s", n, metrs_full)
         if n < FULL_TEST_SET:
-            print(f"  NOTE: {n} < {FULL_TEST_SET} clips, so the gallery row is an {n}-way "
+            log.info(f"  NOTE: {n} < {FULL_TEST_SET} clips, so the gallery row is an {n}-way "
                   f"retrieval and reads HIGHER than the published 1013-way protocol. "
                   f"Quote the batches row.")
         # `n` IS the gallery size — there is no second notion of run size to distinguish it
@@ -159,7 +170,7 @@ def main():
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         with open(out_path, "w") as f:
             json.dump(results, f, indent=2)
-        print(f"\nWrote {out_path}")
+        log.info(f"\nWrote {out_path}")
 
 
 if __name__ == "__main__":

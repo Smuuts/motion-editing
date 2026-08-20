@@ -9,10 +9,21 @@ everything at once. Writes Mean.npy / Std.npy (135,) into the feature dir.
 """
 
 import os
+import sys
+
+# These scripts live one level below src/, so src/ is not on the path when they are run
+# directly. Put it there before any project import.
+_SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+
 import argparse
 
 import numpy as np
-from tqdm import tqdm
+
+from utils.logger import add_logging_args, configure_logging, get_logger
+
+log = get_logger(__name__)
 
 
 def main():
@@ -22,14 +33,15 @@ def main():
                          "Mean.npy/Std.npy are written to its root.")
     ap.add_argument("--split", required=True, help="train.txt — ids to compute stats over.")
     ap.add_argument("--eps", type=float, default=1e-8, help="Std floor (avoid divide-by-zero channels).")
-    args = ap.parse_args()
+    add_logging_args(ap)
+    args = configure_logging(ap.parse_args())
 
     ids = [l.strip() for l in open(args.split) if l.strip()]
     # Vectorised running sum / sum-of-squares over frames (float64), one load per clip.
     n = 0
     s = ssq = None
     missing = 0
-    for cid in tqdm(ids, desc="stats"):
+    for cid in log.progress(ids, desc="stats", leave=True):
         p = os.path.join(args.feat_dir, "new_joint_vecs", f"{cid}.npy")
         if not os.path.exists(p):
             missing += 1
@@ -46,8 +58,8 @@ def main():
 
     np.save(os.path.join(args.feat_dir, "Mean.npy"), mean.astype(np.float32))
     np.save(os.path.join(args.feat_dir, "Std.npy"), std.astype(np.float32))
-    print(f"Frames: {n} from {len(ids) - missing}/{len(ids)} clips ({missing} missing).")
-    print(f"Wrote {args.feat_dir}/Mean.npy and Std.npy  (shape {mean.shape})")
+    log.info(f"Frames: {n} from {len(ids) - missing}/{len(ids)} clips ({missing} missing).")
+    log.info(f"Wrote {args.feat_dir}/Mean.npy and Std.npy  (shape {mean.shape})")
 
 
 if __name__ == "__main__":

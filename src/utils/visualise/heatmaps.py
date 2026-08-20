@@ -9,6 +9,9 @@ project's heatmaps are labelled and annotated.
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
+from utils.logger import get_logger
+
+log = get_logger(__name__)
 
 
 def ellipsis(text: str, width: int) -> str:
@@ -92,4 +95,17 @@ def mean_off_diagonal(M) -> float:
 def save_figure(fig, out_path, dpi=130, tight=True):
     fig.savefig(out_path, dpi=dpi, **({"bbox_inches": "tight"} if tight else {}))
     plt.close(fig)
-    print(f"Wrote {out_path}")
+    log.info(f"Wrote {out_path}")
+
+
+def fg_heatmap(ax, fg, glabels, cmap, vmax, expected_idx):
+    """One (F, G) map drawn as (G, F), with the expected rows outlined in red."""
+    heatmap(ax, fg.T, ylabels=glabels, cmap=cmap, vmin=0.0, vmax=vmax, aspect="auto")
+    highlight_rows(ax, expected_idx, fg.shape[0])
+
+
+def shared_vmax(maps):
+    """99th-percentile ceiling over ALL instruction rows: a shared colour scale is the
+    whole point (identical colours = identical maps), and the percentile keeps one hot
+    cell from flattening everything else."""
+    return float(np.quantile(np.concatenate([m.ravel() for m in maps]), 0.99)) or 1.0

@@ -118,7 +118,7 @@ GROUP_DIMS_SMPL:     list[int]       = [len(ch) for ch in GROUP_CHANNELS_SMPL]
 # An alternative to the 6 coarse body-part groups: one token per SMPL joint (22:
 # root/pelvis + 21 body joints), selected by group_mode="joints" (default "parts").
 # Motivation: finer query resolution gives attention/supervision more to bind to —
-# the "finer group axis" route (Option 4, docs/AttentionGrounding_Options.md). The
+# the "finer group axis" route. The
 # token AXIS is the only thing that changes; the channel partition is a strict
 # refinement of the body-part one (every part is a union of its joint tokens), so the
 # whole editing/masking stack — which is already parametrised on `group_channels`

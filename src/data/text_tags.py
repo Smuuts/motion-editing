@@ -18,6 +18,17 @@ run it before trusting tagged text, since a drift here is invisible downstream.
 """
 
 import os
+import sys
+
+# These scripts live one level below src/, so src/ is not on the path when they are run
+# directly. Put it there before any project import.
+_SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+
+from utils.logger import get_logger
+
+log = get_logger(__name__)
 
 _NLP = None
 
@@ -95,12 +106,11 @@ def verify_against_dataset(data_root: str, n: int = 200, split: str = "val") -> 
 
 
 if __name__ == "__main__":                                      # quick manual check
-    import sys
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # -> src/
-    root = sys.argv[1] if len(sys.argv) > 1 else "data/HumanML3D/HumanML3D"
-    print(" ".join(tag_text("kick with the left leg")))
+    from utils.paths import repo_path
+    root = sys.argv[1] if len(sys.argv) > 1 else repo_path("data/HumanML3D/HumanML3D")
+    log.info(" ".join(tag_text("kick with the left leg")))
     res = verify_against_dataset(root)
-    print(f"on {res['checked']} captions:  exact {res['exact_match_rate']:.3f}   "
+    log.info(f"on {res['checked']} captions:  exact {res['exact_match_rate']:.3f}   "
           f"words {res['word_match_rate']:.3f}   vip {res['vip_match_rate']:.3f}")
     for e in res["examples"]:
-        print(f"  {e['clip']}\n    disk: {e['disk']}\n    ours: {e['ours']}")
+        log.info(f"  {e['clip']}\n    disk: {e['disk']}\n    ours: {e['ours']}")

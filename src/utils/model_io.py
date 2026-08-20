@@ -14,6 +14,9 @@ import torch
 
 from model.dit import build_model
 from model.text_encoder import get_encoder_dims
+from utils.logger import get_logger
+
+log = get_logger(__name__)
 
 
 def load_config(ckpt_dir: str) -> dict:
@@ -35,7 +38,7 @@ def load_model(ckpt_dir: str, device, use_ema: bool = True):
     # ignores the rest) so every model-defining key — including attention-regime
     # flags like ctx_pad_mask/attn_sink — travels with the checkpoint
     # automatically. Rebuilding from a hand-copied subset is how a mask-trained
-    # checkpoint once ran unmasked (FID 0.65 -> 27.0; see docs/FINDINGS.md).
+    # checkpoint once ran unmasked (FID 0.65 -> 27.0).
     # Only derived/inference-specific values are overridden.
     model = build_model({
         **config,
@@ -47,5 +50,5 @@ def load_model(ckpt_dir: str, device, use_ema: bool = True):
     weights = os.path.join(ckpt_dir, "ema.pt" if use_ema else "model.pt")
     model.load_state_dict(torch.load(weights, map_location=device, weights_only=True))
     model.eval()
-    print(f"Loaded: {weights}")
+    log.info(f"Loaded: {weights}")
     return model, config

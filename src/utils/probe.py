@@ -42,7 +42,7 @@ def source_activity(x0, group_channels, is_group=True) -> np.ndarray:
 
     Must stay the same functional form as `editing.masking._frame_energy` — that parity is
     what makes "did the edit change this cell" and "was the source already moving here"
-    like-for-like (docs/ARCHITECTURE.md). Frame 0 repeats frame 1 rather than being zeroed
+    like-for-like. Frame 0 repeats frame 1 rather than being zeroed
     (2026-08-16, changed in both functions together); see `_frame_energy` for why the zero
     was a structural hole rather than a neutral convention.
     """
@@ -94,7 +94,7 @@ def resolve_sweeps(mask_timesteps, T, m1_window=None, m2_window=None):
     `None` on a per-mask window keeps that mask on the shared sweep, so the default run
     is a single even sweep over the whole trajectory. A window is resampled to the same
     number of steps *inside* the window (denser sampling, not fewer points) — M1 and M2
-    carry their signal at different noise levels, see docs/FINDINGS.md.
+    carry their signal at different noise levels.
     """
     shared = masking.build_sweep(mask_timesteps, T) if mask_timesteps else None
     n = mask_timesteps or T - 1

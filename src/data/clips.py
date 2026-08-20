@@ -2,8 +2,8 @@
 Reading individual clips out of a processed dataset root, for the scripts that work
 on single clips rather than a DataLoader (edit/probe/generate/sample).
 
-Every representation mirrors the same layout (see docs/ARCHITECTURE.md "Repo layout
-notes"), so all of this is feature-dim agnostic:
+Every representation mirrors the same on-disk layout, so all of this is feature-dim
+agnostic:
     <data_root>/new_joint_vecs/<id>.npy   (T, D) raw features
     <data_root>/texts/<id>.txt            HumanML3D annotations, "caption#word/POS…"
     <data_root>/<split>.txt               clip ids

@@ -13,11 +13,13 @@ import os
 
 import numpy as np
 from scipy.linalg import sqrtm
-from tqdm import tqdm
 
 from data.clips import read_tagged_caption
 from data.hml3d_features import extract_hml3d_features, get_tgt_offsets
 from utils.decode import recover_from_ric
+from utils.logger import get_logger
+
+log = get_logger(__name__)
 
 
 def load_generated(generated_dir: str, data_root: str):
@@ -34,11 +36,11 @@ def load_generated(generated_dir: str, data_root: str):
     for cid in manifest["clip_ids"]:
         npz_path = os.path.join(generated_dir, f"{cid}.npz")
         if not os.path.exists(npz_path):
-            print(f"  [WARN] missing {npz_path}, skipping")
+            log.warning(f"missing {npz_path}, skipping")
             continue
         text, tokens = read_tagged_caption(data_root, cid)
         if not text:
-            print(f"  [WARN] missing text for {cid}, skipping")
+            log.warning(f"missing text for {cid}, skipping")
             continue
         data = np.load(npz_path)
         clips.append({
@@ -104,7 +106,7 @@ def compute_r_precision(motion_embs, text_embs, pool_size=32, top_k=(1, 2, 3), s
     counts = {k: 0 for k in top_k}
     rng = np.random.default_rng(seed)
 
-    for i in tqdm(range(N), desc="R-Precision", leave=False):
+    for i in log.progress(range(N), desc="R-Precision"):
         neg_pool = [j for j in range(N) if j != i]
         neg_idx = rng.choice(neg_pool, size=min(pool_size - 1, len(neg_pool)),
                              replace=False)

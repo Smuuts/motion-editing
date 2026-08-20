@@ -43,35 +43,41 @@ Example (smoke test on 16 clips):
 
 import os
 import sys
-import json
-import random
+
+# These scripts live one level below src/, so src/ is not on the path when they are run
+# directly. Put it there before any project import.
+_SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+
 import argparse
+import json
 
 import numpy as np
 import torch
-from tqdm import tqdm
 
-src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # repo/src
-if src_dir not in sys.path:
-    sys.path.insert(0, src_dir)
-
-from model.text_encoder import build_text_encoder
-from model.schedule import NoiseSchedule
+from data.body_part_labels import route_groups
+from data.smplh_features import (features_to_smpl, resample_motion, smpl_to_gen_layout,
+                                 smplh_to_features)
 from editing import MotionEditor, derive_seed
 from editing.masking import mask_mode_components
-from data.body_part_labels import route_groups
 from model.body_groups import resolve_group_context
+from model.schedule import NoiseSchedule
+from model.text_encoder import build_text_encoder
 from training.grounding import resolve_readout_columns, resolve_readout_layers
-from utils.cli import add_mask_args, add_model_args, parse_group_mask, resolve_device
-from utils.probe import resolve_sweeps
-from data.smplh_features import (
-    smplh_to_features, features_to_smpl, smpl_to_gen_layout, resample_motion,
-)
+from utils.cli import (add_logging_args, add_mask_args, add_model_args,
+                       configure_logging, parse_group_mask, resolve_device)
+from utils.logger import get_logger
+from eval.provenance import check_resumable, mask_fingerprint, select_keyids
 from utils.model_io import load_model
+from utils.paths import REPO_ROOT
+from utils.probe import resolve_sweeps
+
+log = get_logger(__name__)
 
 
 def parse_args():
-    repo = os.path.dirname(src_dir)
+    repo = REPO_ROOT
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     # --checkpoint / --no_ema / --device, and the whole Stage-2 mask block (thresholds,
@@ -119,99 +125,14 @@ def parse_args():
                         "this invocation's. Produces a score sheet mixing two "
                         "configurations — only for deliberately continuing an interrupted "
                         "run whose flags you have since edited cosmetically.")
-    return p.parse_args()
-
-
-# Settings that change the CONTENT of a generated .npy, hence what may not silently differ
-# between the files already in an output dir and the ones about to join them. Conditioned on
-# mask_mode so that changing an inert knob (lambda_attn under m2_only, say) is not a false
-# mismatch. --scales and --limit are deliberately absent: adding a scale or more clips is a
-# legitimate resume, since each lands in its own file.
-def mask_fingerprint(args, editor, config) -> dict:
-    fp = {
-        "checkpoint":   os.path.abspath(args.checkpoint),
-        "weights":      "model" if args.no_ema else "ema",
-        "mask_mode":    args.mask_mode,
-        "edit_space":   editor.edit_space,
-        "alpha_floor":  editor.resolve_alpha_floor(args.guidance_alpha_floor),
-        "seed":         args.seed,
-        "mask_timesteps": args.mask_timesteps,
-        "src_fps": args.src_fps, "edit_fps": args.edit_fps,
-        "max_frames": args.max_frames, "min_frames": args.min_frames,
-    }
-    # Which components this mode actually uses comes from masking's own table, so adding a
-    # mask mode cannot leave the fingerprint silently omitting that mode's live flags —
-    # which would let the guard pass a genuinely mixed run.
-    semantic_source, uses_m2 = mask_mode_components(args.mask_mode)
-    uses_m1 = semantic_source == "attn"
-    if uses_m1:
-        fp.update({
-            "m1_columns": args.m1_columns,
-            "m1_layers":  resolve_readout_layers(config, args.m1_layers),
-            "m1_select":  args.m1_select,
-            "m1_window":  args.m1_window,
-        })
-        if args.m1_select == "rank":
-            fp.update({"m1_rank_ratio": args.m1_rank_ratio,
-                       "m1_rank_max": args.m1_rank_max})
-        else:
-            fp["lambda_attn"] = args.lambda_attn
-    if uses_m2:
-        fp.update({"psi_readout": editor.psi_readout,
-                   "lambda_noise": args.lambda_noise,
-                   "m2_window": args.m2_window,
-                   "per_step_norm": args.per_step_norm})
-    return fp
-
-
-def check_resumable(args, out_dirs, fingerprint, manifest_path):
-    """Refuse to add files to an output dir whose existing generations came from different
-    settings. The resume rule is "skip a clip whose .npy exists", which is only sound while
-    those files mean the same thing — otherwise one score sheet silently mixes two
-    configurations and the manifest, rewritten at the end, describes only the newer one."""
-    if args.overwrite:                    # every file is recomputed; nothing stale survives
-        return
-    present = [d for d in out_dirs.values()
-               if os.path.isdir(d) and any(f.endswith(".npy") for f in os.listdir(d))]
-    if not present:
-        return
-    old = {}
-    if os.path.exists(manifest_path):
-        with open(manifest_path) as f:
-            old = json.load(f).get("fingerprint", {})
-    if old == fingerprint:
-        return
-    diff = [f"    {k}: on disk {old.get(k, '<absent>')!r} -> now {fingerprint[k]!r}"
-            for k in sorted(fingerprint) if old.get(k) != fingerprint[k]]
-    msg = (f"\nRefusing to resume: {len(present)} output dir(s) under {args.out_root} already "
-           f"hold generations made with different settings.\n"
-           + ("\n".join(diff) if diff else "    (no fingerprint recorded — a pre-2026-08-16 run)")
-           + "\n\nThose .npy files would be kept as-is and mixed with new ones in the same "
-             "score sheet.\nPick one:\n"
-             "  --out_root <a fresh dir>   keep both runs (recommended)\n"
-             "  --overwrite                 recompute everything with the new settings\n"
-             "  --ignore_fingerprint        proceed anyway, accepting the mixture\n")
-    if args.ignore_fingerprint:
-        print(msg + "\n--ignore_fingerprint given: proceeding with a MIXED output set.\n")
-        return
-    raise SystemExit(msg)
-
-
-def select_keyids(data, args):
-    """The clips to edit. `--limit_mode random` samples with its own seeded RNG and then
-    restores sorted order, so the SET is a sample while the iteration order stays stable."""
-    keyids = sorted(data.keys())
-    if not args.limit or args.limit >= len(keyids):
-        return keyids
-    if args.limit_mode == "first":
-        return keyids[:args.limit]
-    return sorted(random.Random(args.limit_seed).sample(keyids, args.limit))
+    add_logging_args(p)
+    return configure_logging(p.parse_args())
 
 
 def main():
     args = parse_args()
     device = resolve_device(args.device)
-    print(f"Device: {device}")
+    log.info(f"Device: {device}")
 
     model, config = load_model(args.checkpoint, device=device, use_ema=not args.no_ema)
     feature_mode = config.get("feature_mode", "humanml3d")
@@ -230,7 +151,7 @@ def main():
     editor = MotionEditor(model, schedule, device, is_group=is_group,
                           edit_space=args.edit_space, psi_readout=args.psi_readout,
                           attn_layers=resolve_readout_layers(config, args.m1_layers))
-    print(f"predict_type={schedule.predict_type}  edit_space={editor.edit_space}  "
+    log.info(f"predict_type={schedule.predict_type}  edit_space={editor.edit_space}  "
           f"psi_readout={editor.psi_readout}  m1_columns={args.m1_columns}  "
           f"m1_select={args.m1_select}")
 
@@ -252,20 +173,20 @@ def main():
         json.dump({"fingerprint": fingerprint, "status": "in-progress"}, f, indent=2)
 
     import joblib
-    print(f"Loading test set: {args.testset}")
+    log.info(f"Loading test set: {args.testset}")
     data = joblib.load(args.testset)
     keyids = select_keyids(data, args)
     limit_note = ""
     if len(keyids) < len(data):
         seed_note = f", limit_seed={args.limit_seed}" if args.limit_mode == "random" else ""
         limit_note = f" ({args.limit_mode} subsample of {len(data)}{seed_note})"
-    print(f"{len(keyids)} clips{limit_note} × {len(args.scales)} scales -> {args.out_root}")
+    log.info(f"{len(keyids)} clips{limit_note} × {len(args.scales)} scales -> {args.out_root}")
 
     need_attn = mask_mode_components(args.mask_mode)[0] == "attn"
     skipped = {}
     routed, col_modes, col_fallback = {}, {}, []
     n_done = 0
-    for k in tqdm(keyids, desc="Editing"):
+    for k in log.progress(keyids, desc="Editing", leave=True):
         # which scales still need this clip?
         todo = [s for s in args.scales
                 if args.overwrite or not os.path.exists(os.path.join(out_dirs[s], f"{k}.npy"))]
@@ -368,20 +289,22 @@ def main():
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
 
-    print(f"\nDone: edited {n_done} clips this run, skipped {len(skipped)}; "
+    log.info(f"\nDone: edited {n_done} clips this run, skipped {len(skipped)}; "
           f"{min(n_present.values()) if n_present else 0} on disk per scale.")
     if skipped:
-        print("Skipped (first few):", dict(list(skipped.items())[:5]))
+        log.info("Skipped (first few): %s", dict(list(skipped.items())[:5]))
     if col_fallback:
         n_m1 = sum(col_modes.values())
-        print(f"\n{'=' * 78}\nWARNING: --m1_columns {args.m1_columns!r} fell back to the "
-              f"all-content-token read on\n{len(col_fallback)}/{n_m1} clips "
-              f"({len(col_fallback) / max(n_m1, 1):.1%}) — those instructions name no body "
-              f"part, so\nthere is no supervised span to restrict M1 to. This score sheet "
-              f"therefore mixes\nTWO M1 read-outs. Report it split, or re-run with "
-              f"--m1_columns semantic for one\nread-out throughout. The affected keyids are "
-              f"in the manifest as m1_columns_fallback.\n{'=' * 78}")
-    print("Output folders:", ", ".join(out_dirs.values()))
+        log.warning(
+            "--m1_columns %r fell back to the all-content-token read on %d/%d clips "
+            "(%.1f%%) — those instructions name no body part, so there is no supervised "
+            "span to restrict M1 to. This score sheet therefore mixes TWO M1 read-outs. "
+            "Report it split, or re-run with --m1_columns semantic for one read-out "
+            "throughout. The affected keyids are in the manifest as "
+            "m1_columns_fallback.",
+            args.m1_columns, len(col_fallback), n_m1,
+            100 * len(col_fallback) / max(n_m1, 1))
+    log.info("Output folders: %s", ", ".join(out_dirs.values()))
 
 
 if __name__ == "__main__":

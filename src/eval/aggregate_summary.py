@@ -27,9 +27,21 @@ Example:
 """
 
 import os
-import re
-import json
+import sys
+
+# These scripts live one level below src/, so src/ is not on the path when they are run
+# directly. Put it there before any project import.
+_SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+
 import argparse
+import json
+import re
+
+from utils.logger import add_logging_args, configure_logging, get_logger
+
+log = get_logger(__name__)
 
 # Duplicated in run_motionfix_metrics.py, which runs in MotionFix's venv and so cannot share
 # a module with this one.
@@ -67,7 +79,8 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tmr", required=True, help="JSON from run_motionfix_metrics.py.")
     ap.add_argument("--out_dir", default="eval_results/motionfix")
-    args = ap.parse_args()
+    add_logging_args(ap)
+    args = configure_logging(ap.parse_args())
 
     tmr = json.load(open(args.tmr))
 
@@ -148,8 +161,8 @@ def main():
         lines.append("| " + " | ".join(fmt(r[c]) for c in cols) + " |" + tag)
     md = "\n".join(lines) + "\n"
     open(os.path.join(args.out_dir, "summary.md"), "w").write(md)
-    print(md)
-    print(f"Wrote {args.out_dir}/summary.json and summary.md")
+    log.info(md)
+    log.info(f"Wrote {args.out_dir}/summary.json and summary.md")
 
 
 if __name__ == "__main__":

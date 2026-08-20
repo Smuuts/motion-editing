@@ -4,8 +4,7 @@ Decompose a mask's instruction-invariance into its LATERALITY and CATEGORY axes.
 One mean off-diagonal correlation conflates two very different failures — "left arm"
 vs "right arm" (same limb, other side) and "left arm" vs "left leg" (other limb) — and
 the project's history predicts these move apart (category is recoverable, laterality
-needs supervision; docs/FINDINGS.md). Splitting them is what makes a result readable;
-see docs/ARCHITECTURE.md "Mask instruction-invariance is reported decomposed".
+needs supervision). Splitting them is what makes a result readable.
 
 Also computed here:
   align_*             share of the binary mask's active cells landing in the expected
@@ -33,9 +32,9 @@ def axis_stats(maps, glabels, instructions=DEFAULT_INSTRUCTIONS,
     """The per-family statistics for ONE set of (F, G) maps, one per instruction.
 
     Factored out of `decompose` so anything else that produces a per-instruction (F, G)
-    map — Option 6's generation-space divergence, say — reports the *same* quantities
+    map — the generation-space divergence, say — reports the *same* quantities
     computed the *same* way, which is the only reason numbers from different probes can
-    be put in one table (docs/AttentionGrounding_Options.md status board).
+    be put in one table.
 
     Keys are unprefixed; `decompose` prefixes them with "m1_"/"m2_".
     """

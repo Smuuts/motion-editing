@@ -26,7 +26,9 @@ LEDITS++ implementation will extend this class with two additional methods:
 """
 
 import torch
-from tqdm import tqdm
+from utils.logger import get_logger
+
+log = get_logger(__name__)
 
 
 class DDPMSampler:
@@ -66,13 +68,13 @@ class DDPMSampler:
 
         timesteps = list(range(self.schedule.T - 1, 0, -1))
 
-        it = tqdm(timesteps, desc="Sampling") if show_progress else timesteps
+        it = log.progress(timesteps, desc="Sampling", leave=True) if show_progress else timesteps
 
         for t in it:
             t_batch = torch.full((B,), t, device=self.device, dtype=torch.long)
 
             # conditional prediction. to_eps is the identity for an eps-head and the
-            # exact x0->eps conversion for an x0-head (Option 5), so CFG and the
+            # exact x0->eps conversion for an x0-head, so CFG and the
             # reverse step below are unchanged for either parameterisation.
             eps_cond = self.schedule.to_eps(self.model(x, t_batch, context), x, t_batch)
 
@@ -106,10 +108,10 @@ class DDPMSampler:
 
         Identical to `sample` except that the initial x_T and every posterior draw z_t
         are drawn once and reused across the batch, so two rows can only diverge through
-        their text. That is the paired-sample trick Option 6 is built on
-        (docs/AttentionGrounding_Options.md): with independent noise, two generations of
-        the same prompt already differ everywhere, and the text-driven difference is not
-        recoverable from a single pair.
+        their text. That is the paired-sample trick the generation-space differential
+        mask is built on: with independent noise, two generations of the same prompt
+        already differ everywhere, and the text-driven difference is not recoverable from
+        a single pair.
 
         The pairing is exact, not approximate: rows that carry the *same* context stay
         bitwise identical for all T steps, which is what `probe_gen_diff.py` asserts as
@@ -135,7 +137,8 @@ class DDPMSampler:
         x = shared_noise().contiguous()
 
         timesteps = list(range(self.schedule.T - 1, 0, -1))
-        it = tqdm(timesteps, desc="Sampling (paired)") if show_progress else timesteps
+        it = log.progress(timesteps, desc="Sampling (paired)", leave=True) \
+            if show_progress else timesteps
 
         for t in it:
             t_batch = torch.full((B,), t, device=self.device, dtype=torch.long)

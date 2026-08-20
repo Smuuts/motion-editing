@@ -5,7 +5,7 @@ The full benchmark costs hours and answers "is the edit BETTER". This answers th
 cheaper question you need first: "does the edit do ANYTHING, and has it already gone off a
 cliff". Run it before committing to a scale list, because the recorded scales
 (0/2.5/5/7.5) were tuned in eps space, x0 bites harder at the same s (0.014 -> 0.041 m
-mean joint displacement at s=2.5, docs/FINDINGS.md), and psi changed to the signed energy
+mean joint displacement at s=2.5), and psi changed to the signed energy
 read-out on top of that. If 2.5 is already past the useful range the whole sweep measures
 damage and every number will look like the standing negative regardless of mask quality.
 
@@ -34,20 +34,26 @@ silently scrambles the joints).
 """
 
 import os
-import re
 import sys
+
+# These scripts live one level below src/, so src/ is not on the path when they are run
+# directly. Put it there before any project import.
+_SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+
+import argparse
 import glob
 import json
-import argparse
+import re
 
 import numpy as np
 import torch
 
-src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # repo/src
-if src_dir not in sys.path:
-    sys.path.insert(0, src_dir)
-
 from data.smplh_features import gen_layout_to_rotmats
+from utils.logger import add_logging_args, configure_logging, get_logger
+
+log = get_logger(__name__)
 
 
 def load_clip(path: str):
@@ -115,7 +121,8 @@ def main():
     p.add_argument("--noop_deg", type=float, default=1.0,
                    help="Below this mean rotation change, call the edit a no-op.")
     p.add_argument("--out", default=None, help="Also write the table as JSON here.")
-    args = p.parse_args()
+    add_logging_args(p)
+    args = configure_logging(p.parse_args())
 
     modes = scale_dirs(args.out_root, args.mask_mode)
     if not modes:
@@ -124,25 +131,25 @@ def main():
     report = {}
     for mode, by_scale in modes.items():
         if 0.0 not in by_scale:
-            print(f"[{mode}] no s0 folder — scale 0 is the reference, skipping.")
+            log.info(f"[{mode}] no s0 folder — scale 0 is the reference, skipping.")
             continue
         ref = load_dir(by_scale[0.0])          # loaded once, reused across every scale
         n_ref = len(ref)
-        print(f"\n=== {mode}  ({n_ref} clips, reference = s0 = source reconstruction) ===")
-        print(f"{'scale':>7} {'rot deg':>9} {'rotmax':>9} {'p90 max':>9} "
+        log.info(f"\n=== {mode}  ({n_ref} clips, reference = s0 = source reconstruction) ===")
+        log.info(f"{'scale':>7} {'rot deg':>9} {'rotmax':>9} {'p90 max':>9} "
               f"{'trans m':>9} {'no-op':>7}")
-        print("-" * 56)
+        log.info("-" * 56)
         rows = {}
         for s in sorted(by_scale):
             if s == 0.0:
                 continue
             rot, rmax, tr = compare(ref, by_scale[s])
             if not len(rot):
-                print(f"{s:>7g}   (no shared clips)"); continue
+                log.info(f"{s:>7g}   (no shared clips)"); continue
             # "no-op" is judged on the MOST-MOVED joint, not the skeleton mean — a
             # body-part edit is supposed to leave 21 of 22 joints alone.
             noop = float((rmax < args.noop_deg).mean())
-            print(f"{s:>7g} {rot.mean():>9.2f} {rmax.mean():>9.2f} "
+            log.info(f"{s:>7g} {rot.mean():>9.2f} {rmax.mean():>9.2f} "
                   f"{np.percentile(rmax, 90):>9.2f} {tr.mean():>9.4f} {noop:>6.0%}")
             rows[s] = {"rot_deg_mean": float(rot.mean()),
                        "rot_max_deg_mean": float(rmax.mean()),
@@ -157,21 +164,21 @@ def main():
             continue
         live = [s for s in sorted(rows) if rows[s]["frac_noop"] < 0.5]
         top = max(rows)
-        print()
+        log.info()
         if not live:
-            print(f"[{mode}] NOTHING here is doing an edit — even s={top:g} leaves the "
+            log.info(f"[{mode}] NOTHING here is doing an edit — even s={top:g} leaves the "
                   f"most-moved joint under {args.noop_deg:g} deg on most clips.")
-            print(f"        Scan HIGHER before spending TMR: set SCAN_SCALES=\"0 {top:g} "
+            log.info(f"        Scan HIGHER before spending TMR: set SCAN_SCALES=\"0 {top:g} "
                   f"{top*2:g} {top*4:g}\" in eval_motionfix.sh's Config block and re-run.")
         else:
             lo = live[0]
-            print(f"[{mode}] the edit starts moving the body around s={lo:g} "
+            log.info(f"[{mode}] the edit starts moving the body around s={lo:g} "
                   f"(most-moved joint clears {args.noop_deg:g} deg on >50 % of clips).")
             hi = [s for s in sorted(rows) if s >= lo][:3]
-            print(f"        Suggested SCALES for the scored run: \"0 "
+            log.info(f"        Suggested SCALES for the scored run: \"0 "
                   f"{' '.join(f'{s:g}' for s in hi)}\"")
 
-    print("\nRead `rotmax` first: it is the most-moved joint, so it survives a "
+    log.info("\nRead `rotmax` first: it is the most-moved joint, so it survives a "
           "body-part edit that\nleaves the rest of the skeleton alone. `rot deg` is the "
           "skeleton mean and divides that\nby ~22. Both measure MAGNITUDE, never "
           "correctness — a big number is not a good edit.")
@@ -179,7 +186,7 @@ def main():
         os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
         with open(args.out, "w") as f:
             json.dump(report, f, indent=2)
-        print(f"\nwrote {args.out}")
+        log.info(f"\nwrote {args.out}")
 
 
 if __name__ == "__main__":

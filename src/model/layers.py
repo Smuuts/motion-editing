@@ -50,7 +50,7 @@ def resolve_context_and_mask(context, B, null_text_emb, ctx_pad_mask):
     sample-wise for CFG-dropout batches where torch.where mixed null_text_emb rows
     (nonzero everywhere → unmasked, as intended). Returns ctx_mask=None (keeping the
     fused SDPA fast path) whenever nothing is padded. The pad mask is inference-critical
-    (getting it wrong is FID 0.65 → 27.0; see docs/FINDINGS.md 'padding sink')."""
+    (getting it wrong is FID 0.65 → 27.0)."""
     if context is None:
         return null_text_emb.expand(B, -1, -1), None
     if not ctx_pad_mask:
@@ -81,7 +81,7 @@ class CrossAttention(nn.Module):
         # softmax denominator but carries a zero VALUE vector, so mass routed to it simply
         # vanishes from the output. Gives queries that don't need text a principled dump
         # site — instead of hijacking EOS (or, pre-ctx_pad_mask, the zero-value padding
-        # columns; see docs/FINDINGS.md "padding sink"). Init 0 = exactly one synthetic
+        # columns). Init 0 = exactly one synthetic
         # pad-like column, learnable from there. Config-gated (attn_sink) because it adds
         # a parameter: old checkpoints don't have it and must load without it.
         self.sink_logit = nn.Parameter(torch.zeros(num_heads)) if use_sink else None
@@ -108,7 +108,7 @@ class CrossAttention(nn.Module):
 
         # Head-averaged attention of the last forward, (B, N_motion, L_text), kept WITH
         # graph when supervise=True — the input to the TokenCompose grounding loss
-        # (training/grounding.py, Option 1). Deliberately a SEPARATE attribute from
+        # (training/grounding/). Deliberately a SEPARATE attribute from
         # last_attn_map: that one is detached by contract (every M1 read-out consumes it
         # under no_grad and would otherwise silently retain a training graph), and
         # merging the two would make "is this map differentiable?" depend on which
@@ -127,7 +127,7 @@ class CrossAttention(nn.Module):
         # column competes in the softmax with key logit exactly 0 (zeroed T5 pad
         # embedding × bias-free W_k) and absorbs ~93% of the mass for short texts,
         # attenuating the (zero-value) cross-attention output ~14× — see
-        # docs/FINDINGS.md "padding sink". Old checkpoints trained unmasked; the
+        # Old checkpoints trained unmasked; the
         # model only passes a mask when built with ctx_pad_mask=True.
         # compute_entropy=True additionally stashes the mean normalised row entropy
         # of the real-token attention in self.last_entropy (graph kept) for the
@@ -238,9 +238,8 @@ class SelfAttention(nn.Module):
 
         # ── probe-only token↔token attention capture (analyse_self_attention.py) ──
         # Self-attention is the one attention pathway none of the M1/M2 probes ever
-        # read (they are all cross-attention); Option 7 in
-        # docs/AttentionGrounding_Options.md ports DiffSeg (arXiv 2308.12469) onto it
-        # to look for emergent (frame, body-part) segment structure.
+        # read (they are all cross-attention). DiffSeg (arXiv 2308.12469) is ported
+        # onto it to look for emergent (frame, body-part) segment structure.
         #
         # Enabled by SETTING THE ATTRIBUTE on the module, not by a forward kwarg —
         # deliberately. Capture is needed identically in GroupDiT (model/dit.py) and

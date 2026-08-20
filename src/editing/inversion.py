@@ -1,75 +1,51 @@
 """
 LEDITS++ Stage 1 (edit-friendly inversion) and Stage 3 (masked SEGA denoising).
 
-This implements the *DDPM-form* edit-friendly inversion of Huberman-Spiegelglas
-et al. (2024) on this project's NoiseSchedule:
+This implements the DDPM-form edit-friendly inversion of Huberman-Spiegelglas et al.
+(2024) on this project's NoiseSchedule:
 
-  1. Build an independent noisy sequence  x_t = √ᾱ_t · x0 + √(1−ᾱ_t) · ε_t,
-     with ε_t drawn i.i.d. per timestep (the "edit-friendly" noise space).
-  2. Extract noise maps  z_t = (x_{t−1} − μ_θ(x_t)) / σ_t,
-     where μ_θ is the DDPM posterior mean using the model's *unconditional*
-     ε_θ(x_t, ∅) and σ_t = √(posterior_variance_t).
+  1. Build an independent noisy sequence  x_t = sqrt(a_bar_t) x0 + sqrt(1-a_bar_t) eps_t,
+     with eps_t drawn i.i.d. per timestep (the "edit-friendly" noise space).
+  2. Extract noise maps  z_t = (x_{t-1} - mu(x_t)) / sigma_t, where mu is the DDPM
+     posterior mean using the model's UNCONDITIONAL eps(x_t, null) and
+     sigma_t = sqrt(posterior_variance_t).
 
 Re-running the reverse process with the stored {z_t} and unchanged conditioning
-reproduces x0 exactly (perfect reconstruction). Stage 3 instead replaces the
-unconditional prediction with the masked multi-edit SEGA estimate (proposal Eq. 1) and
-hard-inpaints unedited frames from the stored sequence, so only the targeted
-(frame, body-part group) cells move.
+reproduces x0 exactly. Stage 3 instead replaces the unconditional prediction with the
+masked multi-edit SEGA estimate and hard-inpaints unedited frames from the stored
+sequence, so only the targeted (frame, body-part group) cells move.
 
-Edit space (`MotionEditor.edit_space`, resolved from the checkpoint's `predict_type`)
-selects which quantity Stages 2–3 do their arithmetic in — see
-docs/AttentionGrounding_Options.md §5.3:
+EDIT SPACE (`MotionEditor.edit_space`, resolved from the checkpoint's `predict_type`)
+selects which quantity Stages 2-3 do their arithmetic in:
 
-  "eps" — the historical path: SEGA composes noise estimates, and the result is mapped
-          back with predict_x0_from_eps, i.e. the guidance term is multiplied by
-          1/√ᾱ_t (×34 at t=980, unbounded as t→T). Hence `guidance_alpha_floor`.
-  "x0"  — the x0-native path: SEGA composes clean-signal predictions directly, so no
-          1/√ᾱ_t appears and the highest-noise steps need no gating. Per step this is
-          the *same estimate* written one level up (the conversion is affine, so it
-          commutes with the guidance sum); what changes is that an x0 head produces it
-          without a division by a vanishing √ᾱ_t, and that ψ/M2 is then a difference of
-          clean-motion predictions rather than a √SNR_t-weighted one.
+  "eps"  the historical path: SEGA composes noise estimates and the result is mapped back
+         with predict_x0_from_eps, i.e. the guidance term is multiplied by
+         1/sqrt(a_bar_t) — x34 at t=980, unbounded as t->T. Hence `guidance_alpha_floor`.
+  "x0"   the x0-native path: SEGA composes clean-signal predictions directly, so no
+         1/sqrt(a_bar_t) appears and the highest-noise steps need no gating. Per step this
+         is the SAME estimate written one level up (the conversion is affine, so it
+         commutes with the guidance sum); what changes is that an x0 head produces it
+         without dividing by a vanishing sqrt(a_bar_t), and that psi/M2 is then a
+         difference of clean-motion predictions rather than a sqrt(SNR_t)-weighted one.
 
-Scope note: the proposal targets the sde-dpm-solver++ recurrence for acceleration.
-That is a drop-in replacement for the per-step μ/σ recurrence here and is left as
-follow-up; the DDPM form already provides the exact-reconstruction guarantee that
-Stages 2–3 rely on. Inversion runs on the full timestep grid for that reason.
+Scope note: the sde-dpm-solver++ recurrence is a drop-in replacement for the per-step
+mu/sigma recurrence here and is left as follow-up; the DDPM form already provides the
+exact-reconstruction guarantee Stages 2-3 rely on, which is why inversion runs on the
+full timestep grid.
+
+Stage 3's guidance math lives in editing/sega.py and the per-item seeding in
+editing/seeding.py; Stage 2 is editing/masking/.
 """
 
-import zlib
 from dataclasses import dataclass
 
 import torch
-from tqdm import tqdm
 
 from editing import masking
+from editing.sega import guided_x0, resolve_alpha_floor
+from utils.logger import get_logger
 
-# Default `guidance_alpha_floor` for eps-space editing. Only that space needs one: it is
-# the 1/√ᾱ_t amplification of the guidance term that diverges, and the x0-native path
-# has no such factor (§5.3), so it defaults to 0.0 = guide at every step.
-EPS_GUIDANCE_ALPHA_FLOOR = 0.03
-
-
-def derive_seed(base_seed: int, item_id: str) -> int:
-    """Per-item inversion seed from a run-level seed and an item's identity.
-
-    Lives beside `invert` because it is a property of how `invert` draws noise, not of any
-    one caller. `invert` builds its `x_t` ladder from a fresh `Generator(seed)`, so the draw
-    depends only on `(seed, shape)` — which means a batch job passing one seed to every item
-    gives **any two items of equal frame count a bit-identical noise realisation**. On the
-    MotionFix test set that is 1013 clips over ~60 distinct lengths, i.e. ~17 clips per
-    length sharing their whole trajectory noise, and the metric consuming them is retrieval,
-    where generations are scored against each other.
-
-    Deriving keeps a run exactly reproducible from one `--seed` (which still moves every item
-    together, so seed-spread measurements work unchanged) while making the draws independent
-    across items. `crc32` rather than `hash()` because Python string hashing is salted per
-    process, so `hash()` would not be reproducible across runs.
-
-    NOTE any multi-item caller wants this — the probes still pass a bare `--seed` across
-    their clip loops and therefore still share ladders between equal-length clips.
-    """
-    return (base_seed * 1_000_003 + zlib.crc32(item_id.encode())) % (2 ** 31 - 1)
+log = get_logger(__name__)
 
 
 @dataclass
@@ -172,7 +148,7 @@ class MotionEditor:
         # 2. edit-friendly noise maps z_t (for t in [1, T))
         zs = torch.zeros(T, 1, F, D, device=self.device)
         it = range(T - 1, 0, -1)
-        it = tqdm(it, desc="Inversion", leave=False) if show_progress else it
+        it = log.progress(it, desc="Inversion") if show_progress else it
         for t in it:
             t_b = torch.full((1,), t, device=self.device, dtype=torch.long)
             # `posterior_mean` takes x̂0, so read the unconditional prediction straight
@@ -270,61 +246,16 @@ class MotionEditor:
 
     # ── Stage 3 ────────────────────────────────────────────────────────────────
     def resolve_alpha_floor(self, guidance_alpha_floor=None) -> float:
-        """The `guidance_alpha_floor` `edit()` will actually use — the space-dependent
-        default when None (see `edit`). Exposed so callers can log/print the resolved
-        value instead of a bare None."""
-        if guidance_alpha_floor is not None:
-            return float(guidance_alpha_floor)
-        return 0.0 if self.edit_space == "x0" else EPS_GUIDANCE_ALPHA_FLOOR
-
-    @torch.no_grad()
-    def _guided_x0(self, x, t_b, edit_contexts, m_channels, scales, guide: bool):
-        """One reverse step's masked multi-edit SEGA estimate, returned as x̂0.
-
-        In "eps" space this composes noise estimates and converts once at the end
-        (the historical arithmetic, unchanged):
-
-            ε̂  = ε_∅ + Σ_i s_i·M_i⊙(ε_{c_i} − ε_∅)   →   x̂0 = predict_x0_from_eps(ε̂)
-
-        In "x0" space it composes the clean-signal predictions themselves (§5.3):
-
-            x̂0 = x̂0^∅ + Σ_i s_i·M_i⊙(x̂0^{c_i} − x̂0^∅)
-
-        Substituting the ε↔x0 shim into either form gives the other exactly — the
-        conversion is affine at fixed (x, t), so guidance commutes with it. The
-        difference is conditioning, not algebra: the eps form reaches x̂0 by dividing by
-        √ᾱ_t, so it amplifies whatever error the head has by up to 1/√ᾱ_t and needs
-        `guidance_alpha_floor`; with an x0 head the x0 form never performs that division.
-
-        `guide=False` (floor gate) returns the unconditional prediction, in both spaces.
-        """
-        s, space = self.schedule, self.edit_space
-        base = s.to_space(self.model(x, t_b, context=None), x, t_b, space)
-        out = base
-        if guide:
-            for ctx, m_ch, scale in zip(edit_contexts, m_channels, scales):
-                # A zero scale contributes `0 · m ⊙ (out_c − base)` = 0, so the conditional
-                # forward that produces out_c is pure waste — and scale 0 is not a corner
-                # case here, it is the source-reconstruction calibration every sweep runs.
-                # Skipping it saves one model call per step, i.e. ~11% of a MotionFix run
-                # (999 of ~9,100 forwards per clip at four scales). Output is unchanged for
-                # any finite out_c; a NaN there would already have poisoned `base`.
-                if scale == 0:
-                    continue
-                out_c = s.to_space(self.model(x, t_b, ctx), x, t_b, space)
-                out = out + scale * m_ch * (out_c - base)
-        # NB the result is NOT clamped — normalised HumanML3D features legitimately
-        # reach ~±60 (small-std channels), so any fixed clamp would truncate real values
-        # and forfeit the edit-friendly exact-reconstruction guarantee (with scale=0 this
-        # loop must reproduce the source). Guidance is bounded by the mask and scale.
-        return out if space == "x0" else s.predict_x0_from_eps(x, t_b, out)
+        """The `guidance_alpha_floor` `edit()` will actually use. Exposed so callers can
+        report the resolved value instead of a bare None."""
+        return resolve_alpha_floor(self.edit_space, guidance_alpha_floor)
 
     @torch.no_grad()
     def edit(self, state, edit_contexts, masks, scales, show_progress=True,
              guidance_alpha_floor=None):
         """
-        Masked multi-edit SEGA denoising with cell-level hard inpainting (proposal Eq. 1),
-        run in this editor's `edit_space` — see `_guided_x0` for the two forms:
+        Masked multi-edit SEGA denoising with cell-level hard inpainting, run in this
+        editor's `edit_space` — see `editing.sega.guided_x0` for the two forms:
 
             ε̂(x_t, c_e) = ε_θ(x_t, ∅) + Σ_i s_e,i · M_i · [ε_θ(x_t, c_e,i) − ε_θ(x_t, ∅)]
 
@@ -332,7 +263,7 @@ class MotionEditor:
         masks                : list of mask dicts from collect_masks (m_channel / edited)
         scales               : list of guidance scales s_e per instruction
         guidance_alpha_floor : apply edit guidance only at steps where √ᾱ_t ≥ floor.
-            None (default) resolves per space: EPS_GUIDANCE_ALPHA_FLOOR in eps space,
+            None (default) resolves per space: `EPS_GUIDANCE_ALPHA_FLOOR` in eps space,
             0.0 (no gate) in x0 space.
             The gate exists for eps space, where reaching x̂0 divides by √ᾱ_t → 0 at the
             highest-noise steps: guidance there amplifies (ε_c − ε_∅) by an unbounded
@@ -341,7 +272,7 @@ class MotionEditor:
             removes the blow-up while leaving edit strength essentially unchanged.
             x0-native guidance has no such factor, so those steps are guided too — and
             they are exactly where an x0-trained model's text conditioning is strongest
-            (docs/FINDINGS.md). Pass a non-zero floor to gate them anyway (needed if
+            (measured). Pass a non-zero floor to gate them anyway (needed if
             edit_space="x0" is forced onto an eps head). scale=0 reconstructs the source
             exactly regardless, in both spaces.
         Returns the edited motion x̂0 : (1, F, 263), normalised.
@@ -364,14 +295,15 @@ class MotionEditor:
 
         x = state.xs[T - 1].clone()
         it = range(T - 1, 0, -1)
-        it = tqdm(it, desc="Editing", leave=False) if show_progress else it
+        it = log.progress(it, desc="Editing") if show_progress else it
         for t in it:
             t_b = torch.full((1,), t, device=self.device, dtype=torch.long)
 
             # Gate guidance off at vanishing-√ᾱ steps (eps space only by default — see
             # the docstring), then take the reverse step reusing the stored z_t.
             guide = bool(s.sqrt_alphas_cumprod[t] >= guidance_alpha_floor)
-            x0_pred = self._guided_x0(x, t_b, edit_contexts, m_channels, scales, guide)
+            x0_pred = guided_x0(self.model, s, self.edit_space, x, t_b,
+                                edit_contexts, m_channels, scales, guide)
             mu = s.posterior_mean(x0_pred, x, t_b)
             sigma = s.posterior_variance[t].clamp(min=1e-20).sqrt()
             x = mu + sigma * state.zs[t]

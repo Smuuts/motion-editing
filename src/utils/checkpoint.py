@@ -2,6 +2,9 @@ import os
 import json
 import shutil
 import torch
+from utils.logger import get_logger
+
+log = get_logger(__name__)
 
 
 def save_checkpoint(output_dir, epoch, model, ema, optimizer, scheduler, config):
@@ -20,7 +23,7 @@ def save_checkpoint(output_dir, epoch, model, ema, optimizer, scheduler, config)
     elif os.path.isdir(latest):
         shutil.rmtree(latest)
     os.symlink(os.path.basename(ckpt_dir), latest)
-    print(f"  Saved checkpoint: {ckpt_dir}")
+    log.info(f"  Saved checkpoint: {ckpt_dir}")
 
 
 def load_checkpoint(ckpt_dir, model, ema, optimizer, scheduler):
@@ -33,5 +36,5 @@ def load_checkpoint(ckpt_dir, model, ema, optimizer, scheduler):
     scheduler.load_state_dict(_load("scheduler.pt"))
     with open(os.path.join(ckpt_dir, "config.json")) as f:
         saved = json.load(f)
-    print(f"  Resumed from epoch {saved['epoch']}")
+    log.info(f"  Resumed from epoch {saved['epoch']}")
     return saved["epoch"] + 1
