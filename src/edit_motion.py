@@ -39,6 +39,10 @@ import numpy as np
 import torch
 
 import matplotlib
+from utils.logger import get_logger
+from utils.cli import add_logging_args, configure_logging
+
+log = get_logger(__name__)
 matplotlib.use("Agg")
 from scipy.ndimage import gaussian_filter1d
 
@@ -103,7 +107,8 @@ def parse_args():
                         "(DAAM). 'renorm_spatial' = both.")
     p.add_argument("--smooth_sigma", type=float, default=1.5)
     p.add_argument("--out_dir", default="eval_results/edit_demo")
-    return p.parse_args()
+    add_logging_args(p)
+    return configure_logging(p.parse_args())
 
 
 def decode(features, feature_mode, smooth_sigma):
@@ -118,12 +123,12 @@ def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
     device = resolve_device(args.device)
-    print(f"Device: {device}")
+    log.info(f"Device: {device}")
 
     # ── model, schedule, encoder, normalisation stats ───────────────────────────
     model, config = load_model(args.checkpoint, device=device, use_ema=not args.no_ema)
     feature_mode, is_group, group_mode, gnames = resolve_group_context(config)
-    print(f"feature_mode={feature_mode}  is_group={is_group}  group_mode={group_mode} "
+    log.info(f"feature_mode={feature_mode}  is_group={is_group}  group_mode={group_mode} "
           f"(G={len(gnames)})")
     # Prime the SMPL-H body model so recover_joints() decodes 135-d features with the
     # configured model (no-op for humanml3d, which uses RIC recovery).
@@ -141,16 +146,16 @@ def main():
     x0 = torch.from_numpy((raw_feat - mean) / std).float().unsqueeze(0).to(device)
     valid_frames = torch.ones(F, dtype=torch.bool, device=device)
     joints_src = decode(raw_feat, feature_mode, args.smooth_sigma)   # shared by all jobs
-    print(f"Source: {clip_id}  ({F} frames)  original prompt: {src_caption!r}")
+    log.info(f"Source: {clip_id}  ({F} frames)  original prompt: {src_caption!r}")
 
     # ── invert ONCE (inversion depends only on the source, not the instruction) ──
     editor = MotionEditor(model, schedule, device, is_group=is_group,
                           edit_space=args.edit_space, psi_readout=args.psi_readout,
                           attn_layers=resolve_readout_layers(config, args.m1_layers))
-    print(f"predict_type={schedule.predict_type}  edit_space={editor.edit_space}  "
+    log.info(f"predict_type={schedule.predict_type}  edit_space={editor.edit_space}  "
           f"guidance_alpha_floor={editor.resolve_alpha_floor(args.guidance_alpha_floor):g}"
           + ("  (x0-native ψ/SEGA)" if editor.edit_space == "x0" else ""))
-    print("Stage 1: inversion …")
+    log.info("Stage 1: inversion …")
     state = editor.invert(x0, seed=args.seed)
 
     ctx_src = None
@@ -159,7 +164,7 @@ def main():
             with torch.no_grad():
                 ctx_src = text_encoder.encode([src_caption])
         else:
-            print("WARNING: --m2_ref source but the clip has no caption; "
+            log.warning("--m2_ref source but the clip has no caption; "
                   "falling back to the null reference.")
 
     edits = args.instructions
@@ -167,15 +172,15 @@ def main():
     group_spec_of = None
     if args.mask_mode == "groups":
         if not args.target_groups or args.target_groups == ["auto"]:
-            # Option 13's cheap tier: route the instruction to its groups with the same
+            # The cheap tier: route the instruction to its groups with the same
             # parser the grounding labels use — no LLM, no hand-typed groups, and
             # laterality-correct by construction. Resolves 58.9% of MotionFix test
             # instructions; the rest name no body part and get a clear error rather than
-            # a guessed mask (docs/FINDINGS.md "How much of MotionFix a group mask can
+            # a guessed mask (measured: "How much of MotionFix a group mask can
             # even address").
             routed = {e: route_groups(e, group_mode) for e in edits}
             for e, g in routed.items():
-                print(f"  router {e!r} -> {g or 'NOTHING (no body part named)'}")
+                log.info(f"  router {e!r} -> {g or 'NOTHING (no body part named)'}")
             missing = [e for e, g in routed.items() if not g]
             if missing:
                 raise SystemExit(
@@ -193,7 +198,7 @@ def main():
     # compose → all edits in one video; else → one video per instruction (variety).
     for job in ([edits] if args.compose else [[e] for e in edits]):
         scales = [scale_of(e) for e in job]
-        print(f"\nEdit job: {job}  scales={scales}  mask_mode={args.mask_mode}")
+        log.info(f"\nEdit job: {job}  scales={scales}  mask_mode={args.mask_mode}")
         with torch.no_grad():
             # One batched encode() for the whole job: same per-text embeddings (encoder
             # attention is intra-sequence only), fewer forward passes when composing.
@@ -203,7 +208,7 @@ def main():
             cols = [resolve_readout_columns(e, text_encoder, config, args.m1_columns,
                                             group_mode) for e in job]
         if args.mask_mode in ("attn", "m1_only"):
-            print("  M1 columns: "
+            log.info("  M1 columns: "
                   + ", ".join(f"{e!r}->{c[2]}" for e, c in zip(job, cols)))
 
         group_masks = None
@@ -211,7 +216,7 @@ def main():
             group_masks = [parse_group_mask(group_spec_of(e), is_group, group_mode)
                            for e in job]
             for e, gm in zip(job, group_masks):
-                print(f"  target_groups {e!r}: "
+                log.info(f"  target_groups {e!r}: "
                       f"{[gnames[g] for g in gm.nonzero().flatten().tolist()]}")
 
         masks = editor.collect_masks(
@@ -228,7 +233,7 @@ def main():
         x_edit = editor.edit(state, ctxs, masks, scales=scales,
                              guidance_alpha_floor=args.guidance_alpha_floor)  # (1,F,D)
         for i, m in enumerate(masks):
-            print(f"  mask[{i}] {job[i]!r}: {int(m['edited'].sum())}/{F} frames, "
+            log.info(f"  mask[{i}] {job[i]!r}: {int(m['edited'].sum())}/{F} frames, "
                   f"{int(m['m_group'].sum())} active (frame,group) cells")
 
         joints_edit = decode(x_edit[0].cpu().numpy() * std + mean, feature_mode,

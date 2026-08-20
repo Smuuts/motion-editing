@@ -1,7 +1,7 @@
 """
-Option 6 — the generation-space differential mask, and the statistics that judge it.
+The generation-space differential mask, and the statistics that judge it.
 
-The idea (docs/AttentionGrounding_Options.md §"Option 6"): this backbone's *generation*
+The idea: this backbone's *generation*
 path is measured-good (FID 0.153, R@1 0.554 on the x0 checkpoint) while its *editing*
 conditioner on inverted latents is measured-blind to the instruction. So instead of
 reading the mask out of the weak pathway (attention M1 / noise-contrast M2), generate
@@ -44,7 +44,7 @@ import torch
 
 from editing.masking import percentile_threshold
 from model.body_groups import BODY_PART_GROUPS, GROUP_NAMES, group_layout
-from utils.probe import accuracy_block, group_profile
+from utils.probe import accuracy_block
 from .instructions import DEFAULT_INSTRUCTIONS, DEFAULT_TARGETS, MIRROR
 from .mask_axes import alignment, axis_stats
 
@@ -91,7 +91,7 @@ def temporal_activity(divergence_fn, clip) -> np.ndarray:
     """The same divergence applied between consecutive frames of ONE clip → its own
     (F, G) motion energy, first frame REPEATED.
 
-    This is the control that keeps Option 6 honest: if a generation's plain motion energy
+    This is the control that keeps the route honest: if a generation's plain motion energy
     localises the instruction just as well as the paired difference does, then the
     differencing — and the shared noise it needs — buys nothing, and what is really being
     measured is "the generator moves the named limb".
@@ -100,7 +100,7 @@ def temporal_activity(divergence_fn, clip) -> np.ndarray:
     copies of this convention — `masking._frame_energy`, `utils.probe.source_activity`,
     `grounding.batched_source_activity`. They are one definition and are changed together, so
     that "this map vs the source's own activity" stays a comparison of like with like
-    (docs/ARCHITECTURE.md).
+    definition.
     """
     d = divergence_fn(clip[1:], clip[:-1])
     return np.concatenate([d[:1], d], axis=0)

@@ -18,9 +18,12 @@ import argparse
 
 import numpy as np
 import torch
-from tqdm import tqdm
 
 from model.text_encoder import build_text_encoder
+from utils.logger import get_logger
+from utils.cli import add_logging_args, configure_logging
+
+log = get_logger(__name__)
 
 
 def parse_args():
@@ -45,7 +48,8 @@ def parse_args():
                    help="'cuda' or 'cpu'. Defaults to cuda if available.")
     p.add_argument("--overwrite",     action="store_true",
                    help="Re-encode clips that already have a cached file.")
-    return p.parse_args()
+    add_logging_args(p)
+    return configure_logging(p.parse_args())
 
 
 def collect_clip_annotations(data_root: str, splits: list[str]) -> dict[str, list[str]]:
@@ -55,7 +59,7 @@ def collect_clip_annotations(data_root: str, splits: list[str]) -> dict[str, lis
     for split in splits:
         split_file = os.path.join(data_root, f"{split}.txt")
         if not os.path.exists(split_file):
-            print(f"  Warning: split file not found, skipping: {split_file}")
+            log.warning(f"split file not found, skipping: {split_file}")
             continue
         with open(split_file) as f:
             clip_ids.update(line.strip() for line in f if line.strip())
@@ -73,7 +77,7 @@ def collect_clip_annotations(data_root: str, splits: list[str]) -> dict[str, lis
         if annotations:
             clip_annotations[clip_id] = annotations
 
-    print(f"  Found {len(clip_annotations)} clips across splits "
+    log.info(f"  Found {len(clip_annotations)} clips across splits "
           f"({missing} missing text files skipped).")
     return clip_annotations
 
@@ -81,13 +85,13 @@ def collect_clip_annotations(data_root: str, splits: list[str]) -> dict[str, lis
 def main():
     args = parse_args()
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    log.info(f"Device: {device}")
 
     out_dir = args.out_dir or os.path.join(args.data_root, "text_emb")
     os.makedirs(out_dir, exist_ok=True)
 
     # ── collect annotations ───────────────────────────────────────────────
-    print("Scanning clips...")
+    log.info("Scanning clips...")
     clip_annotations = collect_clip_annotations(args.data_root, args.splits)
 
     # skip already-cached clips unless --overwrite
@@ -96,16 +100,16 @@ def main():
             cid: anns for cid, anns in clip_annotations.items()
             if not os.path.exists(os.path.join(out_dir, f"{cid}.npy"))
         }
-        print(f"  {len(clip_annotations)} clips need encoding (use --overwrite to redo all).")
+        log.info(f"  {len(clip_annotations)} clips need encoding (use --overwrite to redo all).")
 
     if not clip_annotations:
-        print("Nothing to do.")
+        log.info("Nothing to do.")
         return
 
     # ── load encoder ──────────────────────────────────────────────────────
     encoder_label = (f"T5 {args.t5_version} (max_length={args.t5_max_length})"
                      if args.text_encoder == "t5" else f"CLIP {args.clip_version}")
-    print(f"Loading {encoder_label}...")
+    log.info(f"Loading {encoder_label}...")
     encoder = build_text_encoder(vars(args), device=device)
 
     CHUNK_SIZE = 256
@@ -114,7 +118,7 @@ def main():
 
     dim = None
     saved = 0
-    pbar = tqdm(total=total_clips, desc="Encoding & saving")
+    pbar = log.progress(None, desc="Encoding & saving", total=total_clips)
     for chunk_start in range(0, total_clips, CHUNK_SIZE):
         chunk_ids = clip_ids_ordered[chunk_start : chunk_start + CHUNK_SIZE]
 
@@ -149,8 +153,8 @@ def main():
     total_annotations = sum(len(v) for v in clip_annotations.values())
     seq_len = encoder.max_length
     size_gb = total_annotations * seq_len * dim * 2 / 1024 ** 3  # float16 = 2 bytes
-    print(f"\nDone. {saved} clips saved to {out_dir}/")
-    print(f"  Encoder: {encoder_label}  |  seq_len: {seq_len}  |  dim: {dim}"
+    log.info(f"\nDone. {saved} clips saved to {out_dir}/")
+    log.info(f"  Encoder: {encoder_label}  |  seq_len: {seq_len}  |  dim: {dim}"
           f"  |  Approx disk: {size_gb:.2f} GB (float16)")
 
 

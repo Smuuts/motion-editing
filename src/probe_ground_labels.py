@@ -1,37 +1,34 @@
 """
-The label-quality gate for Option 1 (cross-attention grounding supervision).
+The label-quality gate for the cross-attention grounding supervision.
 
 Before spending a 500-epoch retrain on a supervision signal, measure the signal. This
-script builds the caption→body-part label set (data/body_part_labels.py) over a whole
-split and answers the four questions that decide whether the retrain is worth starting:
+builds the caption->body-part label set (`data/body_part_labels`) over a whole split and
+answers the four questions that decide whether the retrain is worth starting:
 
 1. COVERAGE, per tier. What share of annotations produce a lateralised item (tier 1 — the
-   ones that carry the left/right signal Option 1 exists for), an unlateralised one
-   (tier 2), or nothing? This is the number that decides whether the loss fires often
-   enough to shape the model, whether those clips need oversampling, and whether the
-   optional tier-3 generator labels are worth 15-24 GPU-hours. The most frequent
-   *uncovered* caption words are printed alongside, because that list is the cheapest
-   possible vocabulary fix.
+   ones carrying the left/right signal the whole exercise exists for), an unlateralised
+   one (tier 2), or nothing? This decides whether the loss fires often enough to shape the
+   model, whether those clips need oversampling, and whether the optional tier-3
+   generator labels are worth 15-24 GPU-hours. The most frequent UNCOVERED caption words
+   are printed alongside, because that list is the cheapest possible vocabulary fix.
 
-2. LATERALITY BALANCE. Left-target vs right-target item counts. This should be ~1.000 by
+2. LATERALITY BALANCE. Left-target vs right-target item counts, which should be ~1.000 by
    construction: half the train split is mirror-augmented clips whose captions are
    verified left/right-swapped. A ratio far from 1 means the parser drops one side, which
    would bias the very axis being supervised — a hard stop.
 
-3. AGREEMENT WITH THE GENERATOR (--audit_checkpoint). The independent auditor. Option 6
-   measured that a single generation's per-group motion energy picks the named group at
-   0.990 and the named side at 1.000, so it is the one signal in this project known to
-   resolve laterality. Generate from a sample of tier-1 captions and check the energy
-   lands on the group the parser claimed. High agreement validates the parser at scale;
-   the disagreements are a concrete list of vocabulary bugs.
+3. AGREEMENT WITH THE GENERATOR (--audit_checkpoint). The independent auditor. A single
+   generation's per-group motion energy picks the named group at 0.990 and the named side
+   at 1.000, so it is the one signal here known to resolve laterality. Generate from a
+   sample of tier-1 captions and check the energy lands on the group the parser claimed.
+   High agreement validates the parser at scale; the disagreements are a concrete list of
+   vocabulary bugs.
 
 4. COLUMN ALIGNMENT (mandatory). Assert that `token_spans` columns are exactly
    `token_info` columns, i.e. that the supervised columns index the same L axis the
    attention maps use. Supervising the wrong columns trains nonsense and is invisible
    downstream, so this one is an assertion, not a metric.
 
-Usage
------
     # fast: everything except the generator audit (no GPU, seconds)
     python src/probe_ground_labels.py --data_root data/HumanML3D/HumanML3D
 
@@ -46,12 +43,14 @@ import json
 import os
 import re
 
-import numpy as np
-
+from analysis.ground_audit import audit_with_generator
 from data.body_part_labels import LIMB2BASE, build_cache, parse_caption
 from data.clips import read_captions, split_ids
 from model.body_groups import GROUP_NAMES
-from utils.probe import accuracy_block
+from utils.cli import add_logging_args, configure_logging
+from utils.logger import get_logger
+
+log = get_logger(__name__)
 
 # Words that carry no body-part information and would only clutter the "most frequent
 # uncovered word" list the vocabulary fix is read off.
@@ -104,7 +103,8 @@ def parse_args():
     p.add_argument("--no_ema", action="store_true")
     p.add_argument("--smplh_model_path",
                    default="data/motionfix/data/body_models/smplh")
-    return p.parse_args()
+    add_logging_args(p)
+    return configure_logging(p.parse_args())
 
 
 # ── 1 + 2: coverage and balance, from the parser alone (no model, no tokenizer) ──────
@@ -166,43 +166,43 @@ def coverage_report(annotations, top_uncovered):
 
 def print_coverage(rep, n_clips):
     c, k = rep["coverage"], rep["counts"]
-    print(f"\n── 1. coverage over {rep['n_annotations']} annotations "
-          f"({n_clips} clips) ──────────")
-    print(f"  tier 1  lateralised     {k['tier1']:6d}  {c['tier1']:6.1%}   "
+    log.section(f"1. coverage over {rep['n_annotations']} annotations "
+                f"({n_clips} clips)")
+    log.info(f"  tier 1  lateralised     {k['tier1']:6d}  {c['tier1']:6.1%}   "
           f"← carries the left/right signal")
-    print(f"  tier 2  limb, no side   {k['tier2']:6d}  {c['tier2']:6.1%}")
-    print(f"  none    no part word    {k['none']:6d}  {c['none']:6.1%}   "
+    log.info(f"  tier 2  limb, no side   {k['tier2']:6d}  {c['tier2']:6.1%}")
+    log.info(f"  none    no part word    {k['none']:6d}  {c['none']:6.1%}   "
           f"← tier-3 territory")
-    print(f"  clips with >=1 tier-1 annotation: {rep['n_clips_with_tier1']} / {n_clips} "
+    log.info(f"  clips with >=1 tier-1 annotation: {rep['n_clips_with_tier1']} / {n_clips} "
           f"({rep['n_clips_with_tier1'] / max(n_clips, 1):.1%})")
-    print(f"  items: {rep['items_per_tier']}")
+    log.info(f"  items: {rep['items_per_tier']}")
 
     lat = rep["laterality"]
-    print(f"\n── 2. laterality balance ──────────────────────────────────────")
-    print(f"  left items {lat['left_items']:6d}   right items {lat['right_items']:6d}   "
+    log.section("2. laterality balance")
+    log.info(f"  left items {lat['left_items']:6d}   right items {lat['right_items']:6d}   "
           f"ratio {lat['ratio']:.4f}")
     verdict = ("OK" if 0.95 <= lat["ratio"] <= 1.05 else
                "SKEWED — the parser is dropping one side; investigate before training")
-    print(f"  → {verdict}")
+    log.info(f"  → {verdict}")
 
-    print("\n  group distribution over items:")
+    log.info("\n  group distribution over items:")
     total = sum(rep["group_distribution"].values()) or 1
     for g in GROUP_NAMES:
         v = rep["group_distribution"].get(g, 0)
         if v:
-            print(f"    {g:10s} {v:7d}  {v / total:6.1%}")
+            log.info(f"    {g:10s} {v:7d}  {v / total:6.1%}")
 
-    print(f"\n  most frequent words in UNCOVERED annotations "
-          f"(candidate vocabulary additions):")
+    log.info("\n  most frequent words in UNCOVERED annotations "
+             "(candidate vocabulary additions):")
     line = "    "
     for w, cnt in rep["top_uncovered_words"]:
         entry = f"{w}({cnt})  "
         if len(line) + len(entry) > 96:
-            print(line)
+            log.info(line)
             line = "    "
         line += entry
     if line.strip():
-        print(line)
+        log.info(line)
 
 
 # ── 4: the mandatory column assertion ────────────────────────────────────────────────
@@ -227,107 +227,6 @@ def assert_columns(encoder, annotations, n=200):
     return checked
 
 
-# ── 3: the generator auditor ─────────────────────────────────────────────────────────
-
-def audit_with_generator(args, annotations, device):
-    """Do the parser's tier-1 labels agree with where the generator puts motion energy?
-
-    Reuses Option 6's measured-good read-out verbatim (analysis/gen_diff): generate the
-    caption, decode to joints, take the per-group motion energy, and ask two questions a
-    constant bias cannot win.
-    """
-    import torch
-
-    from analysis.gen_diff import joint_divergence, temporal_activity
-    from model.sampler import DDPMSampler
-    from model.schedule import NoiseSchedule
-    from model.text_encoder import build_text_encoder
-    from utils.decode import recover_joints, smplh_body_model
-    from utils.model_io import load_model
-    from utils.probe import group_profile
-
-    # Tier-1 captions only: the audit is about laterality, which is what tier 1 carries.
-    pool = []
-    for _, caption in annotations:
-        lat = [m for m in parse_caption(caption) if m.lat]
-        if len(lat) == 1:                      # one unambiguous target to score against
-            pool.append((caption, lat[0].groups[0]))
-    rng = np.random.default_rng(args.audit_seed)
-    idx = rng.permutation(len(pool))[:args.audit_n]
-    sample = [pool[i] for i in idx]
-    print(f"\n── 3. generator audit: {len(sample)} tier-1 captions "
-          f"(pool {len(pool)}) ──────")
-
-    model, config = load_model(args.audit_checkpoint, device=device,
-                               use_ema=not args.no_ema)
-    feature_mode = config.get("feature_mode", "humanml3d")
-    if feature_mode == "smplh":
-        smplh_body_model(args.smplh_model_path)
-    schedule = NoiseSchedule.from_config(config, device=device)
-    sampler = DDPMSampler(model, schedule, device)
-    text_encoder = build_text_encoder(config, device=device)
-    mean = np.load(os.path.join(args.data_root, "Mean.npy"))
-    std = np.load(os.path.join(args.data_root, "Std.npy"))
-    mirror = {"left_arm": "right_arm", "right_arm": "left_arm",
-              "left_leg": "right_leg", "right_leg": "left_leg"}
-
-    top1_wins, lat_wins, cat_wins, rows = [], [], [], []
-    for start in range(0, len(sample), args.audit_batch):
-        chunk = sample[start:start + args.audit_batch]
-        with torch.no_grad():
-            ctx = text_encoder.encode([c for c, _ in chunk]).to(device)
-        gen = sampler.sample_paired(
-            ctx, length=args.audit_length, guidance_scale=args.audit_guidance,
-            generator=torch.Generator(device=device).manual_seed(args.audit_seed + start),
-            show_progress=False).float().cpu().numpy()
-
-        for (caption, target), g in zip(chunk, gen):
-            joints = recover_joints(g * std + mean, feature_mode)
-            profile = group_profile(temporal_activity(joint_divergence, joints))
-            pred = GROUP_NAMES[int(np.argmax(profile))]
-            ti, mi = GROUP_NAMES.index(target), GROUP_NAMES.index(mirror[target])
-            own = [ti, mi]
-            other = ([GROUP_NAMES.index("left_leg"), GROUP_NAMES.index("right_leg")]
-                     if target.endswith("_arm") else
-                     [GROUP_NAMES.index("left_arm"), GROUP_NAMES.index("right_arm")])
-            top1_wins.append(pred == target)
-            lat_wins.append(bool(profile[ti] > profile[mi]))
-            cat_wins.append(bool(profile[own].sum() > profile[other].sum()))
-            rows.append({"caption": caption, "parser": target, "generator_top1": pred,
-                         "profile": profile.tolist()})
-        print(f"  generated {min(start + args.audit_batch, len(sample))}/{len(sample)}")
-
-    blocks = {
-        "laterality": accuracy_block(lat_wins, "generator agrees on the SIDE"),
-        "category": accuracy_block(cat_wins, "generator agrees on the LIMB"),
-        "top1": accuracy_block(top1_wins, "generator's top-1 group == parser's group",
-                               chance=1.0 / len(GROUP_NAMES)),
-    }
-    for b in blocks.values():
-        flag = ("PASS" if b["beats_chance"] else
-                "BELOW chance" if b["below_chance"] else "at chance")
-        print(f"  {b['label']:44s} {b['accuracy']:.3f}  "
-              f"[{b['ci95'][0]:.3f}, {b['ci95'][1]:.3f}]  n={b['n']}  "
-              f"chance {b['chance']:.3f}  → {flag}")
-
-    disagree = [r for r in rows if r["parser"] != r["generator_top1"]]
-    if disagree:
-        # Read these carefully before blaming the parser. The auditor scores where the
-        # generation puts the most MOTION, which is not the same question as which part
-        # the caption names: in a compound caption ("walks down stairs while holding the
-        # rail with their left hand") the locomotion dominates the energy and the named
-        # arm loses, even though the parser's label is the correct one to supervise. A
-        # disagreement is a parser bug only when the caption names one part and the
-        # generator picks a different *named-able* one.
-        print(f"\n  {len(disagree)} disagreements; first 15 (inspect — a compound caption "
-              f"whose named limb is not its dominant motion is EXPECTED here, and is not "
-              f"a parser bug):")
-        for r in disagree[:15]:
-            print(f"    parser={r['parser']:10s} gen={r['generator_top1']:10s} "
-                  f"| {r['caption'][:70]}")
-    return {"blocks": blocks, "rows": rows}
-
-
 # ── main ─────────────────────────────────────────────────────────────────────────────
 
 def main():
@@ -336,18 +235,18 @@ def main():
 
     annotations = collect_annotations(args.data_root, args.split)
     n_clips = len(split_ids(args.data_root, args.split))
-    print(f"data_root {args.data_root}   split {args.split}")
+    log.info(f"data_root {args.data_root}   split {args.split}")
 
     rep = coverage_report(annotations, args.top_uncovered)
     print_coverage(rep, n_clips)
 
     # ── 4 (assertion) + the cache, both of which need the encoder ──
     from model.text_encoder import build_text_encoder
-    print(f"\n── 4. column alignment ────────────────────────────────────────")
+    log.section("4. column alignment")
     encoder = build_text_encoder(vars(args), device="cpu")
     checked = assert_columns(encoder, annotations)
-    print(f"  token_spans columns == token_info columns on {checked} real captions → OK")
-    print(f"  encoder L axis = {encoder.max_length} "
+    log.info(f"  token_spans columns == token_info columns on {checked} real captions → OK")
+    log.info(f"  encoder L axis = {encoder.max_length} "
           f"({args.text_encoder}{'/' + args.t5_version if args.text_encoder == 't5' else ''})")
 
     cache_out = args.cache_out or os.path.join(args.data_root, "ground_labels.json")
@@ -355,7 +254,7 @@ def main():
         cache = build_cache(args.data_root, encoder, splits=args.cache_splits,
                             out_path=cache_out)
         n_items = sum(len(v) for v in cache.values())
-        print(f"\n  wrote {cache_out}: {len(cache)} captions, {n_items} items "
+        log.info(f"\n  wrote {cache_out}: {len(cache)} captions, {n_items} items "
               f"(splits {args.cache_splits})")
 
     audit = None
@@ -374,7 +273,7 @@ def main():
                 "checkpoint": args.audit_checkpoint,
                 "blocks": audit["blocks"], "rows": audit["rows"]},
         }, f, indent=2)
-    print(f"\nWrote {out}")
+    log.info(f"\nWrote {out}")
 
 
 if __name__ == "__main__":

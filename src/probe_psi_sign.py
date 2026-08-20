@@ -53,6 +53,9 @@ import numpy as np
 import torch
 
 import matplotlib
+from utils.logger import get_logger
+
+log = get_logger(__name__)
 matplotlib.use("Agg")
 
 from analysis.instructions import DEFAULT_INSTRUCTIONS, resolve_targets
@@ -64,10 +67,10 @@ from model.body_groups import group_names, resolve_group_context
 from model.schedule import NoiseSchedule
 from model.text_encoder import build_text_encoder
 from training.grounding import resolve_readout_layers
-from utils.cli import add_data_args, add_mask_args, add_model_args, resolve_device
+from utils.cli import add_data_args, add_logging_args, add_mask_args, add_model_args, configure_logging, resolve_device
 from utils.model_io import load_model
 from utils.probe import flat_corr, group_profile, resolve_sweeps, source_activity
-from utils.visualise.masks import plot_psi_sign
+from utils.visualise import plot_psi_sign
 
 PSI_READOUTS = ("abs", "energy")
 
@@ -82,7 +85,8 @@ def parse_args():
                    help="Clip id in <data_root>/new_joint_vecs. Repeat for several.")
     p.add_argument("--no_figures", action="store_true")
     p.add_argument("--out_dir", default="eval_results/psi_sign")
-    return p.parse_args()
+    add_logging_args(p)
+    return configure_logging(p.parse_args())
 
 
 def sign_stats(energy_maps, src_act, glabels, targets, valid) -> list[dict]:
@@ -250,9 +254,9 @@ def probe_one(ckpt, clip, args, device) -> dict:
 
 
 def print_report(results):
-    print("\n── H1/H2: the sign of the energy change ────────────────────────────")
-    print("  H1: ΔE at the TARGET group > 0        H2: corr(source energy, ΔE) < 0 off-target")
-    print(f"\n  {'clip':8} {'instruction':24} {'ΔE target':>10} {'ΔE other':>10} "
+    log.section("H1/H2: the sign of the energy change")
+    log.info("  H1: ΔE at the TARGET group > 0        H2: corr(source energy, ΔE) < 0 off-target")
+    log.info(f"\n  {'clip':8} {'instruction':24} {'ΔE target':>10} {'ΔE other':>10} "
           f"{'ΔE other (src-w)':>17} {'corr H2':>9}")
     h1 = h2 = n = 0
     for d in results:
@@ -260,37 +264,37 @@ def print_report(results):
             h1 += s["delta_energy_target"] > 0
             h2 += s["corr_src_vs_delta_nontarget"] < 0
             n += 1
-            print(f"  {d['clip']:8} {instr:24} {s['delta_energy_target']:+10.4f} "
+            log.info(f"  {d['clip']:8} {instr:24} {s['delta_energy_target']:+10.4f} "
                   f"{s['delta_energy_other']:+10.4f} "
                   f"{s['delta_energy_other_src_weighted']:+17.4f} "
                   f"{s['corr_src_vs_delta_nontarget']:+9.3f}")
-    print(f"\n  H1 holds in {h1}/{n} cases;  H2 holds in {h2}/{n} cases")
+    log.info(f"\n  H1 holds in {h1}/{n} cases;  H2 holds in {h2}/{n} cases")
     corrs = [s["corr_src_vs_delta_nontarget"] for d in results for s in d["sign"]
              if np.isfinite(s["corr_src_vs_delta_nontarget"])]
-    print(f"  mean corr(source energy, ΔE) over non-target groups = {np.mean(corrs):+.3f}")
+    log.info(f"  mean corr(source energy, ΔE) over non-target groups = {np.mean(corrs):+.3f}")
 
-    print("\n── does the signed read-out fix the mask? (alignment, chance "
-          f"{results[0]['align_chance']:.3f}) ──")
+    log.section(f"does the signed read-out fix the mask? "
+                f"(alignment, chance {results[0]['align_chance']:.3f})")
     keys = ["m2_only_abs", "m2_only_energy", "m1_only", "attn_abs", "attn_energy",
             "attn_energy_matched"]
-    print(f"\n  {'clip':8} " + " ".join(f"{k:>19}" for k in keys))
+    log.info(f"\n  {'clip':8} " + " ".join(f"{k:>19}" for k in keys))
     for d in results:
-        print(f"  {d['clip']:8} "
+        log.info(f"  {d['clip']:8} "
               + " ".join(f"{np.mean(d['align'][k]):19.3f}" for k in keys))
-    print(f"  {'MEAN':8} "
+    log.info(f"  {'MEAN':8} "
           + " ".join(f"{np.mean([np.mean(d['align'][k]) for d in results]):19.3f}"
                      for k in keys))
-    print(f"  {'recall':8} "
+    log.info(f"  {'recall':8} "
           + " ".join(f"{np.mean([np.mean(d['recall'][k]) for d in results]):19.3f}"
                      for k in keys))
-    print(f"  {'cells':8} "
+    log.info(f"  {'cells':8} "
           + " ".join(f"{np.mean([d['cells'][k] for d in results]):19.0f}" for k in keys))
-    print("\n  alignment = precision (share of mask cells inside the target group);\n"
+    log.info("\n  alignment = precision (share of mask cells inside the target group);\n"
           "  recall    = share of the target group's cells kept. A sparser mask buys\n"
           "  precision for free, which is what `attn_energy_matched` controls for.")
-    print("\n  ψ map statistics (r → 1 = ignores the instruction):")
+    log.info("\n  ψ map statistics (r → 1 = ignores the instruction):")
     for r in PSI_READOUTS:
-        print(f"    {r:7} r_lat {np.mean([d['r_laterality'][r] for d in results]):.3f}   "
+        log.info(f"    {r:7} r_lat {np.mean([d['r_laterality'][r] for d in results]):.3f}   "
               f"r_cat {np.mean([d['r_category'][r] for d in results]):.3f}   "
               f"corr with source motion {np.mean([d['src_corr'][r] for d in results]):+.3f}")
 
@@ -299,13 +303,13 @@ def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
     device = resolve_device(args.device)
-    print(f"Device: {device}")
+    log.info(f"Device: {device}")
 
     results = []
     for ckpt in args.checkpoint:
         tag = os.path.basename(os.path.dirname(ckpt.rstrip("/"))) or "ckpt"
         for clip in args.clip:
-            print(f"\n── {tag}  clip {clip} ──")
+            log.section(f"{tag}  clip {clip}")
             res = probe_one(ckpt, clip, args, device)
             if not args.no_figures:
                 # The last panel shows the mask this probe actually recommends — the
@@ -322,7 +326,7 @@ def main():
             with open(out, "w") as f:
                 json.dump({k: v for k, v in res.items() if not k.startswith("_")},
                           f, indent=2)
-            print(f"  wrote {out}")
+            log.info(f"  wrote {out}")
             results.append(res)
 
     print_report(results)

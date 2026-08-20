@@ -1,9 +1,8 @@
 """
 Visualise "the mask problem" — why the implicit LEDITS++ masks fail.
 
-The core negative result of this project (docs/FINDINGS.md, docs/PROGRESS.md "Open
-problems") is that both implicit masks are *source-dynamics-driven, not
-instruction-driven*:
+The core negative result: both implicit masks are SOURCE-DYNAMICS-DRIVEN, not
+instruction-driven.
 
   M1 (cross-attention)  — meant to answer "which body-part group does the edit TEXT
                           attend to?", but the readout is nearly invariant to the
@@ -52,6 +51,9 @@ import numpy as np
 import torch
 
 import matplotlib
+from utils.logger import get_logger
+
+log = get_logger(__name__)
 matplotlib.use("Agg")
 
 from analysis.instructions import DEFAULT_INSTRUCTIONS, resolve_targets
@@ -62,7 +64,7 @@ from model.body_groups import GROUP_NAMES, group_names, resolve_group_context
 from model.schedule import NoiseSchedule
 from model.text_encoder import build_text_encoder
 from training.grounding import resolve_readout_layers
-from utils.cli import add_data_args, add_mask_args, add_model_args, resolve_device
+from utils.cli import add_data_args, add_logging_args, add_mask_args, add_model_args, configure_logging, resolve_device
 from utils.decode import smplh_body_model
 from utils.model_io import load_model
 from utils.probe import flat_corr, pairwise_corr, resolve_sweeps, source_activity
@@ -89,18 +91,19 @@ def parse_args():
                    choices=["raw", "renorm", "spatial", "renorm_spatial"],
                    help="M1 per-cell attention readout (see masking.collect_statistics).")
     p.add_argument("--out_dir", default="eval_results/mask_problem")
-    return p.parse_args()
+    add_logging_args(p)
+    return configure_logging(p.parse_args())
 
 
 def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
     device = resolve_device(args.device)
-    print(f"Device: {device}")
+    log.info(f"Device: {device}")
 
     model, config = load_model(args.checkpoint, device=device, use_ema=not args.no_ema)
     feature_mode, is_group, group_mode, _ = resolve_group_context(config)
-    print(f"feature_mode={feature_mode}  arch={config.get('arch', 'dit')}  "
+    log.info(f"feature_mode={feature_mode}  arch={config.get('arch', 'dit')}  "
           f"is_group={is_group}  group_mode={group_mode}")
     if feature_mode == "smplh":
         smplh_body_model(args.smplh_model_path)
@@ -119,23 +122,23 @@ def main():
         args.source, args.data_root, args.split, args.max_frames)
     x0 = torch.from_numpy((raw_feat - mean) / std).float().unsqueeze(0).to(device)
     valid_frames = torch.ones(F, dtype=torch.bool, device=device)
-    print(f"Source: {clip_id}  ({F} frames)   prompt: {caption!r}\n"
+    log.info(f"Source: {clip_id}  ({F} frames)   prompt: {caption!r}\n"
           f"instructions: {instructions}")
 
     editor = MotionEditor(model, schedule, device, is_group=is_group,
                           edit_space=args.edit_space, psi_readout=args.psi_readout,
                           attn_layers=resolve_readout_layers(config, args.m1_layers))
-    print(f"predict_type={schedule.predict_type}  edit_space={editor.edit_space} "
+    log.info(f"predict_type={schedule.predict_type}  edit_space={editor.edit_space} "
           f"(ψ read as {'|x̂0_c − x̂0_ref|' if editor.edit_space == 'x0' else '|ε_c − ε_ref|'})")
     glabels = group_names(group_mode) if is_group else ["all"]
     src_act = source_activity(x0, editor.group_channels, is_group)   # (F, G) reference
 
-    print("Stage 1: inversion …")
+    log.info("Stage 1: inversion …")
     state = editor.invert(x0, seed=args.seed)
 
     sweeps = resolve_sweeps(args.mask_timesteps, schedule.T, args.m1_window, args.m2_window)
     if args.m1_window or args.m2_window or args.per_step_norm:
-        print(f"sweep: M1 {args.m1_window or 'full'}  M2 {args.m2_window or 'full'}  "
+        log.info(f"sweep: M1 {args.m1_window or 'full'}  M2 {args.m2_window or 'full'}  "
               f"per_step_norm={args.per_step_norm}")
 
     columns = {}
@@ -146,12 +149,12 @@ def main():
         per_step_norm=args.per_step_norm, column_mode=args.m1_columns, config=config,
         group_mode=group_mode, columns_out=columns)
     bin_maps = binaries[args.mask_mode]
-    print(f"M1 columns ({args.m1_columns}): "
+    log.info(f"M1 columns ({args.m1_columns}): "
           + ", ".join(f"{e!r}->{m}" for e, (m, _) in columns.items())
           + f"   ψ read-out: {editor.psi_readout}")
     for e, b in zip(instructions, bin_maps):
         cells, frames = active_cells(b)
-        print(f"  {e!r}: mask {cells} active cells, {frames}/{F} frames")
+        log.info(f"  {e!r}: mask {cells} active cells, {frames}/{F} frames")
 
     m1_src = [flat_corr(m, src_act) for m in m1_maps]
     m2_src = [flat_corr(m, src_act) for m in m2_maps]
@@ -165,14 +168,14 @@ def main():
     plot_mask_quant(clip_id, caption, instructions, m1_corr, m2_corr, m1_src, m2_src,
                     base + "_quant.png")
 
-    print("\n── summary ─────────────────────────────────────────────")
+    log.section("summary")
     if len(instructions) > 1:
-        print("instruction-invariance (mean off-diagonal r):  "
+        log.info("instruction-invariance (mean off-diagonal r):  "
               f"M1 {mean_off_diagonal(m1_corr):.3f}   M2 {mean_off_diagonal(m2_corr):.3f}"
               "   (→1 = mask ignores the instruction)")
-    print(f"mask↔source-motion corr (mean over instr.):    M1 {np.mean(m1_src):.3f}   "
+    log.info(f"mask↔source-motion corr (mean over instr.):    M1 {np.mean(m1_src):.3f}   "
           f"M2 {np.mean(m2_src):.3f}   (→1 = source-dynamics detector)")
-    print(f"body-part axis present (G={len(glabels)}): laterality/limb overlay in red."
+    log.info(f"body-part axis present (G={len(glabels)}): laterality/limb overlay in red."
           if is_group else "flat model (G=1): temporal-only, body-part overlay omitted.")
 
 

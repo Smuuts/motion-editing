@@ -25,12 +25,15 @@ import json
 
 import torch
 import matplotlib
+from utils.logger import get_logger
+
+log = get_logger(__name__)
 matplotlib.use("Agg")
 
 from model.text_encoder import build_text_encoder
 from model.schedule import NoiseSchedule
 from data.dataset import build_dataloader
-from utils.cli import resolve_device
+from utils.cli import add_logging_args, configure_logging, resolve_device
 from utils.skeleton import compute_mpjpe
 from utils.model_io import load_model
 from utils.padding import length_to_mask
@@ -50,7 +53,8 @@ def parse_args():
     p.add_argument("--noise_levels",  type=int, nargs="+",
                    default=[50, 100, 250, 500, 750, 999],
                    help="Timesteps at which to evaluate one-step reconstruction.")
-    return p.parse_args()
+    add_logging_args(p)
+    return configure_logging(p.parse_args())
 
 
 def main():
@@ -58,14 +62,14 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     device = resolve_device()
-    print(f"Device: {device}")
+    log.info(f"Device: {device}")
 
     model, config = load_model(args.checkpoint, device)
     feature_mode = config.get("feature_mode", "humanml3d")
     timesteps    = config.get("timesteps", 1000)
-    print(f"Model:         {type(model).__name__}")
-    print(f"Feature mode:  {feature_mode}")
-    print(f"Noise steps:   {timesteps}")
+    log.info(f"Model:         {type(model).__name__}")
+    log.info(f"Feature mode:  {feature_mode}")
+    log.info(f"Noise steps:   {timesteps}")
 
     # from_config so an x0-trained checkpoint (predict_type) is interpreted correctly;
     # missing key -> "eps", i.e. unchanged for every existing checkpoint.
@@ -109,12 +113,12 @@ def main():
     B        = motions.shape[0]
 
     attn_mask = length_to_mask(lengths, motions.shape[1])
-    print(f"\nTesting on {B} validation clips\n")
+    log.info(f"\nTesting on {B} validation clips\n")
 
     # ── One-step x̂₀ reconstruction across noise levels ────────────────────────
     header = f"{'t':>6}  {'MPJPE cond':>12}  {'MPJPE uncond':>14}  {'noise MSE cond':>16}"
-    print(header)
-    print("-" * len(header))
+    log.info(header)
+    log.info("-" * len(header))
 
     results: dict[int, dict] = {}
     with torch.no_grad():
@@ -123,7 +127,7 @@ def main():
             x_t, noise = schedule.q_sample(motions, t_batch)
 
             # Conditional: uses text embeddings. to_eps/to_x0 are identities for an
-            # eps-head; for an x0-head (Option 5) they convert, so the noise-MSE and
+            # eps-head; for an x0-head they convert, so the noise-MSE and
             # MPJPE checks below stay the same quantities across parameterisations.
             eps_c  = schedule.to_eps(model(x_t, t_batch, contexts, mask=attn_mask),
                                      x_t, t_batch)
@@ -148,7 +152,7 @@ def main():
             ).item()
 
             results[t_val] = {"cond": mpjpe_c, "uncond": mpjpe_u, "noise_mse": mse}
-            print(f"{t_val:6d}  {mpjpe_c:12.4f}m  {mpjpe_u:14.4f}m  {mse:16.6f}")
+            log.info(f"{t_val:6d}  {mpjpe_c:12.4f}m  {mpjpe_u:14.4f}m  {mse:16.6f}")
 
     # ── Save results JSON ──────────────────────────────────────────────────────
     with open(os.path.join(args.output_dir, "results.json"), "w") as f:
@@ -167,24 +171,22 @@ def main():
     mpjpe_ok  = mpjpe_low_t < 0.15
     mse_ok    = mse_500 < 0.50
 
-    print(f"\n{'='*56}")
-    print("LEDITS++ prerequisite check")
-    print(f"{'='*56}")
+    log.section("LEDITS++ prerequisite check")
     # Report the actual parameterisation — the checks above are run in eps space via
     # schedule.to_eps either way, but an x0 checkpoint is not an eps model.
-    print(f"  Architecture:  {type(model).__name__} "
+    log.info(f"  Architecture:  {type(model).__name__} "
           f"({schedule.predict_type}-prediction)  ✓")
-    print(f"  Feature mode:  {feature_mode}")
-    print(f"  MPJPE at t={best_t:3d} [cond]    {mpjpe_low_t:.4f} m   "
+    log.info(f"  Feature mode:  {feature_mode}")
+    log.info(f"  MPJPE at t={best_t:3d} [cond]    {mpjpe_low_t:.4f} m   "
           f"[{'PASS' if mpjpe_ok  else 'REVIEW'} — threshold 0.15 m]")
-    print(f"  Noise MSE at t=500          {mse_500:.6f}     "
+    log.info(f"  Noise MSE at t=500          {mse_500:.6f}     "
           f"[{'PASS' if mse_ok else 'REVIEW'} — threshold 0.50]")
-    print(f"  Output:        {args.output_dir}/")
+    log.info(f"  Output:        {args.output_dir}/")
     if mpjpe_ok and mse_ok:
-        print("  Overall: PASS — backbone ready for LEDITS++ inversion (Phase 1)")
+        log.info("  Overall: PASS — backbone ready for LEDITS++ inversion (Phase 1)")
     else:
-        print("  Overall: REVIEW — consider more training before implementing inversion")
-    print(f"{'='*56}")
+        log.info("  Overall: REVIEW — consider more training before implementing inversion")
+    log.rule()
 
 
 if __name__ == "__main__":

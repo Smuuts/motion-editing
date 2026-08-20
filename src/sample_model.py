@@ -19,6 +19,9 @@ import torch
 from scipy.ndimage import gaussian_filter1d
 
 import matplotlib
+from utils.logger import get_logger
+
+log = get_logger(__name__)
 matplotlib.use("Agg")
 
 from data.clips import iter_split_clips
@@ -72,7 +75,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     device = resolve_device()
-    print(f"Device: {device}")
+    log.info(f"Device: {device}")
 
     model, config = load_model(args.checkpoint, device=device, use_ema=not args.no_ema)
     feature_mode = config.get("feature_mode", "humanml3d")
@@ -86,18 +89,18 @@ def main():
     if args.num_samples > 0:
         items = load_val_samples(args.data_root, args.split, args.num_samples,
                                  seed=args.seed)
-        print(f"\nValidation-set mode: {len(items)} clips from '{args.split}' split\n")
+        log.info(f"\nValidation-set mode: {len(items)} clips from '{args.split}' split\n")
     else:
         if not args.prompts:
             parser.error("--prompts is required when --num_samples is 0.")
         items = [{"clip_id": None, "text": p, "raw_feat": None, "length": None}
                  for p in args.prompts]
-        print(f"\nPrompt mode: {len(items)} prompts\n")
+        log.info(f"\nPrompt mode: {len(items)} prompts\n")
 
     for i, item in enumerate(items):
         prompt  = item["text"]
         clip_id = item["clip_id"] or f"prompt_{i:03d}"
-        print(f"[{i+1}/{len(items)}] '{prompt}'")
+        log.info(f"[{i+1}/{len(items)}] '{prompt}'")
 
         with torch.no_grad():
             context = text_encoder.encode([prompt])
@@ -120,13 +123,13 @@ def main():
         if args.smooth_sigma > 0:
             joints_gt = gaussian_filter1d(joints_gt, sigma=args.smooth_sigma, axis=0)
         per_frame, total_mpjpe, T_common = mpjpe_from_joints(joints_gen, joints_gt)
-        print(f"   MPJPE: {total_mpjpe*1000:.1f} mm  (over {T_common} frames)")
+        log.info(f"   MPJPE: {total_mpjpe*1000:.1f} mm  (over {T_common} frames)")
         save_comparison_animation(
             joints_gen, joints_gt, per_frame, total_mpjpe,
             os.path.join(args.output_dir, f"{i:03d}_{clip_id}_{slug}.mp4"),
             title=prompt, clip_id=clip_id)
 
-    print(f"\nDone. Results saved to: {args.output_dir}/")
+    log.info(f"\nDone. Results saved to: {args.output_dir}/")
 
 
 if __name__ == "__main__":

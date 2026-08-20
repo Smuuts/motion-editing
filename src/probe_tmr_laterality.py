@@ -1,13 +1,13 @@
 """
 Does MotionFix's TMR retrieval model encode LEFT vs RIGHT?
 
-Gate test for queue item F.14 (frozen-detector classifier guidance). Every mask signal read
-out of the diffusion backbone has been measured to be laterality-blind — attention, ψ,
-self-attention, every readout variant, every noise window, disattenuated r ≈ 1.0 throughout
-(docs/FINDINGS.md). F.14 proposes using a frozen external model instead, with TMR the obvious
-candidate since it is already in the eval stack. That only makes sense if TMR itself can tell
-left from right, and this test answers that in forward passes only — no differentiable decode
-path, no gradients, no SMPL-H x0 checkpoint needed, all of which F.14 proper would require.
+The gate test for frozen-detector classifier guidance. Every mask signal read out of the
+diffusion backbone has been measured to be laterality-blind — attention, psi,
+self-attention, every read-out variant, every noise window, disattenuated r ~ 1.0
+throughout. Using a frozen external model instead only makes sense if that model can tell
+left from right, and TMR is the obvious candidate since it is already in the eval stack.
+This answers the question in forward passes only — no differentiable decode path, no
+gradients, no SMPL-H x0 checkpoint — all of which the full method would require.
 
 DESIGN
 ------
@@ -51,6 +51,10 @@ import argparse
 
 import numpy as np
 import torch
+from utils.logger import get_logger
+from utils.cli import add_logging_args, configure_logging
+
+log = get_logger(__name__)
 
 src_dir = os.path.dirname(os.path.abspath(__file__))
 if src_dir not in sys.path:
@@ -86,7 +90,8 @@ def parse_args():
                    help="Feed the clips at --src_fps (ablation for the fps handling).")
     p.add_argument("--out", default="eval_results/tmr_laterality")
     p.add_argument("--device", default=None)
-    return p.parse_args()
+    add_logging_args(p)
+    return configure_logging(p.parse_args())
 
 
 def swap_words(text, pairs):
@@ -196,7 +201,7 @@ def main():
     args = parse_args()
     os.makedirs(args.out, exist_ok=True)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    print(f"Device: {device}")
+    log.info(f"Device: {device}")
 
     with open(os.path.join(args.data_root, f"{args.split}.txt")) as f:
         ids = [l.strip() for l in f if l.strip()]
@@ -221,10 +226,10 @@ def main():
             break
     if len(clips) < 4:
         raise SystemExit(f"only {len(clips)} usable clips found — loosen the filters")
-    print(f"{len(clips)} clips with a side word + a limb word in the caption\n")
+    log.info(f"{len(clips)} clips with a side word + a limb word in the caption\n")
 
     motion_enc, text_enc, (mean, std), text_to_emb = load_tmr(device)
-    print("TMR loaded from eval-deps/last_weights (motion 135->256, text 768->256)\n")
+    log.info("TMR loaded from eval-deps/last_weights (motion 135->256, text 768->256)\n")
 
     ids_, caps, feats_o, feats_m = [], [], [], []
     for cid, cap, feats in clips:
@@ -237,7 +242,7 @@ def main():
 
     caps_lat = [swap_words(c, _LAT) for c in caps]          # side flipped
     caps_cat = [swap_words(c, _LIMB) for c in caps]         # limb flipped
-    print(f"example:\n  T   {caps[0]!r}\n  T'  {caps_lat[0]!r}\n  T'' {caps_cat[0]!r}\n")
+    log.info(f"example:\n  T   {caps[0]!r}\n  T'  {caps_lat[0]!r}\n  T'' {caps_cat[0]!r}\n")
 
     emb_o = encode_seq(motion_enc, *pad_stack(feats_o, device)[:2], device)
     emb_m = encode_seq(motion_enc, *pad_stack(feats_m, device)[:2], device)
@@ -254,10 +259,10 @@ def main():
     rank_m2t = (S > S[np.arange(n), np.arange(n)][:, None]).sum(1)
     rank_t2m = (S.T > S[np.arange(n), np.arange(n)][:, None]).sum(1)
     r_at = lambda r, k: float((r < k).mean())
-    print("── retrieval sanity (does a clip retrieve its own caption?) ───────────")
-    print(f"  motion->text  R@1 {r_at(rank_m2t,1):.3f}  R@3 {r_at(rank_m2t,3):.3f}  "
+    log.section("retrieval sanity (does a clip retrieve its own caption?)")
+    log.info(f"  motion->text  R@1 {r_at(rank_m2t,1):.3f}  R@3 {r_at(rank_m2t,3):.3f}  "
           f"R@10 {r_at(rank_m2t,10):.3f}   (chance R@1 = {1/n:.3f})")
-    print(f"  text->motion  R@1 {r_at(rank_t2m,1):.3f}  R@3 {r_at(rank_t2m,3):.3f}  "
+    log.info(f"  text->motion  R@1 {r_at(rank_t2m,1):.3f}  R@3 {r_at(rank_t2m,3):.3f}  "
           f"R@10 {r_at(rank_t2m,10):.3f}")
 
     # ── 2. does the motion embedding separate a clip from its mirror? ──────────
@@ -265,10 +270,10 @@ def main():
     # baseline: similarity to an unrelated clip, to read cos_mm against
     off = cos_sim(emb_o, emb_o).cpu().numpy()
     other = off[~np.eye(n, dtype=bool)].mean()
-    print("\n── motion embedding: clip vs its own mirror ───────────────────────────")
-    print(f"  cos(M, M')          {cos_mm.mean():.4f}  (min {cos_mm.min():.4f}, "
+    log.section("motion embedding: clip vs its own mirror")
+    log.info(f"  cos(M, M')          {cos_mm.mean():.4f}  (min {cos_mm.min():.4f}, "
           f"max {cos_mm.max():.4f})")
-    print(f"  cos(M, other clip)  {other:.4f}   <- the scale: 1.0 would mean 'identical'")
+    log.info(f"  cos(M, other clip)  {other:.4f}   <- the scale: 1.0 would mean 'identical'")
 
     # ── 3. the paired contrasts ───────────────────────────────────────────────
     d = lambda a, b: (torch.nn.functional.cosine_similarity(a, b, dim=-1)).cpu().numpy()
@@ -277,18 +282,18 @@ def main():
     d_lat = s_o_o - s_o_lat                 # original clip prefers its own side word?
     d_lat_m = s_m_lat - s_m_o               # mirrored clip prefers the swapped word?
     d_cat = s_o_o - s_o_cat                 # calibration: limb word
-    print("\n── paired contrasts (>0 = TMR prefers the CORRECT word) ───────────────")
-    print(f"  d_cat  limb  swap, original : {d_cat.mean():+.4f}  "
+    log.section("paired contrasts (>0 = TMR prefers the CORRECT word)")
+    log.info(f"  d_cat  limb  swap, original : {d_cat.mean():+.4f}  "
           f"(positive on {int((d_cat>0).sum())}/{n})")
-    print(f"  d_lat  side  swap, original : {d_lat.mean():+.4f}  "
+    log.info(f"  d_lat  side  swap, original : {d_lat.mean():+.4f}  "
           f"(positive on {int((d_lat>0).sum())}/{n})")
-    print(f"  d_lat' side  swap, mirrored : {d_lat_m.mean():+.4f}  "
+    log.info(f"  d_lat' side  swap, mirrored : {d_lat_m.mean():+.4f}  "
           f"(positive on {int((d_lat_m>0).sum())}/{n})")
     combined = (d_lat + d_lat_m) / 2
-    print(f"  laterality, mirror-paired   : {combined.mean():+.4f}  "
+    log.info(f"  laterality, mirror-paired   : {combined.mean():+.4f}  "
           f"(positive on {int((combined>0).sum())}/{n})")
     ratio = combined.mean() / d_cat.mean() if abs(d_cat.mean()) > 1e-9 else float("nan")
-    print(f"\n  laterality / category effect ratio: {ratio:.2f}   "
+    log.info(f"\n  laterality / category effect ratio: {ratio:.2f}   "
           f"(≈1 ⇒ TMR reads sides as well as limbs; ≈0 ⇒ laterality-blind)")
 
     res = {
@@ -310,7 +315,7 @@ def main():
     path = os.path.join(args.out, f"tmr_laterality_{args.split}.json")
     with open(path, "w") as f:
         json.dump(res, f, indent=2)
-    print(f"\nWrote {path}")
+    log.info(f"\nWrote {path}")
 
 
 if __name__ == "__main__":

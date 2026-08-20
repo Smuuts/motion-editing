@@ -18,6 +18,7 @@ import argparse
 
 from training.config import print_config, resolve_config, save_config
 from training.trainer import Trainer
+from utils.cli import add_logging_args, configure_logging
 
 
 def build_parser():
@@ -66,11 +67,11 @@ def build_parser():
                    help="Cross-attention entropy regulariser: loss -= w * H(attn), "
                         "encouraging queries to spread over words instead of collapsing "
                         "onto one key. 0 disables (default); measured NEGATIVE at 0.01 "
-                        "(docs/FINDINGS.md). Also forces the explicit attention path.")
-    # ── attention grounding (TokenCompose L_token, Option 1) ───────────────────
+                        "(measured). Also forces the explicit attention path.")
+    # ── attention grounding (TokenCompose L_token) ─────────────────────────────
     # All default off, so a run that does not pass --attn_ground_weight is byte-identical
     # to one from before these flags existed. See src/training/grounding.py and
-    # docs/TokenCompose_Handoff.md.
+    # See training/grounding.py for the loss itself.
     p.add_argument("--attn_ground_weight", type=float, default=0.0,
                    help="TokenCompose cross-attention grounding loss: the text columns "
                         "spelling out a body part must put their attention on that "
@@ -138,14 +139,14 @@ def build_parser():
                    help="Mask padding keys in cross-attention (default on). Without it "
                         "zero-embedding pad columns absorb ~93%% of attention mass and "
                         "attenuate text conditioning ~14x ('padding sink', "
-                        "docs/FINDINGS.md). No-op with --text_encoder clip. Old "
+                        "measured). No-op with --text_encoder clip. Old "
                         "checkpoints load with it off automatically.")
 
     # ── diffusion ──────────────────────────────────────────────────────────────
     p.add_argument("--predict_type", type=str, default="eps", choices=["eps", "x0"],
                    help="What the output head predicts. 'eps' (default) is "
                         "noise-prediction; 'x0' regresses the clean motion directly "
-                        "(Option 5, docs/AttentionGrounding_Options.md) — the "
+                        "— the "
                         "eps-objective discounts high-noise steps, which is exactly "
                         "where the caption is the only information present. Flips "
                         "Min-SNR off and drops the geometric confidence weight "
@@ -206,8 +207,8 @@ def build_parser():
 
 
 def main():
-    parser = build_parser()
-    config = resolve_config(parser, parser.parse_args())
+    parser = add_logging_args(build_parser())
+    config = resolve_config(parser, configure_logging(parser.parse_args()))
     print_config(config)
     save_config(config, config["output_dir"])
     Trainer(config).run()

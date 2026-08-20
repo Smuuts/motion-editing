@@ -1,75 +1,54 @@
 """
-Option 6 gate — does DIFFING two shared-noise generations localise the instruction?
+Does DIFFING two shared-noise generations localise the instruction?
 
-The premise (docs/AttentionGrounding_Options.md "Option 6"): this backbone's generation
-path is measured-good while its editing conditioner on inverted latents is measured-blind
-to the instruction, so take the mask from the strong pathway — generate under the edit
-instruction and under a reference prompt from ONE shared noise path, and read the group
-selector off the difference. Nothing is trained, nothing is inverted, and no attention is
-read; the whole route is gated on one question nobody has asked this checkpoint:
+The premise: this backbone's generation path is measured-good while its editing
+conditioner on inverted latents is measured-blind to the instruction. So take the mask
+from the strong pathway — generate under the edit instruction and under a reference
+prompt from ONE shared noise path, and read the group selector off the difference.
+Nothing is trained, nothing is inverted, and no attention is read; the whole route is
+gated on one question nobody has asked this checkpoint:
 
-    **does our own generator carry left/right at all?**
+    does our own generator carry left/right at all?
 
-If it does, Option 6 hands us an automatic instruction-driven mask on a frozen backbone.
-If it does not, that is the cleaner finding — laterality is absent from the *weights*, not
-merely from the editing read-out — and Option 1 (attention supervision) is confirmed
-mandatory. Either way this script is the answer; it is item 3 of the ranked to-do.
+If it does, this hands us an automatic instruction-driven mask on a frozen backbone. If
+it does not, that is the cleaner finding — laterality is absent from the WEIGHTS, not
+merely from the editing read-out — and attention supervision is confirmed mandatory.
 
-WHAT IS MEASURED
-----------------
-The four contrasting instructions every probe in this project uses (two laterality pairs
-× two limb categories), so the numbers land in the same table as M1/M2's. For each,
-three read-outs of the same generations — the point is that the last two are controls that
-can take the result away from Option 6:
+WHAT IS MEASURED. The four contrasting instructions every probe here uses (two
+laterality pairs x two limb categories), so the numbers land in the same table as
+M1/M2's. Three read-outs of the same generations, the last two being controls that can
+take the result away:
 
-  paired    D = |g_instruction − g_reference|, SHARED noise      ← the Option 6 statistic
-  energy    the generation's own |Δ| motion energy              ← does differencing add
-                                                                   anything over just
-                                                                   looking at the sample?
-  unpaired  the same difference against a reference from a       ← does the shared noise
-            DIFFERENT seed                                          do any work?
+  paired    D = |g_instruction - g_reference|, SHARED noise     <- the statistic itself
+  energy    the generation's own |delta| motion energy          <- does differencing add
+                                                                  anything over just
+                                                                  looking at the sample?
+  unpaired  the same difference against a reference from a      <- does the shared noise
+            DIFFERENT seed                                         do any work?
 
-each scored in decoded joint space and in normalised feature space, and each reported as:
+each scored in decoded joint space and in normalised feature space, and each reported as
+lat_acc / cat_acc (forced choices, chance 0.5), top1 and align (chance 1/G), plus
+r_lat/r_cat instruction-invariance. Both forced choices are between two options over an
+instruction set symmetric in side and in limb, so a constant preference ("always left")
+scores exactly chance and cannot fake a pass.
 
-  lat_acc   does the mask put more mass on the named side than on its mirror?  chance 0.5
-  cat_acc   … on the named limb pair than on the other pair?                   chance 0.5
-  top1      is the biggest group the instructed one?                        chance 1/G
-  align     share of the thresholded mask's cells in the instructed group,   chance 1/G
-            cut with the editor's own percentile threshold (comparable to algM1/algM2)
-  r_lat/r_cat  instruction-invariance on the two axes (→1 = ignores the instruction)
+Controls: the batch carries the reference prompt TWICE and those two rows must come out
+bit-identical (D == 0) — the proof the noise really is shared, without which every paired
+number is meaningless. `D~act` reports how much D just tracks the reference generation's
+motion energy.
 
-Both forced choices are between two options over an instruction set that is symmetric in
-side and in limb, so a constant preference ("always left") scores exactly chance and
-cannot fake a pass — the same design rule as `probe_scorer_laterality.py`.
-
-Controls: the batch carries the reference prompt TWICE, and those two rows must come out
-bit-identical (D ≡ 0) — that is the proof the noise really is shared, without which every
-paired number is meaningless. `D~act` reports how much D just tracks the reference
-generation's motion energy.
-
-One honest caveat on the default reference: a null context makes `eps_cond == eps_uncond`
-for that row, so the reference is generated *unguided* while the instruction rows carry
-the CFG scale. D therefore mixes "what the text does" with "what guidance does" — but
+One honest caveat on the default reference: a null context makes eps_cond == eps_uncond
+for that row, so the reference is generated UNGUIDED while the instruction rows carry the
+CFG scale. D therefore mixes "what the text does" with "what guidance does" — but
 guidance points along the text direction by construction, so it amplifies the real
 localisation rather than inventing one. `--reference caption` puts both rows on the same
-guidance footing if that matters for a given question.
+guidance footing.
 
-Usage
------
-    # the gate, on the best generator in the project
     python src/probe_gen_diff.py --checkpoint runs/exp_hml3d_x0/checkpoint_latest \\
         --data_root data/HumanML3D/HumanML3D --seeds 5
-
-    # the realistic editing setting: instructions composed onto a source clip's caption
-    python src/probe_gen_diff.py --checkpoint runs/exp_hml3d_x0/checkpoint_latest \\
-        --data_root data/HumanML3D/HumanML3D --clip 012698 --reference caption --compose
-
-    # the phrasing control — same four contrasts, worded like a HumanML3D caption
-    python src/probe_gen_diff.py --checkpoint runs/exp_hml3d_x0/checkpoint_latest \\
-        --data_root data/HumanML3D/HumanML3D --seeds 25 --phrasing descriptive
-
-The default reference is the model's null context, i.e. "what does this model generate
-from this noise when told nothing" — the cleanest baseline for the gating question.
+    # instructions composed onto a source clip's caption (the realistic editing setting)
+    python src/probe_gen_diff.py --checkpoint ... --data_root ... --clip 012698 \\
+        --reference caption --compose
 """
 
 import os
@@ -83,19 +62,24 @@ from analysis.gen_diff import (
     feature_divergence, joint_divergence, part_channels, readout_stats,
     temporal_activity, verdict,
 )
+from analysis.gen_diff_report import (family_label, print_reading, print_table,
+                                      print_verdicts)
 from analysis.instructions import DEFAULT_TARGETS, PHRASINGS
 from data.clips import read_caption
 from model.body_groups import GROUP_NAMES
 from model.sampler import DDPMSampler
 from model.schedule import NoiseSchedule
 from model.text_encoder import build_text_encoder
-from utils.cli import add_data_args, add_model_args, resolve_device
+from utils.cli import add_data_args, add_logging_args, add_model_args, configure_logging, resolve_device
 from utils.decode import recover_joints, smplh_body_model
+from utils.logger import get_logger
 from utils.model_io import load_model
 from utils.probe import flat_corr
 from utils.visualise import plot_gen_diff, plot_gen_diff_summary
 
-# Read-out families, in report order. The first is Option 6's own statistic; the other
+log = get_logger(__name__)
+
+# Read-out families, in report order. The first is the statistic itself; the other
 # two are the controls that decide whether it is doing anything the samples don't
 # already say on their own.
 READOUTS = ("paired", "energy", "unpaired")
@@ -132,7 +116,8 @@ def parse_args():
                    help="Percentile threshold for the alignment number (higher = "
                         "sparser), matching the editor's --lambda_noise default.")
     p.add_argument("--out_dir", default="eval_results/gen_diff")
-    return p.parse_args()
+    add_logging_args(p)
+    return configure_logging(p.parse_args())
 
 
 # ── prompts ──────────────────────────────────────────────────────────────────────
@@ -215,75 +200,6 @@ def seed_readouts(gen, joints, prev, fns):
     return maps
 
 
-# ── reporting ────────────────────────────────────────────────────────────────────
-
-def family_label(readout, space):
-    return f"{readout}·{space}"
-
-
-def mean_of(per_seed, key):
-    return float(np.mean([np.mean(s[key]) for s in per_seed]))
-
-
-def print_table(families, controls):
-    cols = ("lat", "cat", "top1", "align", "r_lat", "r_cat", "r_off", "|D|", "D~act")
-    hdr = f"{'readout':16} | " + " ".join(f"{c:>6}" for c in cols)
-    print("\n" + hdr)
-    print("-" * len(hdr))
-    for name, per_seed in families.items():
-        vals = [
-            float(np.mean([np.mean(s["lat_wins"]) for s in per_seed])),
-            float(np.mean([np.mean(s["cat_wins"]) for s in per_seed])),
-            float(np.mean([np.mean(s["top1_wins"]) for s in per_seed])),
-            mean_of(per_seed, "align"),
-            float(np.mean([s["r_laterality"] for s in per_seed])),
-            float(np.mean([s["r_category"] for s in per_seed])),
-            float(np.mean([s["r_offdiag"] for s in per_seed])),
-            mean_of(per_seed, "magnitude"),
-            controls.get(name, float("nan")),
-        ]
-        print(f"{name:16} | " + " ".join(f"{v:6.3f}" for v in vals))
-    print("-" * len(hdr))
-    print(f"chance: lat/cat 0.500   top1/align {1/len(GROUP_NAMES):.3f}   "
-          "(r → 1 = the read-out ignores the instruction)")
-
-
-def print_verdicts(verdicts):
-    print("\n── forced choices, pooled over seeds × instructions ─────────────")
-    for name, blocks in verdicts.items():
-        for key in ("laterality", "category", "top1"):
-            b = blocks[key]
-            flag = ("PASS" if b["beats_chance"]
-                    else "BELOW chance" if b["below_chance"] else "at chance")
-            print(f"  {name:16} {key:10} {b['accuracy']:.3f}  "
-                  f"[{b['ci95'][0]:.3f}, {b['ci95'][1]:.3f}]  n={b['n']:3d}  "
-                  f"chance {b['chance']:.3f}  → {flag}")
-
-
-def print_reading(verdicts):
-    """The one thing the gate exists to decide."""
-    lat = verdicts[family_label("paired", "joint")]["laterality"]
-    cat = verdicts[family_label("paired", "joint")]["category"]
-    energy_lat = verdicts[family_label("energy", "joint")]["laterality"]
-    print("\n── reading ─────────────────────────────────────────────────────")
-    if lat["beats_chance"]:
-        print(f"LATERALITY PASSES on the generator ({lat['accuracy']:.3f}, CI lower "
-              f"{lat['ci95'][0]:.3f} > 0.5). Option 6 can deliver a laterality-correct "
-              "group selector on the frozen backbone — wire D into masking.build_mask "
-              'as mask_mode="gen_diff" and score it against the LLM router.')
-    else:
-        print(f"LATERALITY FAILS on the generator ({lat['accuracy']:.3f}, CI "
-              f"[{lat['ci95'][0]:.3f}, {lat['ci95'][1]:.3f}] straddles/undershoots 0.5). "
-              "Left/right is absent from the WEIGHTS, not just from the editing "
-              "read-out — the stronger negative, and it makes Option 1 (attention "
-              "supervision) the remaining laterality route.")
-    print(f"category: {cat['accuracy']:.3f} "
-          f"({'above' if cat['beats_chance'] else 'at/below'} chance) — whether the "
-          "generator resolves arm-vs-leg is a separate, weaker claim.")
-    print(f"is the differencing needed? paired lat {lat['accuracy']:.3f} vs plain motion "
-          f"energy {energy_lat['accuracy']:.3f} — if these match, D adds nothing over "
-          "reading the generation itself.")
-
 
 # ── main ─────────────────────────────────────────────────────────────────────────
 
@@ -291,7 +207,7 @@ def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
     device = resolve_device(args.device)
-    print(f"Device: {device}")
+    log.info(f"Device: {device}")
 
     model, config = load_model(args.checkpoint, device=device, use_ema=not args.no_ema)
     feature_mode = config.get("feature_mode", "humanml3d")
@@ -308,14 +224,14 @@ def main():
     ref_label, ref_text, prompts = build_prompts(args, caption)
     contexts = encode_prompts(text_encoder, model, ref_text, prompts, device)
 
-    print(f"checkpoint   {args.checkpoint}")
-    print(f"feature_mode {feature_mode}  arch={config.get('arch', 'dit')}  "
+    log.info(f"checkpoint   {args.checkpoint}")
+    log.info(f"feature_mode {feature_mode}  arch={config.get('arch', 'dit')}  "
           f"predict_type={schedule.predict_type}")
-    print(f"generation   {args.length} frames  guidance {args.guidance_scale}  "
+    log.info(f"generation   {args.length} frames  guidance {args.guidance_scale}  "
           f"{args.seeds} seed(s) from {args.seed0}")
-    print(f"reference    {ref_label!r}   phrasing {args.phrasing}")
+    log.info(f"reference    {ref_label!r}   phrasing {args.phrasing}")
     for e in prompts:
-        print(f"  instruction {e!r}")
+        log.info(f"  instruction {e!r}")
 
     fns = divergence_fns(feature_mode)
     families = {family_label(r, s): [] for r in READOUTS for s in SPACES}
@@ -344,7 +260,7 @@ def main():
             last["maps"][name] = maps
 
         prev = (gen, joints)
-        print(f"  seed {seed}: generated {len(gen)} clips   "
+        log.info(f"  seed {seed}: generated {len(gen)} clips   "
               f"identical-rows |Δ|max = {plumbing[-1]:.2e}")
 
     families = {k: v for k, v in families.items() if v}          # drop empty 'unpaired'
@@ -355,10 +271,10 @@ def main():
     paired_ok = ("OK" if worst_plumbing == 0.0 else
                  "NOT bit-identical — the pairing is broken and every paired number "
                  "below is suspect")
-    print(f"\nplumbing check: two identical prompts on one shared noise path differ by "
+    log.info(f"\nplumbing check: two identical prompts on one shared noise path differ by "
           f"at most {worst_plumbing:.2e}  → {paired_ok}")
     if args.seeds < 2:
-        print("note: --seeds 1 ⇒ the 'unpaired' control could not be computed.")
+        log.info("note: --seeds 1 ⇒ the 'unpaired' control could not be computed.")
 
     print_table(families, controls)
     print_verdicts(verdicts)
@@ -398,12 +314,12 @@ def main():
             "per_seed": {k: v for k, v in families.items()},
             "verdict": verdicts,
         }, f, indent=2)
-    print(f"\nWrote {out}")
+    log.info(f"\nWrote {out}")
 
     npz = os.path.join(args.out_dir, f"{tag}_gen_diff_motions.npz")
     np.savez_compressed(npz, motions=np.stack(motions).astype(np.float32),
                         prompts=np.array(["__reference__", "__reference_dup__"] + prompts))
-    print(f"Wrote {npz}   (rows: reference, reference-dup, then the 4 instructions — "
+    log.info(f"Wrote {npz}   (rows: reference, reference-dup, then the 4 instructions — "
           "render these to check the generator actually performs the instruction)")
 
 

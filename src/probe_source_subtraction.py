@@ -44,6 +44,9 @@ import numpy as np
 import torch
 
 import matplotlib
+from utils.logger import get_logger
+
+log = get_logger(__name__)
 matplotlib.use("Agg")
 
 from analysis.instructions import DEFAULT_INSTRUCTIONS, resolve_targets
@@ -58,7 +61,7 @@ from model.body_groups import group_names, resolve_group_context
 from model.schedule import NoiseSchedule
 from model.text_encoder import build_text_encoder
 from training.grounding import resolve_readout_layers
-from utils.cli import add_data_args, add_mask_args, add_model_args, resolve_device
+from utils.cli import add_data_args, add_logging_args, add_mask_args, add_model_args, configure_logging, resolve_device
 from utils.model_io import load_model
 from utils.probe import flat_corr, resolve_sweeps, source_activity
 from utils.visualise import plot_correction_sweep, plot_source_correction
@@ -97,7 +100,8 @@ def parse_args():
                         "which fixes the inversion noise).")
     p.add_argument("--no_figures", action="store_true")
     p.add_argument("--out_dir", default="eval_results/source_correction")
-    return p.parse_args()
+    add_logging_args(p)
+    return configure_logging(p.parse_args())
 
 
 def score(maps, src_act, valid_np, glabels, targets, instructions, lambda_pct,
@@ -146,7 +150,7 @@ def probe_one(ckpt, clip, args, device) -> dict:
     editor = MotionEditor(model, schedule, device, is_group=is_group,
                           edit_space=args.edit_space,
                           attn_layers=resolve_readout_layers(config, args.m1_layers))
-    print(f"  predict_type={schedule.predict_type}  edit_space={editor.edit_space}  "
+    log.info(f"  predict_type={schedule.predict_type}  edit_space={editor.edit_space}  "
           f"attn_layers={editor.attn_layers or 'all'}")
     state = editor.invert(x0, seed=args.seed)
     src_act = source_activity(x0, editor.group_channels)
@@ -248,15 +252,15 @@ def make_figures(res, args, out_dir, tag):
 
 
 def print_table(res, tag):
-    print(f"\n{tag}  clip {res['clip']}   ({res['mask'].upper()} corrected; "
+    log.info(f"\n{tag}  clip {res['clip']}   ({res['mask'].upper()} corrected; "
           f"chance align = {res['align_chance']:.3f})")
     hdr = (f"  {'mode':5} {'norm':11} {'control':14} {'lambda':>7} | {'align':>7} "
            f"{'r_lat':>7} {'r_cat':>7} {'M~S':>7}")
-    print(hdr)
-    print("  " + "-" * (len(hdr) - 2))
+    log.info(hdr)
+    log.info("  " + "-" * (len(hdr) - 2))
     for key, v in res["grid"].items():
         mode, norm, control, lam = key.split("|")
-        print(f"  {mode:5} {norm:11} {control:14} {float(lam):7.2f} | "
+        log.info(f"  {mode:5} {norm:11} {control:14} {float(lam):7.2f} | "
               f"{v['align']:7.3f} {v['r_laterality']:7.3f} {v['r_category']:7.3f} "
               f"{v['src_corr']:+7.3f}")
 
@@ -270,7 +274,7 @@ def verdict(results, args):
     """
     modes = tuple(args.mode or MODES)
     norms = tuple(args.norm or ("z",))
-    print("\n── verdict (mean over clips) ───────────────────────────")
+    log.section("verdict (mean over clips)")
     for mode in modes:
         for norm in effective_norms(mode, norms):
             base = np.mean([r["grid"][f"{mode}|{norm}|real|0"]["align"] for r in results])
@@ -288,12 +292,12 @@ def verdict(results, args):
                 continue
             lam, best = max(rows, key=lambda r: r[1]["real"])
             ctrl = max(best[c] for c in CONTROLS if c != "real" and c in best)
-            print(f"  {mode:5} {norm:11} baseline λ=0 align {base:.3f}   "
+            log.info(f"  {mode:5} {norm:11} baseline λ=0 align {base:.3f}   "
                   f"best λ={lam:g} align {best['real']:.3f}   "
                   f"best shuffled control {ctrl:.3f}")
             gained = best["real"] > base + 1e-9
             beats = best["real"] > ctrl
-            print(f"        → {'IMPROVES' if gained else 'does NOT improve'} on the "
+            log.info(f"        → {'IMPROVES' if gained else 'does NOT improve'} on the "
                   f"untouched map; {'beats' if beats else 'LOSES TO'} its shuffled "
                   f"control{'' if gained and beats else '  ⇒ negative'}")
 
@@ -304,13 +308,13 @@ def main():
         raise SystemExit("--lambdas must include 0 (the baseline every λ is judged against)")
     os.makedirs(args.out_dir, exist_ok=True)
     device = resolve_device(args.device)
-    print(f"Device: {device}")
+    log.info(f"Device: {device}")
 
     results = []
     for ckpt in args.checkpoint:
         tag = os.path.basename(os.path.dirname(ckpt.rstrip("/"))) or "ckpt"
         for clip in args.clip:
-            print(f"\n── {tag}  clip {clip} ──")
+            log.section(f"{tag}  clip {clip}")
             res = probe_one(ckpt, clip, args, device)
             if not args.no_figures:
                 make_figures(res, args, args.out_dir, tag)
@@ -319,7 +323,7 @@ def main():
             with open(out, "w") as f:
                 json.dump({k: v for k, v in res.items() if not k.startswith("_")},
                           f, indent=2)
-            print(f"  wrote {out}")
+            log.info(f"  wrote {out}")
             results.append(res)
 
     verdict(results, args)

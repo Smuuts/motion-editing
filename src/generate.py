@@ -33,14 +33,16 @@ import json
 import argparse
 import numpy as np
 import torch
-from tqdm import tqdm
 
 from data.clips import iter_split_clips
 from model.text_encoder import build_text_encoder
 from model.schedule import NoiseSchedule
 from model.sampler import DDPMSampler
-from utils.cli import resolve_device
+from utils.cli import add_logging_args, configure_logging, resolve_device
+from utils.logger import get_logger
 from utils.model_io import load_model
+
+log = get_logger(__name__)
 
 
 def parse_args():
@@ -62,7 +64,8 @@ def parse_args():
     p.add_argument("--no_ema",         action="store_true")
     p.add_argument("--resume",         action="store_true",
                    help="Skip clips whose .npz already exists in out_dir.")
-    return p.parse_args()
+    add_logging_args(p)
+    return configure_logging(p.parse_args())
 
 
 def main():
@@ -72,12 +75,12 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     device = resolve_device()
-    print(f"Device: {device}")
+    log.info(f"Device: {device}")
 
     model, config = load_model(args.checkpoint, device, use_ema=not args.no_ema)
     max_frames    = config.get("max_frames", 196)
     feature_mode  = config.get("feature_mode", "humanml3d")
-    print(f"Feature mode: {feature_mode}")
+    log.info(f"Feature mode: {feature_mode}")
 
     mean = np.load(os.path.join(args.data_root, "Mean.npy"))
     std  = np.load(os.path.join(args.data_root, "Std.npy"))
@@ -87,11 +90,11 @@ def main():
     schedule     = NoiseSchedule.from_config(config, device=device)
     sampler      = DDPMSampler(model, schedule, device)
 
-    print(f"\nLoading '{args.split}' split …")
+    log.info(f"\nLoading '{args.split}' split …")
     clips = iter_split_clips(args.data_root, args.split, max_frames,
                              max_clips=args.max_clips, seed=args.seed,
                              with_text_emb=True)
-    print(f"  {len(clips)} clips")
+    log.info(f"  {len(clips)} clips")
 
     succeeded = []
     skipped   = 0
@@ -114,10 +117,10 @@ def main():
         manifest["clip_ids"] = succeeded
         with open(manifest_path, "w") as f:
             json.dump(manifest, f, indent=2)
-        print(f"Manifest → {manifest_path}")
+        log.info(f"Manifest → {manifest_path}")
 
     try:
-        for clip in tqdm(clips, desc="Generating"):
+        for clip in log.progress(clips, desc="Generating", leave=True):
             cid  = clip["id"]
             T    = clip["T"]
             out_path = os.path.join(args.out_dir, f"{cid}.npz")
@@ -150,7 +153,7 @@ def main():
                         show_progress=False,
                     ).cpu().numpy()
             except Exception as exc:
-                print(f"  [WARN] {cid}: generation failed — {exc}")
+                log.warning(f"{cid}: generation failed — {exc}")
                 continue
 
             np.savez_compressed(out_path,
@@ -161,10 +164,10 @@ def main():
             succeeded.append(cid)
 
     except KeyboardInterrupt:
-        print(f"\nInterrupted — {len(succeeded)} clips saved so far.")
+        log.info(f"\nInterrupted — {len(succeeded)} clips saved so far.")
 
     finally:
-        print(f"\n{len(succeeded)}/{len(clips)} clips saved"
+        log.info(f"\n{len(succeeded)}/{len(clips)} clips saved"
               + (f" ({skipped} resumed)" if skipped else "") + f" → {args.out_dir}")
         write_manifest()
 

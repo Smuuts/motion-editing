@@ -36,15 +36,17 @@ import argparse
 import os
 
 import torch
-import torch.nn as nn
 from torch.amp import autocast
 
 from data.dataset import build_dataloader
 from model.schedule import NoiseSchedule
 from training.epoch import diffusion_loss
-from utils.cli import add_data_args, add_model_args, resolve_device
+from utils.cli import add_data_args, add_logging_args, add_model_args, configure_logging, resolve_device
+from utils.logger import get_logger
 from utils.model_io import load_model
 from utils.padding import length_to_mask
+
+log = get_logger(__name__)
 
 FP16_MAX = 65504.0
 DTYPES = [("fp32", torch.float32), ("bf16", torch.bfloat16), ("fp16", torch.float16)]
@@ -62,7 +64,8 @@ def parse_args():
     p.add_argument("--t_max", type=int, default=None,
                    help="Sample timesteps from [0, t_max] instead of the full schedule. "
                         "Use to check whether the growth is concentrated at high noise.")
-    return p.parse_args()
+    add_logging_args(p)
+    return configure_logging(p.parse_args())
 
 
 class ActivationProbe:
@@ -160,29 +163,29 @@ def main():
 
     rows = [probe_checkpoint(c, args, device, batches_for) for c in args.checkpoint]
 
-    print(f"\n{args.batches} batches x {args.batch_size}, identical across checkpoints"
+    log.info(f"\n{args.batches} batches x {args.batch_size}, identical across checkpoints"
           + (f", t sampled from [0, {args.t_max}]" if args.t_max else "")
           + f".  fp16 ceiling = {FP16_MAX:.0f}\n")
     hdr = (f"  {'checkpoint':30} {'epoch':>6} {'max|w|':>9} {'max|act|':>11} "
            f"{'fp16 room':>10}  {'fp32/bf16/fp16 bad':>18}  worst module")
-    print(hdr + "\n  " + "-" * (len(hdr) - 2))
+    log.info(hdr + "\n  " + "-" * (len(hdr) - 2))
     for r in rows:
         room = FP16_MAX / r["act"] if r["act"] > 0 else float("inf")
         nf = "/".join(str(r["non_finite"][n]) for n, _ in DTYPES)
         ep = "?" if r["epoch"] is None else str(r["epoch"])
-        print(f"  {os.path.basename(r['ckpt'].rstrip('/')):30} {ep:>6} {r['max_w']:9.2f} "
+        log.info(f"  {os.path.basename(r['ckpt'].rstrip('/')):30} {ep:>6} {r['max_w']:9.2f} "
               f"{r['act']:11.1f} {room:9.1f}x  {nf:>18}  {r['mod']}")
 
-    print("\nverdict:")
+    log.info("\nverdict:")
     last = rows[-1]
     if last["bad_w"]:
-        print("  weights contain non-finite values -> damaged. Resume from earlier; no "
+        log.info("  weights contain non-finite values -> damaged. Resume from earlier; no "
               "dtype change will help.")
     elif last["non_finite"]["fp32"]:
-        print("  fp32 forward is non-finite -> the weights are broken even in full "
+        log.info("  fp32 forward is non-finite -> the weights are broken even in full "
               "precision. Resume from before the first skipped epoch, with a lower --lr.")
     elif last["non_finite"]["fp16"]:
-        print(f"  fp32/bf16 finite but fp16 non-finite on "
+        log.info(f"  fp32/bf16 finite but fp16 non-finite on "
               f"{last['non_finite']['fp16']}/{args.batches} batches -> fp16 ACTIVATION "
               f"OVERFLOW. Weights are fine. Resume with --amp_dtype bf16.")
     elif len(rows) > 1:
@@ -192,7 +195,7 @@ def main():
         w_growth = last_r["max_w"] / max(first["max_w"], 1e-9)
         span = (None if first["epoch"] is None or last_r["epoch"] is None
                 else last_r["epoch"] - first["epoch"])
-        print(f"  nothing overflows yet. Activations grew {act_growth:.2f}x and weights "
+        log.info(f"  nothing overflows yet. Activations grew {act_growth:.2f}x and weights "
               f"{w_growth:.2f}x across these checkpoints; {room:.1f}x headroom remains to "
               f"the fp16 ceiling.")
         # Reference point measured on a run that did NOT diverge (exp_hml3d_x0, x0 +
@@ -200,26 +203,26 @@ def main():
         # per 100 epochs, still 108x from the ceiling at the end. So GROWTH BY ITSELF IS
         # NORMAL — every transformer here does it. What matters is the rate and how much
         # room is left.
-        print("  reference (a run that did NOT diverge — exp_hml3d_x0): 1.26x per 100 "
+        log.info("  reference (a run that did NOT diverge — exp_hml3d_x0): 1.26x per 100 "
               "epochs, 108x headroom left at epoch 499.")
         if span and span > 0 and act_growth > 1.0:
             per100 = act_growth ** (100.0 / span)
             import math
             to_ceiling = math.log(room) / math.log(act_growth) * span
-            print(f"  this run: {per100:.2f}x per 100 epochs -> at this rate the ceiling "
+            log.info(f"  this run: {per100:.2f}x per 100 epochs -> at this rate the ceiling "
                   f"arrives about {to_ceiling:.0f} epochs after epoch {last_r['epoch']} "
                   f"(~epoch {last_r['epoch'] + to_ceiling:.0f}).")
-            print("  Compare that projection against the epoch of your first "
+            log.info("  Compare that projection against the epoch of your first "
                   "`skipped N/M steps` warning: if they roughly agree, activation growth "
                   "IS the mechanism. If the projection lands far later, something else "
                   "ends the run and bf16 will only postpone it.")
         else:
-            print("  activations are not growing across these checkpoints — either the "
+            log.info("  activations are not growing across these checkpoints — either the "
                   "growth starts later, or the divergence is not activation growth. Use "
                   "checkpoints closer to the first skipped epoch, and --t_max to test "
                   "whether it is concentrated at a particular noise level.")
     else:
-        print("  nothing overflows on these batches. Pass SEVERAL checkpoints from the "
+        log.info("  nothing overflows on these batches. Pass SEVERAL checkpoints from the "
               "run (--checkpoint repeatedly) to see whether activations are trending "
               "toward the ceiling — that works before the run has diverged.")
 

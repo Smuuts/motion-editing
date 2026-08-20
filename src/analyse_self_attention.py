@@ -1,12 +1,9 @@
 """
-Probe the SELF-attention pathway for emergent (frame, body-part) structure — Option 7
-of docs/AttentionGrounding_Options.md, Family A of docs/ImplicitMask_Research.md.
+Probe the SELF-attention pathway for emergent (frame, body-part) structure.
 
-Why this probe exists
----------------------
-Every mask probe so far read *cross*-attention (M1) or the noise contrast ψ (M2), and
-both are measured to be instruction-invariant and source-dynamics-driven
-(docs/FINDINGS.md). Self-attention is the one pathway never examined. DiffSeg
+WHY THIS PROBE EXISTS. Every mask probe so far read CROSS-attention (M1) or the noise
+contrast psi (M2), and both are measured to be instruction-invariant and
+source-dynamics-driven. Self-attention is the one pathway never examined. DiffSeg
 ("Diffuse, Attend, and Segment", arXiv 2308.12469) segments images from
 **self-attention only, no text and no labels**, and MotionCLR (arXiv 2410.18977) shows
 motion self-attention carries repetition/segment structure — so there is plausibly a
@@ -15,7 +12,7 @@ the clip to intersect with an instruction-driven selector; it cannot buy instruc
 selectivity, because self-attention is text-free. A clean negative is equally useful:
 it closes "is there ANY usable emergent structure in this backbone without a retrain?".
 
-What is measured (implementations + rationale in analysis/self_attention.py)
+WHAT IS MEASURED (implementations + rationale in analysis/self_attention.py)
   1. Affinity structure — group×group C (body-part structured? left vs right?) and
      frame×frame R (temporally blocked?), each against its random baseline.
   2. DiffSeg segmentation — KL-threshold merging over a swept tau, scored by NMI
@@ -24,8 +21,7 @@ What is measured (implementations + rationale in analysis/self_attention.py)
      segmentation (do the two sides land in different segments).
   4. Text-invariance — self-attention is text-free by construction only in layer 0;
      later layers see the cross-attention residual. Running contrasting instructions
-     measures whether any instruction signal survives, i.e. whether Family A's premise
-     holds.
+     measures whether any instruction signal survives at all.
 
 Outputs per source clip in --out_dir: `<clip>_selfattn_structure.png`,
 `<clip>_selfattn_segments.png`, `<clip>_selfattn.json` (every number in both figures).
@@ -35,7 +31,7 @@ Usage
     python src/analyse_self_attention.py --checkpoint runs/exp_smplh/checkpoint_latest \
         --data_root data/HumanML3D_smplh --source 0 --out_dir eval_results/self_attention
 
-    # Restrict the timestep window (cf. PROGRESS item B.7c):
+    # Restrict the timestep window:
     python src/analyse_self_attention.py --checkpoint ... --data_root ... --source 0 \
         --t_min 250 --t_max 750 --mask_timesteps 40
 
@@ -56,6 +52,9 @@ import numpy as np
 import torch
 
 import matplotlib
+from utils.logger import get_logger
+
+log = get_logger(__name__)
 matplotlib.use("Agg")
 
 from analysis import self_attention as sa
@@ -65,7 +64,7 @@ from editing import MotionEditor
 from model.body_groups import group_names, resolve_group_context
 from model.schedule import NoiseSchedule
 from model.text_encoder import build_text_encoder
-from utils.cli import add_data_args, add_model_args, resolve_device
+from utils.cli import add_data_args, add_logging_args, add_model_args, configure_logging, resolve_device
 from utils.decode import smplh_body_model
 from utils.model_io import load_model
 from utils.probe import flat_corr, source_activity
@@ -101,7 +100,8 @@ def parse_args():
     p.add_argument("--out_dir", default="eval_results/self_attention")
     p.add_argument("--seed", type=int, default=0,
                    help="Seeds the (stochastic) inversion and the shuffled NMI baselines.")
-    return p.parse_args()
+    add_logging_args(p)
+    return configure_logging(p.parse_args())
 
 
 def text_invariance(model, state, timesteps, N, keep_layers, text_encoder,
@@ -116,33 +116,33 @@ def text_invariance(model, state, timesteps, N, keep_layers, text_encoder,
     for e, ctx in zip(instructions, ctxs):
         A_e, _, _ = sa.aggregate(model, state.xs, ctx, timesteps, N, keep_layers)
         per_instr.append(A_e)
-        print(f"  {e!r}: r vs null context = {flat_corr(A_e, A_null):.4f}")
+        log.info(f"  {e!r}: r vs null context = {flat_corr(A_e, A_null):.4f}")
     corr = np.array([[flat_corr(a, b) for b in per_instr] for a in per_instr])
     return corr, [flat_corr(a, A_null) for a in per_instr]
 
 
 def print_summary(metrics, F, G, n_seg, tau, n_instructions):
-    print("\n── summary ─────────────────────────────────────────────")
-    print(f"group-affinity diagonality : {metrics['group_diagonality']:.3f}   "
+    log.section("summary")
+    log.info(f"group-affinity diagonality : {metrics['group_diagonality']:.3f}   "
           f"(random {1/G:.3f})   → is self-attention body-part structured?")
-    print(f"frame-affinity diagonality : {metrics['frame_diagonality']:.4f}   "
+    log.info(f"frame-affinity diagonality : {metrics['frame_diagonality']:.4f}   "
           f"(random {1/F:.4f})  → is it temporally blocked?")
-    print(f"incoming attn vs source |Δx0|: "
+    log.info(f"incoming attn vs source |Δx0|: "
           f"{metrics['corr_incoming_attention_vs_source_motion']:+.3f}   "
           f"(→1 ⇒ another source-dynamics detector)")
-    print(f"DiffSeg segments           : {n_seg}  (tau {tau:.4f})")
+    log.info(f"DiffSeg segments           : {n_seg}  (tau {tau:.4f})")
     for axis in ("group", "time"):
         label = "body-part axis" if axis == "group" else "time bins"
-        print(f"NMI vs {label:<19}: {metrics[f'nmi_{axis}']:.3f}   "
+        log.info(f"NMI vs {label:<19}: {metrics[f'nmi_{axis}']:.3f}   "
               f"(shuffled {metrics[f'nmi_{axis}_shuffled']:.3f}  → gap "
               f"{metrics[f'nmi_{axis}'] - metrics[f'nmi_{axis}_shuffled']:+.3f}; "
               f"best over sweep {metrics[f'best_nmi_{axis}_gap_over_sweep']:+.3f})")
     for k, v in metrics["affinity_laterality"].items():
-        print(f"laterality [{k:>4}]           : self−mirror {v['self_vs_mirror']:+.3f} "
+        log.info(f"laterality [{k:>4}]           : self−mirror {v['self_vs_mirror']:+.3f} "
               f"(>0 ⇒ sides distinguished)   mirror−other {v['mirror_vs_other']:+.3f} "
               f"(>0 ⇒ sides LINKED, i.e. bilateral symmetry)")
     if n_instructions > 1:
-        print(f"instruction-invariance r   : "
+        log.info(f"instruction-invariance r   : "
               f"{metrics['instruction_invariance_mean_off_diag_r']:.4f}   "
               f"(→1 = text-free, as Family A assumes)")
 
@@ -155,12 +155,12 @@ def main():
     # stochastic; seed torch too or the segment count drifts between runs.
     torch.manual_seed(args.seed)
     device = resolve_device(args.device)
-    print(f"Device: {device}")
+    log.info(f"Device: {device}")
 
     model, config = load_model(args.checkpoint, device=device, use_ema=not args.no_ema)
     feature_mode, is_group, group_mode, _ = resolve_group_context(config)
     arch = config.get("arch", "dit")
-    print(f"feature_mode={feature_mode}  arch={arch}  is_group={is_group}  "
+    log.info(f"feature_mode={feature_mode}  arch={arch}  is_group={is_group}  "
           f"group_mode={group_mode}")
     if feature_mode == "smplh":
         smplh_body_model(args.smplh_model_path)
@@ -173,7 +173,7 @@ def main():
     raw_feat, clip_id, F, caption = load_source(
         args.source, args.data_root, args.split, args.max_frames)
     x0 = torch.from_numpy((raw_feat - mean) / std).float().unsqueeze(0).to(device)
-    print(f"Source: {clip_id}  ({F} frames)   prompt: {caption!r}")
+    log.info(f"Source: {clip_id}  ({F} frames)   prompt: {caption!r}")
 
     editor = MotionEditor(model, schedule, device, is_group=is_group)
     glabels = group_names(group_mode) if is_group else ["all"]
@@ -184,22 +184,22 @@ def main():
     keep_layers = {int(s) for s in args.layers.split(",")} if args.layers else None
     t_max = args.t_max if args.t_max is not None else schedule.T - 1
     timesteps = torch.linspace(args.t_min, t_max, args.mask_timesteps).long().tolist()
-    print(f"Sweeping {len(timesteps)} timesteps in [{args.t_min}, {t_max}], "
+    log.info(f"Sweeping {len(timesteps)} timesteps in [{args.t_min}, {t_max}], "
           f"N = F*G = {N}")
 
-    print("Stage 1: inversion …")
+    log.info("Stage 1: inversion …")
     state = editor.invert(x0, seed=args.seed)
 
     # Primary readout: NULL context — self-attention with no text at all, the honest
     # "text-free structure" measurement Family A is about.
-    print("Aggregating self-attention (null context) …")
+    log.info("Aggregating self-attention (null context) …")
     try:
         A_null, per_layer, skipped = sa.aggregate(
             model, state.xs, None, timesteps, N, keep_layers)
     except RuntimeError as e:
         raise SystemExit(str(e))
     if skipped:
-        print(f"  note: skipped {skipped} block(s) at reduced temporal resolution "
+        log.info(f"  note: skipped {skipped} block(s) at reduced temporal resolution "
               f"(U-Net levels); using the {per_layer.shape[0]} full-resolution block(s).")
 
     C = sa.group_affinity(A_null, F, G)
@@ -210,7 +210,7 @@ def main():
     group_ref = sa.group_reference(F, G)
     time_ref = sa.time_reference(F, G, args.time_bins)
 
-    print("DiffSeg merging …")
+    log.info("DiffSeg merging …")
     if args.kl_tau is not None:
         labels, n_seg = sa.diffseg(A_null, F, G, args.anchor_stride, args.merge_iters,
                                    args.kl_tau)
@@ -219,10 +219,10 @@ def main():
         sweep, best, kl_stats = sa.diffseg_tau_sweep(
             A_null, F, G, args.anchor_stride, args.merge_iters, group_ref, time_ref, rng)
         labels, n_seg, tau = best["_labels"], best["n_segments"], best["tau"]
-        print("  tau sweep: " + ", ".join(
+        log.info("  tau sweep: " + ", ".join(
             f"p{r['percentile']}→{r['n_segments']}seg/gap{r['nmi_group_gap']:+.2f}"
             for r in sweep))
-        print(f"  operating point (max body-part gap): tau {tau:.4f} → {n_seg} "
+        log.info(f"  operating point (max body-part gap): tau {tau:.4f} → {n_seg} "
               f"segments; anchor KL median {kl_stats['kl_median']:.3f}")
     labels_fg = labels.reshape(F, G)
 
@@ -259,7 +259,7 @@ def main():
     }
 
     instructions = args.instructions or list(DEFAULT_INSTRUCTIONS)
-    print(f"Text-invariance check over {len(instructions)} instructions …")
+    log.info(f"Text-invariance check over {len(instructions)} instructions …")
     instr_corr, vs_null = text_invariance(
         model, state, timesteps, N, keep_layers, text_encoder, instructions, A_null)
     metrics["instruction_invariance_mean_off_diag_r"] = mean_off_diagonal(instr_corr)
@@ -275,7 +275,7 @@ def main():
                   base + "_segments.png")
     with open(base + ".json", "w") as f:
         json.dump(metrics, f, indent=2)
-    print(f"Wrote {base}.json")
+    log.info(f"Wrote {base}.json")
 
     print_summary(metrics, F, G, n_seg, tau, len(instructions))
 

@@ -44,9 +44,12 @@ from model.body_groups import group_names, resolve_group_context
 from model.schedule import NoiseSchedule
 from model.text_encoder import build_text_encoder
 from training.grounding import resolve_readout_layers
-from utils.cli import add_data_args, add_mask_args, add_model_args, resolve_device
+from utils.cli import add_data_args, add_logging_args, add_mask_args, add_model_args, configure_logging, resolve_device
+from utils.logger import get_logger
 from utils.model_io import load_model
 from utils.probe import resolve_sweeps, source_activity
+
+log = get_logger(__name__)
 
 TABLE_COLUMNS = ["M1 rcat", "M1 rlat", "M1 roff", "M2 rcat", "M2 rlat", "M2 roff",
                  "M1~src", "M2~src", "algM1", "algM2", "algM1nM2", "recM1nM2", "nCells"]
@@ -67,7 +70,8 @@ def parse_args():
                         "numbers differ by readout alone (the inversion is stochastic, "
                         "±0.02 on these metrics). Default: raw.")
     p.add_argument("--out_dir", default="eval_results/mask_axes")
-    return p.parse_args()
+    add_logging_args(p)
+    return configure_logging(p.parse_args())
 
 
 def probe_one(ckpt, clip, args, device) -> list[dict]:
@@ -163,8 +167,8 @@ def print_table(results):
            + " ".join(f"{c:7}" for c in TABLE_COLUMNS[3:6]) + " | "
            + " ".join(f"{c:7}" for c in TABLE_COLUMNS[6:8]) + " | "
            + " ".join(f"{c:6}" for c in TABLE_COLUMNS[8:]))
-    print("\n" + hdr)
-    print("-" * len(hdr))
+    log.info("\n" + hdr)
+    log.info("-" * len(hdr))
     # Group by RUN as well as readout/target. Grouping on `target` alone silently pools
     # two checkpoints whenever they share a predict_type — which is exactly the case for
     # the comparison this probe exists to make (a grounded x0 run against its x0 twin),
@@ -174,20 +178,20 @@ def print_table(results):
         row = summary_row(d)
         key = (_run_tag(d), d["attn_readout"], _target_label(d))
         per_group.setdefault(key, []).append(row)
-        print(_format_row(_run_tag(d), d["clip"], d["attn_readout"],
+        log.info(_format_row(_run_tag(d), d["clip"], d["attn_readout"],
                           _target_label(d), row))
-    print("-" * len(hdr))
+    log.info("-" * len(hdr))
     for (run, readout, target), rows in per_group.items():
-        print(_format_row(run, f"MEAN({len(rows)})", readout, target,
+        log.info(_format_row(run, f"MEAN({len(rows)})", readout, target,
                           np.mean(rows, axis=0)))
-    print(f"\nchance alignment = {results[0]['align_chance']:.3f}   "
+    log.info(f"\nchance alignment = {results[0]['align_chance']:.3f}   "
           f"(rcat → 1 = mask ignores arm-vs-leg;  rlat → 1 = mask ignores left-vs-right)")
 
-    print("\npaired category contrast (mass the instruction MOVES onto its own limb):")
+    log.info("\npaired category contrast (mass the instruction MOVES onto its own limb):")
     for d in results:
         for key in ("m1", "m2"):
             cc = d[f"{key}_category_contrast"]
-            print(f"  {d['clip']} {d['attn_readout']:8} {_target_label(d):7} {key}: "
+            log.info(f"  {d['clip']} {d['attn_readout']:8} {_target_label(d):7} {key}: "
                   f"arm {cc['arm_shift']:+.3f}   leg {cc['leg_shift']:+.3f}")
 
     print_column_stats(results)
@@ -206,9 +210,9 @@ def print_column_stats(results):
             rows.append(d)
     if not rows:
         return
-    print("\nattention mass vs value norm by column class "
+    log.info("\nattention mass vs value norm by column class "
           "(sweep mean; mass is per row, rows sum to <= 1):")
-    print(f"  {'clip':8} {'class':8} {'mass':>8} {'|v|':>8} {'mass*|v|':>10}")
+    log.info(f"  {'clip':8} {'class':8} {'mass':>8} {'|v|':>8} {'mass*|v|':>10}")
     for d in rows:
         agg = {}
         for stats in d["column_stats"].values():           # one per instruction
@@ -218,20 +222,20 @@ def print_column_stats(results):
             m, vn = agg.get(f"mass_{cls}"), agg.get(f"vnorm_{cls}")
             if m is None or vn is None:
                 continue
-            print(f"  {d['clip']:8} {cls:8} {m:8.4f} {vn:8.4f} {m * vn:10.4f}")
+            log.info(f"  {d['clip']:8} {cls:8} {m:8.4f} {vn:8.4f} {m * vn:10.4f}")
 
 
 def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
     device = resolve_device(args.device)
-    print(f"Device: {device}")
+    log.info(f"Device: {device}")
 
     results = []
     for ckpt in args.checkpoint:
         tag = os.path.basename(os.path.dirname(ckpt.rstrip("/"))) or "ckpt"
         for clip in args.clip:
-            print(f"\n── {tag}  clip {clip} ──")
+            log.section(f"{tag}  clip {clip}")
             for res in probe_one(ckpt, clip, args, device):
                 # The readout is part of the filename only when it isn't the historical
                 # default, so existing "<tag>_<clip>.json" baselines stay addressable.
@@ -240,7 +244,7 @@ def main():
                 out = os.path.join(args.out_dir, name)
                 with open(out, "w") as f:
                     json.dump(res, f, indent=2)
-                print(f"wrote {out}")
+                log.info(f"wrote {out}")
                 results.append(res)
 
     print_table(results)
