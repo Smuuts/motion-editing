@@ -101,3 +101,96 @@ def resolve_sweeps(mask_timesteps, T, m1_window=None, m2_window=None):
     m1 = masking.build_sweep(n, T, *m1_window) if m1_window else None
     m2 = masking.build_sweep(n, T, *m2_window) if m2_window else None
     return shared, m1, m2
+
+
+# ── noise-level bands ────────────────────────────────────────────────────────────
+
+# Default band edges as fractions of T. NOT even in t, on purpose: the two masks carry
+# their signal at opposite ends of the trajectory, so an even grid spends most of its
+# rows where neither has anything to show.
+#   · ψ_ε is a low-t read-out — ψ_ε = √SNR_t·ψ_x0 puts only ~5.6 % of its weight at
+#     t ≥ 500 (PROGRESS item 7c) — so the low end needs the resolution.
+#   · M1's instruction-sensitivity strengthens monotonically toward high t, and the two
+#     boundaries every recorded M1 result is quoted against are t≈250 ("category r 0.899
+#     at t < 250 vs 0.746 at t ≥ 750") and t=750 (`--m1_window 750 999`, the best
+#     alignment in the project). Both are band edges here, so a row of this figure is
+#     directly comparable to a number in FINDINGS.md.
+#   · The last edge at 0.90 splits that high-noise end in two, because [750, 900] and
+#     [900, 999] are not the same regime: √ᾱ is 0.19 at t=900 and 0.00 at t=999, so the
+#     final row is the near-pure-noise limit where there is no clip left to detect and
+#     the caption is the only signal in the input at all.
+DEFAULT_BAND_FRACTIONS = (0.0, 0.05, 0.15, 0.30, 0.55, 0.75, 0.90, 1.0)
+
+
+def _edges_to_bands(edges, T) -> list[tuple[int, int]]:
+    """Sorted, de-duplicated, clamped edges → contiguous non-overlapping [lo, hi] bands.
+
+    Bands abut rather than share an endpoint (next lo = previous hi + 1) so no timestep
+    is averaged into two rows; an edge pair that collapses to nothing is dropped.
+    """
+    e = sorted({min(max(int(round(float(x))), 1), T - 1) for x in edges})
+    if len(e) < 2:
+        raise ValueError(f"need at least 2 distinct band edges in [1, {T - 1}], got {e}")
+    bands = [(lo if i == 0 else lo + 1, hi)
+             for i, (lo, hi) in enumerate(zip(e[:-1], e[1:]))]
+    return [(lo, hi) for lo, hi in bands if lo <= hi]
+
+
+def resolve_bands(spec: str, T: int, sqrt_alpha=None) -> list[tuple[int, int]]:
+    """`--bands` spec → [(lo, hi), ...] timestep bands tiling [1, T-1].
+
+    Forms:
+      "default"    the `DEFAULT_BAND_FRACTIONS` edges (see there for why they are uneven)
+      "linear:N"   N equal-width bands in t
+      "log:N"      N bands geometric in t — even in *orders of magnitude* of noise, which
+                   is where ψ's magnitude actually varies
+      "alpha:N"    N bands even in √ᾱ_t, i.e. even in how much clean signal is left. The
+                   most literal reading of "stages of the inversion", and schedule-aware:
+                   it lands in the same place on any β-schedule. Needs `sqrt_alpha`.
+      "1,50,250"   explicit edges
+    """
+    spec = (spec or "default").strip()
+    if spec == "default":
+        return _edges_to_bands([f * T for f in DEFAULT_BAND_FRACTIONS], T)
+
+    kind, _, n_str = spec.partition(":")
+    if kind in ("linear", "log", "alpha"):
+        n = int(n_str) if n_str else 6
+        if n < 1:
+            raise ValueError(f"--bands {spec!r}: need at least 1 band")
+        if kind == "linear":
+            return _edges_to_bands(np.linspace(1, T - 1, n + 1), T)
+        if kind == "log":
+            return _edges_to_bands(np.geomspace(1, T - 1, n + 1), T)
+        if sqrt_alpha is None:
+            raise ValueError("--bands alpha:N needs the schedule's sqrt_alphas_cumprod")
+        # √ᾱ decreases in t; np.interp needs an ascending x, hence the reversal.
+        sa = np.asarray(sqrt_alpha, dtype=np.float64)
+        ts = np.arange(len(sa))
+        levels = np.linspace(sa[1], sa[T - 1], n + 1)
+        return _edges_to_bands(np.interp(levels, sa[::-1], ts[::-1]), T)
+
+    try:
+        return _edges_to_bands([float(x) for x in spec.replace(" ", "").split(",")], T)
+    except ValueError as e:
+        raise ValueError(f"--bands {spec!r}: expected 'default', 'linear:N', 'log:N', "
+                         f"'alpha:N' or a comma-separated edge list ({e})")
+
+
+def band_labels(bands, sqrt_alpha=None) -> list[str]:
+    """Row labels for a band figure: the t range, and the √ᾱ range it corresponds to.
+
+    Both, because neither alone is readable — "t 750–999" says where on the CLI grid the
+    row sits, "√ᾱ 0.31–0.00" says how much of the clip is still there.
+    """
+    out = []
+    for lo, hi in bands:
+        label = f"t {lo}–{hi}"
+        if sqrt_alpha is not None:
+            sa = np.asarray(sqrt_alpha)
+            # The cosine schedule barely moves over the first ~15 % of the trajectory, so
+            # 2 dp collapses the low-noise bands to "1.00–1.00". Widen only those.
+            dp = 2 if round(float(sa[lo]), 2) != round(float(sa[hi]), 2) else 4
+            label += f"\n√ᾱ {sa[lo]:.{dp}f}–{sa[hi]:.{dp}f}"
+        out.append(label)
+    return out

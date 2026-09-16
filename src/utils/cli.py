@@ -59,6 +59,8 @@ def add_mask_args(parser, *, mask_timesteps=40, thresholds=True, windows=True,
                   edit_space=True, alpha_floor=False):
     """The Stage-2 mask-collection knobs (see editing/masking.collect_statistics).
 
+    `thresholds` covers every knob that CUTS the binary mask (--lambda_* and the
+    --m1_select trio); pass False in a probe that only reads the raw M1/M2 maps.
     `alpha_floor=True` additionally defines --guidance_alpha_floor, which is a Stage-3
     guidance knob rather than a mask one — opt-in for the same reason `thresholds`/`windows`
     are, so the probes that only build masks do not carry a flag they never read.
@@ -110,25 +112,6 @@ def add_mask_args(parser, *, mask_timesteps=40, thresholds=True, windows=True,
                              "by default so probe runs are comparable; vary it to measure "
                              "the spread. Paired within-run contrasts were never affected "
                              "(one inversion is shared by all instructions).")
-    parser.add_argument("--m1_select", default="percentile",
-                        choices=["percentile", "rank"],
-                        help="How M1's GROUP component is cut. 'percentile' (default) = "
-                             "one global quantile at --lambda_attn over every (frame, "
-                             "group) cell; bit-identical to results recorded before "
-                             "2026-08-15, but it is a cell BUDGET, not a selector -- at "
-                             "70 it must hand out 0.30*G = 2.1 group-rows whatever the "
-                             "map says, so a one-group instruction always spills into the "
-                             "runner-up. 'rank' = keep the groups holding at least "
-                             "--m1_rank_ratio of the top group's mass (capped at "
-                             "--m1_rank_max), then threshold psi INSIDE those rows only. "
-                             "Rank adapts to how many groups the instruction actually "
-                             "names instead of being told.")
-    parser.add_argument("--m1_rank_ratio", type=float, default=0.5,
-                        help="--m1_select rank: keep a group if its total M1 mass is at "
-                             "least this fraction of the top group's. ->1 = top-1 only.")
-    parser.add_argument("--m1_rank_max", type=int, default=3,
-                        help="--m1_select rank: hard cap on selected groups. Stops a flat "
-                             "(ungrounded) map from selecting the whole body.")
     if alpha_floor:
         parser.add_argument("--guidance_alpha_floor", type=float, default=None,
                             help="Apply edit guidance only where sqrt(alpha_cumprod_t) >= "
@@ -144,6 +127,25 @@ def add_mask_args(parser, *, mask_timesteps=40, thresholds=True, windows=True,
                                  "Unused when --m1_select rank.")
         parser.add_argument("--lambda_noise", type=float, default=70.0,
                             help="M2 percentile threshold (higher = sparser mask).")
+        parser.add_argument("--m1_select", default="percentile",
+                            choices=["percentile", "rank"],
+                            help="How M1's GROUP component is cut. 'percentile' (default) = "
+                                 "one global quantile at --lambda_attn over every (frame, "
+                                 "group) cell; bit-identical to results recorded before "
+                                 "2026-08-15, but it is a cell BUDGET, not a selector -- at "
+                                 "70 it must hand out 0.30*G = 2.1 group-rows whatever the "
+                                 "map says, so a one-group instruction always spills into the "
+                                 "runner-up. 'rank' = keep the groups holding at least "
+                                 "--m1_rank_ratio of the top group's mass (capped at "
+                                 "--m1_rank_max), then threshold psi INSIDE those rows only. "
+                                 "Rank adapts to how many groups the instruction actually "
+                                 "names instead of being told.")
+        parser.add_argument("--m1_rank_ratio", type=float, default=0.5,
+                            help="--m1_select rank: keep a group if its total M1 mass is at "
+                                 "least this fraction of the top group's. ->1 = top-1 only.")
+        parser.add_argument("--m1_rank_max", type=int, default=3,
+                            help="--m1_select rank: hard cap on selected groups. Stops a flat "
+                                 "(ungrounded) map from selecting the whole body.")
     if windows:
         parser.add_argument("--m1_window", type=int, nargs=2, metavar=("LO", "HI"),
                             default=None,

@@ -5,6 +5,15 @@ readable table: one row per edit config (guidance scale).
 Metrics (MotionFix benchmark standard, higher is better, %):
   R@1/2/3       — target <-> generated : instruction following (edit fidelity)
   R@1/2/3_s2t   — source <-> generated : motion preservation
+  AvgR / MedR   — average / median rank of the true target (LOWER is better). Recovered from
+                  the evaluator, which computes and then discards them. Unlike R@1 these do
+                  not saturate: a partial edit that lifts the target from rank 8 to rank 3
+                  moves AvgR and leaves R@1 untouched.
+  PIR           — per-clip Positive Improvement Ratio (`--per_clip`): the share of clips whose
+                  edit landed CLOSER to the target than the unedited source already was.
+                  Chance is 50 %, so this column is read against 50, not against another row.
+                  `p` is an exact two-sided sign test; `Δrank` is the mean rank improvement
+                  over doing nothing.
 
 The `*_s0` (identity) row is the plumbing calibration: R@1_s2t should be ~100.
 
@@ -87,6 +96,7 @@ def main():
     rows = []
     for cfg, m in tmr.items():
         full, batch = m.get("full", {}), m.get("batches", {})
+        drc = m.get("directional") or {}
         rows.append({
             "config": cfg,
             "n": m.get("n"),
@@ -96,6 +106,14 @@ def main():
             # secondary: N-way, where N is this config's own file count
             "R@1_g": _num(full.get("R@1")), "R@3_g": _num(full.get("R@3")),
             "R@1_s2t_g": _num(full.get("R@1_s2t")),
+            # rank metrics — lower is better, and they cannot saturate the way R@1 does
+            "AvgR_b": _num(batch.get("AvgR")), "MedR_b": _num(batch.get("MedR")),
+            "AvgR_g": _num(full.get("AvgR")), "MedR_g": _num(full.get("MedR")),
+            # per-clip directional block (--per_clip); absent on older JSONs
+            "PIR": _num(drc.get("pir_sim")), "PIR_p": _num(drc.get("pir_sim_p")),
+            "PIR_rank": _num(drc.get("pir_rank")),
+            "dAvgR": (None if drc.get("avgr_src") is None or drc.get("avgr_gen") is None
+                      else _num(drc["avgr_src"]) - _num(drc["avgr_gen"])),
         })
     rows.sort(key=lambda r: _scale_key(r["config"]))
 
@@ -118,9 +136,19 @@ def main():
 
     cols = ["config", "n", "R@1_b", "R@2_b", "R@3_b", "R@1_s2t_b",
             "R@1_g", "R@3_g", "R@1_s2t_g"]
+    # Only widen the table with columns that actually have values — an older tmr_metrics.json
+    # has neither block, and a run without --per_clip has only the first.
+    if any(r["AvgR_g"] is not None for r in rows):
+        cols += ["AvgR_g", "MedR_g", "AvgR_b"]
+    has_pir = any(r["PIR"] is not None for r in rows)
+    if has_pir:
+        cols += ["PIR", "PIR_p", "dAvgR"]
 
     def fmt(v):
-        return f"{v:.2f}" if isinstance(v, float) else ("" if v is None else str(v))
+        if isinstance(v, float):
+            # p-values span orders of magnitude; 2dp would print every real result as "0.00"
+            return f"{v:.3g}" if 0 < v < 0.01 else f"{v:.2f}"
+        return "" if v is None else str(v)
 
     lines = [
         "# MotionFix TMR retrieval (SMPL-H editor)\n",
@@ -136,6 +164,20 @@ def main():
         "77.3, vs ~17.6 against 32.0 on the full set). Lead with `_g` on a full run; `_b` is the "
         "only comparable column on a subsampled one.\n",
     ]
+    if any(r["AvgR_g"] is not None for r in rows):
+        lines.append(
+            "**`AvgR` / `MedR` are ranks — LOWER is better**, and they do not saturate: an edit "
+            "that lifts the true target from rank 8 to rank 3 moves `AvgR` and leaves `R@1` "
+            "exactly where it was. They were always computed by MotionFix's evaluator and "
+            "discarded before it returned; this table recovers them.\n")
+    if has_pir:
+        lines.append(
+            "**`PIR`** = share of clips whose edit landed closer to the target than the "
+            "unedited source already was — **read it against 50 %, not against the other "
+            "rows**: each clip is its own control, so chance is exactly 50. `PIR_p` is an exact "
+            "two-sided sign test. `dAvgR` is the mean rank improvement over doing nothing "
+            "(positive = the edit helped). A PIR at ~50 with a non-significant p is not a weak "
+            "result, it is a clean statement that the edit direction carries no signal.\n")
     if subsampled:
         lines.append(
             f"> ⚠ **The `_g` columns are not publication-comparable here.** At least one "

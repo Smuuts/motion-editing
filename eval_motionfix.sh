@@ -118,6 +118,13 @@ SEED=42                   # the inversion is stochastic; fix it. Derived per-cli
 # ── clip selection and scoring ────────────────────────────────────────────────────
 LIMIT_MODE="random"       # 'first' = a contiguous block of sorted keyids
 LIMIT_SEED=0              # separate from SEED: the clip SET and the noise vary independently
+PER_CLIP=1                # also compute the per-clip directional metrics: PIR (share of clips
+                          # the edit moved CLOSER to the target than the unedited source) with
+                          # an exact sign test, plus a per-clip CSV. R@1 has ~3.7 pp of range on
+                          # the 32-way protocol and cannot see a partial edit; PIR is paired,
+                          # chance is exactly 50 %, and it does not saturate. Costs one extra
+                          # encoding pass per config — negligible against Stage 3, which is why
+                          # this defaults ON. See EVALUATION.md §10 option 1.
 COMMON_SUBSET=1           # score every dir on the keyids they all share (needed whenever the
                           # mask modes have different coverage, a no-op when they do not)
 EXTRA=""                  # extra flags for the editor, e.g. "--overwrite"
@@ -266,7 +273,10 @@ log "Scoring ${#SMPL_DIRS[@]} dirs through TMR"
 echo "    ${N_GEN} generations -> $(( N_GEN / 32 )) batches of 32; $(( N_GEN % 32 )) dropped"
 SUBSET_FLAG=""
 [[ "${COMMON_SUBSET}" == "1" ]] && SUBSET_FLAG="--common_subset"
-"${MFIX_PY}" src/eval/run_motionfix_metrics.py "${SMPL_DIRS[@]}" ${SUBSET_FLAG} --out "${METRICS}"
+PER_CLIP_FLAG=""
+[[ "${PER_CLIP}" == "1" ]] && PER_CLIP_FLAG="--per_clip"
+"${MFIX_PY}" src/eval/run_motionfix_metrics.py "${SMPL_DIRS[@]}" ${SUBSET_FLAG} ${PER_CLIP_FLAG} \
+  --out "${METRICS}"
 
 # ----------------------------------------------------------------------
 # 4. Render the comparable table

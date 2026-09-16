@@ -112,3 +112,47 @@ def active_cells(binary_map) -> tuple[int, int]:
     summary printed per instruction."""
     m = np.asarray(binary_map)
     return int(m.sum()), int((m.sum(axis=1) > 0).sum())
+
+
+def collect_noise_band_maps(model, schedule, editor, state, text_encoder, instruction,
+                            valid_frames, is_group, bands, *, band_timesteps=16,
+                            attn_readout="raw", per_step_norm=False,
+                            column_mode="content", config=None, group_mode="parts",
+                            psi_readout=None, columns_out=None):
+    """-> (m1_bands, m2_bands): one raw (F, G) numpy map per noise band, for ONE instruction.
+
+    The band twin of `collect_instruction_masks`: that one holds the timestep sweep fixed
+    and varies the instruction, this one holds the instruction fixed and varies the
+    *noise level*. Nothing is thresholded — a binary mask is a property of the whole
+    sweep, and asking what one band's mask would look like on its own would answer a
+    question nobody is going to run.
+
+    `bands` is [(lo, hi), ...] from `utils.probe.resolve_bands`; each is swept with
+    `band_timesteps` steps RESAMPLED INSIDE it (`masking.build_sweep`), so a narrow
+    low-t band gets the same number of samples as a wide one and the rows are averages
+    over an equal number of forward passes rather than over an equal width of t.
+
+    Every band reads the SAME stored inversion in `state`, so the rows differ only by
+    noise level. Re-inverting per band would put the inversion's own ±0.02 run-to-run
+    spread inside the comparison the figure exists to make.
+    """
+    with torch.no_grad():
+        ctx = text_encoder.encode([instruction])
+        tok, sem, mode = resolve_readout_columns(
+            instruction, text_encoder, config, column_mode, group_mode)
+    if columns_out is not None:
+        columns_out[instruction] = (mode, tok)
+
+    m1_bands, m2_bands = [], []
+    for lo, hi in bands:
+        attn_fg, psi_fg = masking.collect_statistics(
+            model, schedule, state.xs, ctx, tok, is_group=is_group,
+            timesteps=masking.build_sweep(band_timesteps, schedule.T, lo, hi),
+            need_attn=True, group_channels=editor.group_channels,
+            valid_frames=valid_frames, attn_readout=attn_readout, semantic_idxs=sem,
+            per_step_norm=per_step_norm, psi_space=editor.edit_space,
+            attn_layers=editor.attn_layers,
+            psi_readout=psi_readout or getattr(editor, "psi_readout", "energy"))
+        m1_bands.append(attn_fg.cpu().numpy())
+        m2_bands.append(psi_fg.cpu().numpy())
+    return m1_bands, m2_bands

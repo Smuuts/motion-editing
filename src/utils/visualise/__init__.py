@@ -3,8 +3,9 @@ Plotting for the whole project, split by what is being drawn:
 
   animation.py    skeleton animations (single, and generated-vs-source comparison)
   heatmaps.py     axis-level primitives shared by every analysis figure
-  masks.py        the implicit-mask (M1/M2) panels
+  masks.py        the implicit-mask (M1/M2) panels, per instruction and per noise band
   corrections.py  the mask-correction figures (source subtraction, signed psi)
+  dataset_compat.py  the HumanML3D/MotionFix corpus-compatibility figure
   gen_diff.py     the generation-space divergence figures
   attention.py    the self-attention probe figures
   diagnostics.py  backbone-verification curves
@@ -18,16 +19,20 @@ from .animation import (
     show_animation,
 )
 from .corrections import plot_correction_sweep, plot_psi_sign, plot_source_correction
+from .dataset_compat import plot_dataset_compat, plot_perplexity_sweep
 from .diagnostics import plot_noise_level_sweep
 from .gen_diff import plot_gen_diff, plot_gen_diff_summary
 from .heatmaps import mean_off_diagonal
-from .masks import plot_mask_problem, plot_mask_quant, save_mask_heatmap
+from .masks import (plot_mask_noise_bands, plot_mask_problem, plot_mask_quant,
+                    save_mask_heatmap)
 
 __all__ = [
     "CHAIN_COLORS", "KINEMATIC_CHAIN",
     "save_animation", "save_comparison_animation", "show_animation",
     "plot_noise_level_sweep", "mean_off_diagonal",
     "plot_gen_diff", "plot_gen_diff_summary",
-    "plot_mask_problem", "plot_mask_quant", "save_mask_heatmap",
+    "plot_mask_noise_bands", "plot_mask_problem", "plot_mask_quant",
+    "save_mask_heatmap",
     "plot_source_correction", "plot_correction_sweep", "plot_psi_sign",
+    "plot_dataset_compat", "plot_perplexity_sweep",
 ]
