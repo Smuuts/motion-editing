@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
 #
-# rescore_motionfix.sh — re-score generations that ALREADY EXIST on disk with the metrics
-# R@1 cannot express. No editing, no inversion, no generation: it loads the .npy files you
-# already have and runs TMR over them.
+# rescore_motionfix.sh — re-score MotionFix generations that ALREADY EXIST on disk with the
+# metrics R@1 cannot express. No editing, no inversion, no generation: it loads the .npy files
+# you already have and runs TMR over them.
 #
-#   ./rescore_motionfix.sh                    # list what it can see, then stop
-#   ./rescore_motionfix.sh exp_smplh_verbs_signed
-#   ./rescore_motionfix.sh --all              # everything under data/motionfix/motionfix_smpl
+#   ./rescore_motionfix.sh                      # list the sweeps it can find, then stop
+#   ./rescore_motionfix.sh exp_smplh_verbs      # prefix match is fine
+#   ./rescore_motionfix.sh --all
+#   ./rescore_motionfix.sh --gen_root some/dir --all
 #
-# TWO LAYOUTS ARE HANDLED. Current runs are tagged — <TAG>/<mask_mode>_s<scale>/*.npy — and
-# each tag is scored as its own sweep. Older runs predate the tag convention and sit flat as
-# <mask_mode>_s<scale>/*.npy directly under the generation root; those are collected and
-# scored TOGETHER as one sweep (named by --group, default "legacy"), because they are one,
-# and scoring them separately would throw away the cross-scale comparison and make
-# --common_subset a no-op.
+# WHICH FOLDER. It wants the **MotionFix editing** output: directories of `<keyid>.npy`, each a
+# (T, 135) SMPL-H feature array, written by `eval_motionfix.sh` (OUT_ROOT, default
+# data/motionfix/motionfix_smpl/<TAG>/<mask_mode>_s<scale>/). That is NOT `generated/`, which
+# holds `<keyid>.npz` text-to-motion samples from `generate.py` — different task, different
+# format, and nothing here can score them. The script checks and says so rather than skipping.
+#
+# LAYOUT-AGNOSTIC. It assumes no directory depth: it finds every directory that directly
+# contains .npy files and groups them by their parent, so <TAG>/<config>/*.npy and flat
+# <config>/*.npy both work, at any nesting.
 #
 # WHAT IT ADDS over the numbers already in eval_results/ (EVALUATION.md §10, option 1):
 #
@@ -35,127 +39,204 @@
 #   PIR < 50, p small   the edit moves AWAY from the target — which is what this project's
 #                       own prior finding ("a magnitude knob, not a semantic one") predicts
 #
-# COST: one TMR pass per config dir (plus a second one for the per-clip baseline). Minutes,
-# not hours — the expensive part of an eval is Stage 3, and that is already done.
+# COST: one TMR pass per config dir (plus a second for the per-clip baseline). Minutes, not
+# hours — the expensive part of an eval is Stage 3, and that is already done.
 #
-# ⚠ One scoring call per SWEEP, never one call spanning several tags. run_motionfix_metrics.py
-# keys its results by the directory BASENAME, so passing two tags' `attn_s2` dirs to a single
-# call would silently overwrite one with the other (this bug was found and fixed once already —
-# see MaskOptions.md §13.2). Within a sweep the basenames are unique, so pooling the flat
-# config dirs is safe; across tags it is not, which is why each tag gets its own output file.
+# ⚠ One scoring call per SWEEP, never one call spanning several. run_motionfix_metrics.py keys
+# its results by the directory BASENAME, so passing two sweeps' `attn_s2` dirs to a single call
+# would silently overwrite one with the other (this bug was found and fixed once already — see
+# MaskOptions.md §13.2). Within a sweep the basenames are unique; across sweeps they are not,
+# which is why each sweep gets its own output file.
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
 MFIX_PY="data/motionfix/mfix-env/bin/python"
-GEN_ROOT="data/motionfix/motionfix_smpl"
 OUT_ROOT="eval_results/motionfix"
-COMMON_SUBSET=1          # score every dir of a tag on the keyids they all share
+COMMON_SUBSET=1          # score every dir of a sweep on the keyids they all share
 MIN_CLIPS=32             # MotionFix's evaluator builds zero batches below this and crashes
+FLAT_GROUP="legacy"      # sweep name for config dirs sitting directly under a root
+
+# Searched in order unless --gen_root is given. The first is eval_motionfix.sh's own OUT_ROOT.
+DEFAULT_ROOTS=("data/motionfix/motionfix_smpl" "generated")
 
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 
-[[ -x "${MFIX_PY}" ]] || { echo "No MotionFix venv at ${MFIX_PY}"; exit 1; }
-[[ -d "${GEN_ROOT}" ]] || { echo "No generations at ${GEN_ROOT}"; exit 1; }
-
-list_tags() { find "${GEN_ROOT}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort; }
-# A "flat" entry is a config dir sitting directly under the root: it holds .npy itself
-# instead of holding config subdirectories.
-is_flat() { [[ -n "$(find "${GEN_ROOT}/$1" -maxdepth 1 -name '*.npy' -print -quit)" ]]; }
-
-GROUP="legacy"
-ARGS=()
+ROOTS=(); NAMES=(); ALL=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --group) GROUP="$2"; shift 2 ;;
-    *) ARGS+=("$1"); shift ;;
+    --gen_root) ROOTS+=("${2%/}"); shift 2 ;;
+    --all)      ALL=1; shift ;;
+    -h|--help)  sed -n '2,48p' "$0"; exit 0 ;;
+    *)          NAMES+=("$1"); shift ;;
   esac
 done
-set -- "${ARGS[@]+"${ARGS[@]}"}"
+[[ ${#ROOTS[@]} -eq 0 ]] && ROOTS=("${DEFAULT_ROOTS[@]}")
 
-if [[ $# -eq 0 ]]; then
-  echo "Generations on disk under ${GEN_ROOT}:"
-  while read -r t; do
-    if is_flat "$t"; then
-      echo "  ${t}  (flat config dir — scored together with the other flat ones)"
-    else
-      echo "  ${t}"
+[[ -x "${MFIX_PY}" ]] || { echo "No MotionFix venv at ${MFIX_PY}"; exit 1; }
+
+# ----------------------------------------------------------------------
+# Discovery: a "config dir" is any directory that directly contains .npy files; its parent
+# names the sweep. Nothing here depends on how deep the tree is.
+# ----------------------------------------------------------------------
+SWEEP_NAMES=(); SWEEP_DIRS=(); NPZ_ONLY=()
+
+add_dir() {
+  local sweep="$1" dir="$2" i
+  for i in "${!SWEEP_NAMES[@]}"; do
+    if [[ "${SWEEP_NAMES[$i]}" == "$sweep" ]]; then
+      SWEEP_DIRS[$i]="${SWEEP_DIRS[$i]}"$'\n'"$dir"
+      return
     fi
-  done < <(list_tags)
+  done
+  SWEEP_NAMES+=("$sweep"); SWEEP_DIRS+=("$dir")
+}
+
+for ROOT in "${ROOTS[@]}"; do
+  [[ -d "$ROOT" ]] || continue
+  while IFS= read -r d; do
+    if [[ -n "$(find "$d" -maxdepth 1 -name '*.npy' -print -quit)" ]]; then
+      parent="$(dirname "$d")"
+      if [[ "$parent" == "$ROOT" ]]; then
+        sweep="${FLAT_GROUP}"
+      else
+        sweep="${parent#"$ROOT"/}"; sweep="${sweep//\//_}"
+      fi
+      add_dir "$sweep" "$d"
+    elif [[ -n "$(find "$d" -maxdepth 1 -name '*.npz' -print -quit)" ]]; then
+      NPZ_ONLY+=("$d")
+    fi
+  done < <(find "${ROOT}" -mindepth 1 -type d | sort)
+done
+
+diagnose() {
+  local i n_cfg n_clip
   echo
-  echo "Usage: $0 <TAG> [<TAG> ...] [--group NAME]   |   $0 --all"
+  echo "Searched: ${ROOTS[*]}"
+  if [[ ${#SWEEP_NAMES[@]} -gt 0 ]]; then
+    echo
+    echo "Sweeps found (MotionFix editing output, <keyid>.npy):"
+    for i in "${!SWEEP_NAMES[@]}"; do
+      n_cfg=$(printf '%s\n' "${SWEEP_DIRS[$i]}" | wc -l)
+      n_clip=$(find "$(printf '%s\n' "${SWEEP_DIRS[$i]}" | head -1)" -maxdepth 1 -name '*.npy' | wc -l)
+      printf '  %-44s %2s config dirs, ~%s clips each\n' "${SWEEP_NAMES[$i]}" "$n_cfg" "$n_clip"
+    done
+  else
+    echo "  (no directory containing <keyid>.npy was found)"
+  fi
+  if [[ ${#NPZ_ONLY[@]} -gt 0 ]]; then
+    echo
+    echo "Ignored — these hold .npz, not .npy. That is generate.py's text-to-motion output,"
+    echo "not MotionFix editing output, and this benchmark cannot score it:"
+    printf '  %s\n' "${NPZ_ONLY[@]}" | head -8
+    [[ ${#NPZ_ONLY[@]} -gt 8 ]] && echo "  ... and $(( ${#NPZ_ONLY[@]} - 8 )) more"
+  fi
+  echo
+  echo "MotionFix edits are written by eval_motionfix.sh to"
+  echo "  data/motionfix/motionfix_smpl/<TAG>/<mask_mode>_s<scale>/<keyid>.npy"
+  echo "where TAG is RUN plus the readout suffix — e.g. exp_smplh_verbs_energy, not"
+  echo "exp_smplh_verbs. Point elsewhere with --gen_root DIR."
+}
+
+if [[ ${#NAMES[@]} -eq 0 && "$ALL" -eq 0 ]]; then
+  diagnose
+  echo
+  echo "Usage: $0 <SWEEP> [<SWEEP> ...] | --all   [--gen_root DIR]"
   exit 0
 fi
 
-if [[ "${1:-}" == "--all" ]]; then
-  mapfile -t TAGS < <(list_tags)
+# ----------------------------------------------------------------------
+# Selection: exact name, else prefix, else substring. A miss is an ERROR with a listing —
+# never a silent skip that still exits 0, which is how you end up believing a sweep scored.
+# ----------------------------------------------------------------------
+SELECTED=()
+if [[ "$ALL" -eq 1 ]]; then
+  SELECTED=("${SWEEP_NAMES[@]+"${SWEEP_NAMES[@]}"}")
 else
-  TAGS=("$@")
+  for want in "${NAMES[@]}"; do
+    hits=()
+    for s in "${SWEEP_NAMES[@]+"${SWEEP_NAMES[@]}"}"; do [[ "$s" == "$want" ]] && hits+=("$s"); done
+    if [[ ${#hits[@]} -eq 0 ]]; then
+      for s in "${SWEEP_NAMES[@]+"${SWEEP_NAMES[@]}"}"; do [[ "$s" == "$want"* ]] && hits+=("$s"); done
+      [[ ${#hits[@]} -gt 0 ]] && echo "'${want}' matched by prefix: ${hits[*]}"
+    fi
+    if [[ ${#hits[@]} -eq 0 ]]; then
+      for s in "${SWEEP_NAMES[@]+"${SWEEP_NAMES[@]}"}"; do [[ "$s" == *"$want"* ]] && hits+=("$s"); done
+      [[ ${#hits[@]} -gt 0 ]] && echo "'${want}' matched by substring: ${hits[*]}"
+    fi
+    if [[ ${#hits[@]} -eq 0 ]]; then
+      echo "ERROR: nothing on disk matches '${want}'."
+      diagnose
+      exit 1
+    fi
+    SELECTED+=("${hits[@]}")
+  done
 fi
 
-# Split by layout: tagged sweeps are scored one per tag, flat config dirs are pooled into one.
-TAGGED=(); FLAT=()
-for T in "${TAGS[@]}"; do
-  if [[ ! -d "${GEN_ROOT}/${T}" ]]; then
-    echo "skipping ${T}: no such directory ${GEN_ROOT}/${T}"
-  elif is_flat "${T}"; then
-    FLAT+=("${T}")
-  else
-    TAGGED+=("${T}")
-  fi
-done
+if [[ ${#SELECTED[@]} -eq 0 ]]; then
+  echo "ERROR: no sweep selected — there is nothing to score."
+  diagnose
+  exit 1
+fi
 
-# Collect one --smpl_dir per config dir with enough clips. realpath --no-symlinks, NOT plain
-# realpath: resolving through a symlink collapses distinct configs onto one basename, which is
-# the collision this script is structured to avoid.
-collect() {
-  SMPL_DIRS=()
-  for d in "$@"; do
-    [[ -d "$d" ]] || continue
-    n=$(find "$d" -maxdepth 1 -name '*.npy' | wc -l)
-    if [[ "$n" -lt "${MIN_CLIPS}" ]]; then
-      echo "  skipping $(basename "${d%/}"): ${n} clips < ${MIN_CLIPS}"
+# ----------------------------------------------------------------------
+# Pre-flight + scoring
+# ----------------------------------------------------------------------
+check_shape() {
+  # A wrong folder is far cheaper to catch here than 40 s into a TMR load with an opaque
+  # shape error. MotionFix edits are (T, 135) SMPL-H features.
+  local f
+  f="$(find "$1" -maxdepth 1 -name '*.npy' -print -quit)"
+  python3 - "$f" <<'PY'
+import sys, numpy as np
+a = np.load(sys.argv[1], allow_pickle=True)
+if getattr(a, "ndim", 0) != 2 or a.shape[-1] != 135:
+    print(f"      WARNING {sys.argv[1]}: shape {getattr(a, 'shape', type(a))}, expected (T, 135). "
+          f"This does not look like MotionFix SMPL-H editing output.")
+PY
+}
+
+for SWEEP in "${SELECTED[@]}"; do
+  for i in "${!SWEEP_NAMES[@]}"; do
+    [[ "${SWEEP_NAMES[$i]}" == "$SWEEP" ]] || continue
+
+    SMPL_DIRS=()
+    while IFS= read -r d; do
+      [[ -n "$d" ]] || continue
+      n=$(find "$d" -maxdepth 1 -name '*.npy' | wc -l)
+      if [[ "$n" -lt "${MIN_CLIPS}" ]]; then
+        echo "  skipping $(basename "$d"): ${n} clips < ${MIN_CLIPS}"
+        continue
+      fi
+      check_shape "$d"
+      # realpath --no-symlinks, NOT plain realpath: resolving through a symlink collapses
+      # distinct configs onto one basename, which is the collision noted at the top.
+      SMPL_DIRS+=(--smpl_dir "$(realpath --no-symlinks "$d")")
+    done <<< "${SWEEP_DIRS[$i]}"
+
+    if [[ ${#SMPL_DIRS[@]} -eq 0 ]]; then
+      echo "skipping ${SWEEP}: no config dir has >= ${MIN_CLIPS} clips"
       continue
     fi
-    SMPL_DIRS+=(--smpl_dir "$(realpath --no-symlinks "$d")")
+
+    METRICS="${OUT_ROOT}/${SWEEP}_rescored.json"
+    SUMMARY_DIR="${OUT_ROOT}/${SWEEP}_rescored"
+    mkdir -p "${OUT_ROOT}" "${SUMMARY_DIR}"
+    SUBSET_FLAG=""
+    [[ "${COMMON_SUBSET}" == "1" ]] && SUBSET_FLAG="--common_subset"
+
+    log "${SWEEP}: scoring $(( ${#SMPL_DIRS[@]} / 2 )) config dirs"
+    "${MFIX_PY}" src/eval/run_motionfix_metrics.py "${SMPL_DIRS[@]}" ${SUBSET_FLAG} \
+      --per_clip --per_clip_dir "${SUMMARY_DIR}/per_clip" --out "${METRICS}"
+
+    log "${SWEEP}: table -> ${SUMMARY_DIR}/summary.md"
+    python src/eval/aggregate_summary.py --tmr "${METRICS}" --out_dir "${SUMMARY_DIR}"
   done
-}
-
-score() {
-  local NAME="$1"; shift
-  if [[ ${#SMPL_DIRS[@]} -eq 0 ]]; then
-    echo "skipping ${NAME}: no config dir has >= ${MIN_CLIPS} clips"
-    return
-  fi
-  local METRICS="${OUT_ROOT}/${NAME}_rescored.json"
-  local SUMMARY_DIR="${OUT_ROOT}/${NAME}_rescored"
-  mkdir -p "${OUT_ROOT}" "${SUMMARY_DIR}"
-  local SUBSET_FLAG=""
-  [[ "${COMMON_SUBSET}" == "1" ]] && SUBSET_FLAG="--common_subset"
-
-  log "${NAME}: scoring $(( ${#SMPL_DIRS[@]} / 2 )) config dirs"
-  "${MFIX_PY}" src/eval/run_motionfix_metrics.py "${SMPL_DIRS[@]}" ${SUBSET_FLAG} \
-    --per_clip --per_clip_dir "${SUMMARY_DIR}/per_clip" --out "${METRICS}"
-
-  log "${NAME}: table -> ${SUMMARY_DIR}/summary.md"
-  python src/eval/aggregate_summary.py --tmr "${METRICS}" --out_dir "${SUMMARY_DIR}"
-}
-
-for TAG in "${TAGGED[@]+"${TAGGED[@]}"}"; do
-  collect "${GEN_ROOT}/${TAG}"/*/
-  score "${TAG}"
 done
 
-if [[ ${#FLAT[@]} -gt 0 ]]; then
-  FLAT_PATHS=()
-  for T in "${FLAT[@]}"; do FLAT_PATHS+=("${GEN_ROOT}/${T}"); done
-  collect "${FLAT_PATHS[@]}"
-  score "${GROUP}"
-fi
-
 log "Done."
-echo "Per-tag table:    ${OUT_ROOT}/<TAG>_rescored/summary.md"
-echo "Per-clip CSVs:    ${OUT_ROOT}/<TAG>_rescored/per_clip/<config>.csv"
+echo "Per-sweep table:  ${OUT_ROOT}/<SWEEP>_rescored/summary.md"
+echo "Per-clip CSVs:    ${OUT_ROOT}/<SWEEP>_rescored/per_clip/<config>.csv"
 echo
 echo "The CSV is the durable asset: keyid, similarity to target for the edit and for the"
 echo "unedited source, the per-clip delta, and both ranks. Every later question — subset by"
