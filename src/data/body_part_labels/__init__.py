@@ -24,9 +24,15 @@ Module map:
   parser.py      caption -> mentions -> cache items / routed group names
   cache.py       the offline build over a dataset split
   selftest.py    parser assertions and corpus verb coverage
+  llm_router.py  the inference-side LLM tier: instruction -> group set (Option 13)
+  llm_items.py   the training-side LLM tier: caption -> per-mention labels (§13.3)
+  llm_cache.py   those mentions -> a vetted label cache, merged with the regex one
 """
 
 from .cache import build_cache, load_cache
+from .llm_cache import audit, build_cache_llm, mirror_caption_pairs
+from .llm_items import route_captions_items_llm, route_items_llm
+from .llm_router import route_captions_llm, route_groups_llm
 from .parser import Mention, parse_caption, route_groups, to_items
 from .selftest import check_verb_coverage, self_check
 from .vocabulary import (HEIGHT_WORDS, LATERALISABLE, LIMB2BASE, VERB2GROUPS,
@@ -34,6 +40,9 @@ from .vocabulary import (HEIGHT_WORDS, LATERALISABLE, LIMB2BASE, VERB2GROUPS,
 
 __all__ = [
     "HEIGHT_WORDS", "LATERALISABLE", "LIMB2BASE", "Mention", "VERB2GROUPS",
-    "VERBS_EXCLUDED", "VERB_FORMS", "build_cache", "check_verb_coverage", "load_cache",
-    "parse_caption", "route_groups", "self_check", "to_items",
+    "VERBS_EXCLUDED", "VERB_FORMS", "audit", "build_cache", "build_cache_llm",
+    "check_verb_coverage", "load_cache", "mirror_caption_pairs", "parse_caption",
+    "route_captions_items_llm", "route_captions_llm", "route_groups", "route_groups_llm",
+    "route_items_llm", "self_check",
+    "to_items",
 ]

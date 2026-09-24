@@ -144,7 +144,7 @@ def build_model_stack(config, dataset, device):
     return text_encoder, model, ema, schedule, amp_dtype, scaler
 
 
-def _ground_cache(config, path, text_encoder):
+def _ground_cache(config, path, text_encoder, explicit=False):
     """The caption -> (columns, groups) label cache, built offline once.
 
     PRECOMPUTED, not parsed online, and the reasons are worth writing down because "just
@@ -158,9 +158,25 @@ def _ground_cache(config, path, text_encoder):
         audited artefact with nothing to notice.
     Built here if absent — a run should not fail on a missing derived artefact — which
     needs the text encoder, i.e. exactly the case the caller already checked.
+
+    EXCEPT when the path was asked for by name (`explicit`), which is a refusal, not an
+    auto-build. The auto-build produces the REGEX label set; a run that typed
+    `--attn_ground_cache .../ground_labels_llm.json` and got regex labels written under
+    that filename would train for 20 h on the wrong supervision, record the LLM path in
+    its config, and look correct in every log line afterwards. There is no later moment
+    that catches it — the alternative label sets (data/body_part_labels/llm_cache.py) are
+    built by their own script, so "the file is not there yet" means the build has not
+    finished, never that it should be generated here.
     """
     if os.path.exists(path):
         return load_cache(path)
+    if explicit:
+        raise FileNotFoundError(
+            f"--attn_ground_cache {path!r} does not exist. This is NOT auto-built: the "
+            f"auto-build produces the REGEX label set, so generating it here would "
+            f"silently train on regex labels under the name you asked for. Build the "
+            f"file first (e.g. python src/build_ground_labels_llm.py --data_root "
+            f"{config['data_root']}), or drop the flag to use the default regex cache.")
     log.info("Grounding labels not found at %s — building (one offline pass over the "
              "captions; see src/probe_ground_labels.py for the audit).", path)
     return build_cache(config["data_root"], text_encoder,
@@ -199,9 +215,11 @@ def build_grounding(config, model, dataset, text_encoder):
         return GroundingConfig()
     _check_grounding_preconditions(config, model, dataset)
 
-    cache_path = (config.get("attn_ground_cache")
-                  or os.path.join(config["data_root"], "ground_labels.json"))
-    cache = _ground_cache(config, cache_path, text_encoder)
+    explicit_cache = config.get("attn_ground_cache")
+    cache_path = explicit_cache or os.path.join(config["data_root"],
+                                                "ground_labels.json")
+    cache = _ground_cache(config, cache_path, text_encoder,
+                          explicit=bool(explicit_cache))
     window = config.get("attn_ground_window")
     cfg = GroundingConfig(
         weight=config["attn_ground_weight"],
@@ -240,8 +258,13 @@ def _report_grounding(cfg, cache, cache_path, n_groups):
              "sampled per step), mirror %g @ margin %g (tier 1), even %g (tier 2), "
              "warmup %d epochs, %s.", cfg.weight, cfg.layers, cfg.mirror, cfg.margin,
              cfg.even, cfg.warmup_epochs, gate)
-    log.info("  Labels: %d captions / %d items from %s (target sizes |S| = %s).",
-             len(cache), len(items), cache_path, sizes)
+    # "%d captions / %d items" reads as a fraction at a glance; they are two independent
+    # counts (one caption yields several body-part items), and a user reported misreading
+    # it as "51k of 166k".
+    log.info("  Labels from %s", cache_path)
+    log.info("    %d captions, %d supervised items (%.1f per caption), "
+             "target sizes |S| = %s.",
+             len(cache), len(items), len(items) / max(len(cache), 1), sizes)
     log.info("  Watch train/ground_m_S_epoch (chance %.3f for this label mix, not "
              "1/G = %.3f) and train/ground_src_corr_epoch (kill above ~0.5 and rising).",
              chance, 1 / n_groups)
