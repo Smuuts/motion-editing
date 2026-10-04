@@ -124,11 +124,19 @@ def compute_mm_dist(motion_embs, text_embs) -> float:
     return float(np.sqrt(((motion_embs - text_embs) ** 2).sum(axis=-1)).mean())
 
 
-def compute_diversity(motion_embs, diversity_times=300, seed=0) -> float:
+def compute_diversity(motion_embs, diversity_times=300, seed=0, replications=20) -> float:
     """Mean distance between randomly paired motion embeddings — detects mode collapse;
-    should land close to the ground-truth diversity."""
+    should land close to the ground-truth diversity.
+
+    Averaged over `replications` draws of `diversity_times` pairs, as the published protocol
+    does (Guo et al. 2022, MDM: 20 replications). One 300-pair draw scatters by about ±0.2 on
+    HumanML3D test, and the seed-42 draw lands at 10.16 against 9.55 over all pairs.
+    `replications=1` reproduces the earlier single-draw values exactly."""
     n = len(motion_embs)
     times = min(diversity_times, n)
     rng = np.random.default_rng(seed)
-    first, second = rng.choice(n, times, replace=False), rng.choice(n, times, replace=False)
-    return float(np.sqrt(((motion_embs[first] - motion_embs[second]) ** 2).sum(axis=-1)).mean())
+    draws = []
+    for _ in range(replications):
+        first, second = rng.choice(n, times, replace=False), rng.choice(n, times, replace=False)
+        draws.append(np.sqrt(((motion_embs[first] - motion_embs[second]) ** 2).sum(axis=-1)).mean())
+    return float(np.mean(draws))

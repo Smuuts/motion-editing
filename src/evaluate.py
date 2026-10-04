@@ -62,6 +62,9 @@ def parse_args():
     p.add_argument("--pool_size",     type=int,   default=32)
     p.add_argument("--diversity_times", type=int, default=300,
                    help="Number of random pairs for the Diversity metric.")
+    p.add_argument("--diversity_replications", type=int, default=20,
+                   help="Diversity is averaged over this many draws of --diversity_times "
+                        "pairs, as in the published protocol. 1 = the old single draw.")
     p.add_argument("--smooth_sigma",  type=float, default=1.5)
     p.add_argument("--seed",          type=int,   default=42)
     add_logging_args(p)
@@ -152,8 +155,10 @@ def main():
     mm_dist = compute_mm_dist(gen_embs, text_embs)
     log.info(f"MM-Dist {mm_dist:.4f}  (lower = better; distance to own caption)")
 
-    div_gen = compute_diversity(gen_embs, args.diversity_times, seed=args.seed)
-    div_gt  = compute_diversity(gt_embs,  args.diversity_times, seed=args.seed)
+    div_gen = compute_diversity(gen_embs, args.diversity_times, seed=args.seed,
+                                replications=args.diversity_replications)
+    div_gt  = compute_diversity(gt_embs,  args.diversity_times, seed=args.seed,
+                                replications=args.diversity_replications)
     log.info(f"Diversity (gen) {div_gen:.4f}   (real motions: {div_gt:.4f} — closer is better)")
 
     summary = {
@@ -170,6 +175,7 @@ def main():
         "diversity_gt":  round(div_gt, 6),
         "pool_size":     effective_pool,
         "diversity_times": min(args.diversity_times, N),
+        "diversity_replications": args.diversity_replications,
         "generation_args": {k: v for k, v in manifest.items() if k != "clip_ids"},
     }
     out_json = os.path.join(args.output_dir, f"results_{args.experiment_name}.json")
