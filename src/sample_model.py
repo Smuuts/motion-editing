@@ -28,7 +28,7 @@ from data.clips import iter_split_clips
 from model.text_encoder import build_text_encoder
 from model.schedule import NoiseSchedule
 from model.sampler import DDPMSampler
-from utils.cli import resolve_device
+from utils.cli import add_render_args, render_vertices, resolve_device
 from utils.decode import recover_joints
 from utils.model_io import load_model
 from utils.skeleton import mpjpe_from_joints
@@ -56,6 +56,7 @@ def parse_args():
     p.add_argument("--smooth_sigma",   type=float, default=1.5)
     p.add_argument("--no_ema",         action="store_true",
                    help="Load model.pt instead of ema.pt.")
+    add_render_args(p)
     return p, p.parse_args()
 
 
@@ -108,26 +109,32 @@ def main():
             context, length=args.length, guidance_scale=args.guidance_scale,
             num_steps=args.num_steps).cpu().numpy()          # (length, D) normalised
 
-        joints_gen = recover_joints(motion_norm * std + mean, feature_mode)
+        raw_gen = motion_norm * std + mean
+        joints_gen = recover_joints(raw_gen, feature_mode)
         if args.smooth_sigma > 0:
             joints_gen = gaussian_filter1d(joints_gen, sigma=args.smooth_sigma, axis=0)
+        verts_gen = render_vertices(raw_gen, feature_mode, args)
 
         slug = prompt[:40].replace(" ", "_")
         if item["raw_feat"] is None:
             save_animation(joints_gen,
                            os.path.join(args.output_dir, f"{i:03d}_{slug}.mp4"),
-                           title=prompt)
+                           title=prompt, vertices=verts_gen,
+                           skeleton_overlay=args.mesh_overlay, mesh_size=args.mesh_size)
             continue
 
         joints_gt = recover_joints(item["raw_feat"], feature_mode)
         if args.smooth_sigma > 0:
             joints_gt = gaussian_filter1d(joints_gt, sigma=args.smooth_sigma, axis=0)
+        verts_gt = render_vertices(item["raw_feat"], feature_mode, args)
         per_frame, total_mpjpe, T_common = mpjpe_from_joints(joints_gen, joints_gt)
         log.info(f"   MPJPE: {total_mpjpe*1000:.1f} mm  (over {T_common} frames)")
         save_comparison_animation(
             joints_gen, joints_gt, per_frame, total_mpjpe,
             os.path.join(args.output_dir, f"{i:03d}_{clip_id}_{slug}.mp4"),
-            title=prompt, clip_id=clip_id)
+            title=prompt, clip_id=clip_id,
+            vertices_gen=verts_gen, vertices_gt=verts_gt,
+            skeleton_overlay=args.mesh_overlay, mesh_size=args.mesh_size)
 
     log.info(f"\nDone. Results saved to: {args.output_dir}/")
 

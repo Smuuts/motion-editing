@@ -15,8 +15,8 @@ from model.body_groups import group_names, parse_axis_spec
 from utils.logger import add_logging_args, configure_logging
 
 __all__ = ["add_data_args", "add_logging_args", "add_mask_args", "add_model_args",
-           "configure_logging", "parse_group_mask", "parse_group_names",
-           "per_edit_lookup", "resolve_device"]
+           "add_render_args", "configure_logging", "parse_group_mask", "parse_group_names",
+           "per_edit_lookup", "render_vertices", "resolve_device"]
 
 
 # ── shared flag groups ───────────────────────────────────────────────────────────
@@ -53,6 +53,50 @@ def add_data_args(parser, *, split=True, source=False, max_frames=196, smplh=Fal
                             default="data/motionfix/data/body_models/smplh",
                             help="smplh checkpoints: SMPLHLayer dir (SMPLH_NEUTRAL.npz).")
     return parser
+
+
+def add_render_args(parser):
+    """--render / --mesh_overlay / --mesh_size: skeleton or SMPL body in the animations.
+
+    `--render mesh` needs per-joint rotations, so it works on `smplh` checkpoints only;
+    `utils.visualise.vertices_from_features` returns None on a 263-d humanml3d clip and the
+    animation falls back to the skeleton with a warning rather than failing.
+    """
+    # Imported here, not at module scope: every entry point reaches its flags through this
+    # file, and most of them never plot — no reason to pull matplotlib into their startup.
+    from utils.visualise import DEFAULT_MESH_SIZE
+
+    parser.add_argument("--render", default="skeleton", choices=["skeleton", "mesh"],
+                        help="What the animations draw: 'skeleton' (default) = the kinematic "
+                             "chains; 'mesh' = the posed SMPL body surface, smplh only.")
+    parser.add_argument("--mesh_overlay", action="store_true",
+                        help="--render mesh: draw the kinematic chains on top of the body "
+                             "(for checking a joint against the surface it drives).")
+    parser.add_argument("--hands", default="flat", choices=["flat", "relaxed"],
+                        help="--render mesh: hand pose of the body. The representation has no "
+                             "finger joints, so the hands never move either way. 'flat' = the "
+                             "SMPL-H zero pose, 'relaxed' = its mean pose with curled fingers.")
+    parser.add_argument("--mesh_size", type=int, default=DEFAULT_MESH_SIZE,
+                        help="--render mesh: offscreen buffer edge in px. Larger is sharper "
+                             "and proportionally slower.")
+    return parser
+
+
+def render_vertices(raw_feat, feature_mode, args):
+    """Raw features → (T, V, 3) SMPL vertices under `--render mesh`, else None (skeleton).
+
+    The read side of `add_render_args`, here rather than in each script so the two cannot
+    disagree about what `--render mesh` means. Vertices are smoothed with the caller's own
+    `--smooth_sigma` (0 where a script has no such flag), matching what it does to its joints
+    so an overlaid chain stays on the body.
+    """
+    from utils.visualise import vertices_from_features
+
+    if args.render != "mesh":
+        return None
+    return vertices_from_features(raw_feat, feature_mode,
+                                  smooth_sigma=getattr(args, "smooth_sigma", 0.0),
+                                  hands=getattr(args, "hands", "flat"))
 
 
 def add_mask_args(parser, *, mask_timesteps=40, thresholds=True, windows=True,

@@ -1,17 +1,34 @@
 """
-Skeleton animations: render (T, 22, 3) world-space joints as an MP4/GIF.
+Motion animations: render (T, 22, 3) world-space joints as an MP4/GIF.
 
     from utils.visualise import save_animation
     save_animation(joints, "output.gif", title="walk forward")
 
+Every entry point draws either a **skeleton** (the kinematic chains, the default) or a **SMPL
+body mesh**, chosen per panel by whether `vertices` were passed:
+
+    from utils.visualise import vertices_from_features
+    verts = vertices_from_features(raw_feat, feature_mode, smooth_sigma)   # None unless smplh
+    save_animation(joints, "output.mp4", vertices=verts, skeleton_overlay=True)
+
+`joints` stays required either way — the mesh panels follow the pelvis with it, and it is what
+the overlay draws — so a caller that cannot build vertices (`humanml3d`, which stores joint
+positions rather than rotations) simply passes None and gets the old behaviour. Mesh frames are
+rendered offscreen by `mesh.py` and drawn into an ordinary 2D axis, so the figure furniture —
+titles, the MPJPE readout, the edit-mask strip — is identical in both modes.
+
 Feature → joints decoding lives in utils/decode.py (`recover_joints`).
 """
 
-import numpy as np
-import matplotlib.pyplot as plt
+from collections import namedtuple
+
 import matplotlib.animation as animation
+import matplotlib.pyplot as plt
+import numpy as np
 from mpl_toolkits.mplot3d import Axes3D    # noqa: F401 (registers the 3d projection)
+
 from utils.logger import get_logger
+from utils.visualise.mesh import DEFAULT_MESH_SIZE, mesh_renderer
 
 log = get_logger(__name__)
 
@@ -30,11 +47,14 @@ CHAIN_COLORS = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6"]
 
 VIEWPORT_HALF_WIDTH = 1.0   # metres; body ~0.5 m wide, arms ~0.8 m
 
+# View angle, shared by both renderers so the skeleton and the mesh cannot drift apart:
+# matplotlib takes it through view_init, MeshRenderer through the same spherical convention.
+CAMERA_ELEV, CAMERA_AZIM = 20.0, -70.0
+
 
 # ── shared rendering helpers ────────────────────────────────────────────────────
-# The three entry points below all draw the same KINEMATIC_CHAIN skeleton on black 3D
-# axes and recentre the viewport on the root joint every frame; they differ only in
-# how many axes they use and whether the result is saved or shown.
+# The three entry points below all recentre the viewport on the root joint every frame and
+# differ only in how many panels they use and whether the result is saved or shown.
 
 def _style_3d_axis(ax):
     """Black background + hidden panes — the shared look of every skeleton axis."""
@@ -47,7 +67,7 @@ def _style_3d_axis(ax):
 def _init_3d_axis(ax, z_min, z_max, title=None):
     """One-time axis setup (view angle, labels, height range) — call from init_func."""
     ax.set_zlim(z_min, z_max)
-    ax.view_init(elev=20, azim=-70)
+    ax.view_init(elev=CAMERA_ELEV, azim=CAMERA_AZIM)
     ax.set_xlabel("X",       color="gray", fontsize=7)
     ax.set_ylabel("Z (fwd)", color="gray", fontsize=7)
     ax.set_zlabel("Y (up)",  color="gray", fontsize=7)
@@ -87,6 +107,117 @@ def _height_range(*joint_arrays):
     return lo - 0.2, hi + 0.2
 
 
+# Vertical framing shared by every panel of one figure, so two panels of a comparison are drawn
+# at the same scale: z_min/z_max are the skeleton axes' height limits, centre_y/half_height the
+# mesh camera's. They are computed from different arrays on purpose — a body's feet and scalp
+# lie outside its ankle and head *joints*, and framing the mesh on joints would clip them.
+_Framing = namedtuple("_Framing", "z_min z_max centre_y half_height")
+
+
+def _framing(joint_arrays, vertex_arrays):
+    z_min, z_max = _height_range(*joint_arrays)
+    if vertex_arrays:
+        lo = min(v[:, :, 1].min() for v in vertex_arrays)
+        hi = max(v[:, :, 1].max() for v in vertex_arrays)
+    else:
+        lo, hi = z_min, z_max
+    return _Framing(z_min, z_max, (lo + hi) / 2.0,
+                    max((hi - lo) / 2.0 + 0.15, VIEWPORT_HALF_WIDTH))
+
+
+# ── panels ───────────────────────────────────────────────────────────────────────
+# A panel owns one axis and the data drawn on it, and exposes init()/update(frame)/artists.
+# The two kinds are interchangeable, which is what keeps the entry points below mode-agnostic.
+
+class _SkeletonPanel:
+    """A 3D axis drawing the kinematic chains, viewport following the pelvis."""
+
+    def __init__(self, fig, pos, joints, framing, title=None):
+        self.joints, self.framing, self.title = joints, framing, title
+        self.ax = fig.add_subplot(pos, projection="3d")
+        _style_3d_axis(self.ax)
+        self.lines = _make_skeleton_lines(self.ax)
+
+    @property
+    def artists(self):
+        return [line for _, line in self.lines]
+
+    def init(self):
+        _init_3d_axis(self.ax, self.framing.z_min, self.framing.z_max, title=self.title)
+        return self.artists
+
+    def update(self, frame):
+        if frame < len(self.joints):
+            _update_skeleton(self.ax, self.lines, self.joints, frame,
+                             self.framing.z_min, self.framing.z_max)
+        return self.artists
+
+
+class _MeshPanel:
+    """A 2D axis showing offscreen-rendered SMPL bodies, optionally with the chains on top.
+
+    The axis is 2D because its content is an image; `imshow` is given the renderer's pixel
+    extent so the projected overlay can be plotted in raw pixel coordinates.
+    """
+
+    def __init__(self, fig, pos, joints, vertices, framing, renderer, title=None,
+                 skeleton_overlay=False):
+        self.joints, self.vertices = joints, vertices
+        self.framing, self.renderer, self.title = framing, renderer, title
+
+        size = renderer.size
+        self.ax = fig.add_subplot(pos)
+        self.ax.set_facecolor("black")
+        self.ax.set_xticks([])
+        self.ax.set_yticks([])
+        for spine in self.ax.spines.values():
+            spine.set_visible(False)
+        self.image = self.ax.imshow(np.zeros((size, size, 3), dtype=np.uint8),
+                                    extent=(0, size, size, 0), interpolation="bilinear")
+        self.ax.set_xlim(0, size)
+        self.ax.set_ylim(size, 0)
+
+        self.lines = [] if not skeleton_overlay else [
+            (chain, self.ax.plot([], [], "-o", color=color, markersize=2, linewidth=1.2,
+                                 alpha=0.9)[0])
+            for chain, color in zip(KINEMATIC_CHAIN, CHAIN_COLORS)
+        ]
+
+    @property
+    def artists(self):
+        return [self.image] + [line for _, line in self.lines]
+
+    def init(self):
+        if self.title:
+            self.ax.set_title(self.title, color="white", fontsize=9, pad=4)
+        return self.artists
+
+    def update(self, frame):
+        if frame < len(self.vertices):
+            # The camera tracks the pelvis in X/Z (as the skeleton viewport does) but holds a
+            # fixed height, so vertical motion shows as vertical motion instead of being
+            # cancelled out by the camera.
+            pose_frame = min(frame, len(self.joints) - 1)
+            target = self.joints[pose_frame, 0].copy()
+            target[1] = self.framing.centre_y
+            rgb, pixels = self.renderer.render(
+                self.vertices[frame], target, self.framing.half_height,
+                overlay_points=self.joints[pose_frame] if self.lines else None)
+            self.image.set_data(rgb)
+            for chain, line in self.lines:
+                line.set_data(pixels[chain, 0], pixels[chain, 1])
+        return self.artists
+
+
+def _make_panel(fig, pos, joints, vertices, framing, renderer, title=None,
+                skeleton_overlay=False):
+    """A mesh panel when this clip has vertices, the skeleton panel when it does not."""
+    if vertices is None:
+        return _SkeletonPanel(fig, pos, joints, framing, title=title)
+    return _MeshPanel(fig, pos, joints, vertices, framing, renderer, title=title,
+                      skeleton_overlay=skeleton_overlay)
+
+
 def _run(fig, update, init, frames, fps, save_path):
     """Drive a FuncAnimation and either save it or show it (blocking).
 
@@ -103,25 +234,20 @@ def _run(fig, update, init, frames, fps, save_path):
     plt.close(fig)
 
 
-def _animate_one(joints, title, fps, figsize, save_path):
-    """Single-skeleton driver shared by save_animation / show_animation."""
-    z_min, z_max = _height_range(joints)
+def _animate_one(joints, title, fps, figsize, save_path, vertices=None,
+                 skeleton_overlay=False, mesh_size=DEFAULT_MESH_SIZE):
+    """Single-body driver shared by save_animation / show_animation."""
+    framing = _framing([joints], [] if vertices is None else [vertices])
 
     fig = plt.figure(figsize=figsize, facecolor="black")
     fig.patch.set_facecolor("black")
-    ax = fig.add_subplot(111, projection="3d")
-    _style_3d_axis(ax)
-    lines = _make_skeleton_lines(ax)
 
-    def init():
-        _init_3d_axis(ax, z_min, z_max, title=title)
-        return [l for _, l in lines]
+    with mesh_renderer(vertices is not None, size=mesh_size,
+                       elev=CAMERA_ELEV, azim=CAMERA_AZIM) as renderer:
+        panel = _make_panel(fig, 111, joints, vertices, framing, renderer, title=title,
+                            skeleton_overlay=skeleton_overlay)
+        _run(fig, panel.update, panel.init, joints.shape[0], fps, save_path)
 
-    def update(frame):
-        _update_skeleton(ax, lines, joints, frame, z_min, z_max)
-        return [l for _, l in lines]
-
-    _run(fig, update, init, joints.shape[0], fps, save_path)
     if save_path is not None:
         log.info(f"Saved animation: {save_path}")
 
@@ -133,19 +259,32 @@ def _ellipsis(s, n):
 # ── public entry points ──────────────────────────────────────────────────────────
 
 def save_animation(joints: np.ndarray, save_path: str, title: str = "",
-                   fps: int = 20, figsize: tuple = (6, 6)):
-    """Render a skeleton animation and save it as MP4 (needs ffmpeg) or GIF (pillow).
+                   fps: int = 20, figsize: tuple = (6, 6),
+                   vertices: np.ndarray = None, skeleton_overlay: bool = False,
+                   mesh_size: int = DEFAULT_MESH_SIZE):
+    """Render an animation and save it as MP4 (needs ffmpeg) or GIF (pillow).
 
-    joints : (T, 22, 3) world-space metres, SMPL axes (X=right, Y=up, Z=fwd).
+    joints   : (T, 22, 3) world-space metres, SMPL axes (X=right, Y=up, Z=fwd).
+    vertices : (T, V, 3) SMPL body vertices from `vertices_from_features` — renders the body
+               mesh instead of the skeleton. None (default) keeps the skeleton.
+    skeleton_overlay : draw the kinematic chains on top of the mesh (ignored without vertices).
+
     The viewport follows the pelvis, so a long trajectory doesn't shrink the figure.
     """
-    _animate_one(joints, title, fps, figsize, save_path)
+    _animate_one(joints, title, fps, figsize, save_path, vertices=vertices,
+                 skeleton_overlay=skeleton_overlay, mesh_size=mesh_size)
 
 
 def show_animation(joints: np.ndarray, title: str = "", fps: int = 20,
-                   figsize: tuple = (6, 6)):
-    """Display a skeleton animation interactively (blocking). Viewport follows the root."""
-    _animate_one(joints, title, fps, figsize, save_path=None)
+                   figsize: tuple = (6, 6), vertices: np.ndarray = None,
+                   skeleton_overlay: bool = False, mesh_size: int = DEFAULT_MESH_SIZE):
+    """Display an animation interactively (blocking). Viewport follows the root.
+
+    See `save_animation` for `vertices` / `skeleton_overlay`. Note that a mesh panel is an
+    image, so it cannot be rotated with the mouse the way the skeleton's 3D axis can.
+    """
+    _animate_one(joints, title, fps, figsize, save_path=None, vertices=vertices,
+                 skeleton_overlay=skeleton_overlay, mesh_size=mesh_size)
 
 
 def save_comparison_animation(
@@ -161,6 +300,10 @@ def save_comparison_animation(
     gen_label: str = "Generated",
     gt_label: str = None,
     edit_mask: np.ndarray = None,
+    vertices_gen: np.ndarray = None,
+    vertices_gt: np.ndarray = None,
+    skeleton_overlay: bool = False,
+    mesh_size: int = DEFAULT_MESH_SIZE,
 ):
     """
     Side-by-side animation: generated (left) vs ground truth / source (right).
@@ -170,29 +313,23 @@ def save_comparison_animation(
     edit_mask       : (T,) bool — when given, a timeline strip (green = edited) with a
                       moving cursor is drawn under the panels and the per-frame readout
                       shows EDIT / frozen. None → no strip.
+    vertices_gen / vertices_gt : (T, V, 3) SMPL vertices from `vertices_from_features`; each
+                      panel renders the body mesh when its array is given and the skeleton
+                      when it is None, so the two sides can differ.
+    skeleton_overlay : draw the kinematic chains on top of whichever panels are meshes.
     """
     T_common, T_gen, T_gt = len(mpjpe_per_frame), len(joints_gen), len(joints_gt)
-    z_min, z_max = _height_range(joints_gen, joints_gt)
+    framing = _framing([joints_gen, joints_gt],
+                       [v for v in (vertices_gen, vertices_gt) if v is not None])
 
     fig = plt.figure(figsize=figsize, facecolor="black")
     fig.patch.set_facecolor("black")
-    ax_gen = fig.add_subplot(121, projection="3d")
-    ax_gt  = fig.add_subplot(122, projection="3d")
-    for ax in (ax_gen, ax_gt):
-        _style_3d_axis(ax)
 
     if title:
         fig.suptitle(_ellipsis(title, 73), color="white", fontsize=8, y=0.99)
-    ax_gen.set_title(_ellipsis(gen_label, 47), color="white", fontsize=9, pad=4)
-    ax_gt.set_title(_ellipsis(gt_label if gt_label is not None
-                              else f"Ground Truth  [{clip_id}]", 47),
-                    color="white", fontsize=9, pad=4)
 
     mpjpe_txt = fig.text(0.5, 0.01, f"Avg MPJPE: {total_mpjpe * 1000:.1f} mm",
                          ha="center", color="cyan", fontsize=9)
-
-    lines_gen = _make_skeleton_lines(ax_gen)
-    lines_gt  = _make_skeleton_lines(ax_gt)
 
     cursor = None
     if edit_mask is not None:
@@ -208,28 +345,34 @@ def save_comparison_animation(
                       ha="right", va="center", color="white", fontsize=7)
         cursor = strip_ax.axvline(0, color="red", lw=1.5)
 
-    def init():
-        _init_3d_axis(ax_gen, z_min, z_max)
-        _init_3d_axis(ax_gt,  z_min, z_max)
-        return [l for _, l in lines_gen] + [l for _, l in lines_gt] + [mpjpe_txt]
+    with mesh_renderer(vertices_gen is not None or vertices_gt is not None, size=mesh_size,
+                       elev=CAMERA_ELEV, azim=CAMERA_AZIM) as renderer:
+        # Both panel kinds take their label through the constructor and set it in init().
+        panel_gen = _make_panel(fig, 121, joints_gen, vertices_gen, framing, renderer,
+                                title=_ellipsis(gen_label, 47),
+                                skeleton_overlay=skeleton_overlay)
+        panel_gt = _make_panel(fig, 122, joints_gt, vertices_gt, framing, renderer,
+                               title=_ellipsis(gt_label if gt_label is not None
+                                               else f"Ground Truth  [{clip_id}]", 47),
+                               skeleton_overlay=skeleton_overlay)
 
-    def update(frame):
-        if frame < T_gen:
-            _update_skeleton(ax_gen, lines_gen, joints_gen, frame, z_min, z_max)
-        if frame < T_gt:
-            _update_skeleton(ax_gt, lines_gt, joints_gt, frame, z_min, z_max)
-        if frame < T_common:
-            status = ""
-            if edit_mask is not None and frame < len(edit_mask):
-                status = "  |  ● EDIT" if edit_mask[frame] > 0.5 else "  |  ○ frozen"
-            mpjpe_txt.set_text(
-                f"Frame {frame:3d}: {mpjpe_per_frame[frame] * 1000:.1f} mm  |  "
-                f"Avg: {total_mpjpe * 1000:.1f} mm{status}")
-        extra = []
-        if cursor is not None:
-            cursor.set_xdata([frame, frame])
-            extra = [cursor]
-        return [l for _, l in lines_gen] + [l for _, l in lines_gt] + [mpjpe_txt] + extra
+        def init():
+            return panel_gen.init() + panel_gt.init() + [mpjpe_txt]
 
-    _run(fig, update, init, max(T_gen, T_gt), fps, save_path)
+        def update(frame):
+            artists = panel_gen.update(frame) + panel_gt.update(frame)
+            if frame < T_common:
+                status = ""
+                if edit_mask is not None and frame < len(edit_mask):
+                    status = "  |  ● EDIT" if edit_mask[frame] > 0.5 else "  |  ○ frozen"
+                mpjpe_txt.set_text(
+                    f"Frame {frame:3d}: {mpjpe_per_frame[frame] * 1000:.1f} mm  |  "
+                    f"Avg: {total_mpjpe * 1000:.1f} mm{status}")
+            if cursor is not None:
+                cursor.set_xdata([frame, frame])
+                artists = artists + [cursor]
+            return artists + [mpjpe_txt]
+
+        _run(fig, update, init, max(T_gen, T_gt), fps, save_path)
+
     log.info(f"Saved comparison: {save_path}")

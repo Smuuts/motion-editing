@@ -1,7 +1,8 @@
 """
 Plotting for the whole project, split by what is being drawn:
 
-  animation.py    skeleton animations (single, and generated-vs-source comparison)
+  animation.py    motion animations (single, and generated-vs-source comparison)
+  mesh.py         SMPL body surfaces + the offscreen renderer animation.py draws them with
   heatmaps.py     axis-level primitives shared by every analysis figure
   masks.py        the implicit-mask (M1/M2) panels, per instruction and per noise band
   corrections.py  the mask-correction figures (source subtraction, signed psi)
@@ -25,9 +26,10 @@ from .gen_diff import plot_gen_diff, plot_gen_diff_summary
 from .heatmaps import mean_off_diagonal
 from .masks import (plot_mask_noise_bands, plot_mask_problem, plot_mask_quant,
                     save_mask_heatmap)
+from .mesh import DEFAULT_MESH_SIZE, vertices_from_features
 
 __all__ = [
-    "CHAIN_COLORS", "KINEMATIC_CHAIN",
+    "CHAIN_COLORS", "KINEMATIC_CHAIN", "DEFAULT_MESH_SIZE", "vertices_from_features",
     "save_animation", "save_comparison_animation", "show_animation",
     "plot_noise_level_sweep", "mean_off_diagonal",
     "plot_gen_diff", "plot_gen_diff_summary",

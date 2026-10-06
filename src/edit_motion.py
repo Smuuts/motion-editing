@@ -49,13 +49,14 @@ from scipy.ndimage import gaussian_filter1d
 from data.body_part_labels import route_groups
 from data.clips import load_source
 from editing import MotionEditor
+from editing.masking.release import add_neighbours, blur_mask
 from model.body_groups import GROUP_NAMES, resolve_group_context
 from model.schedule import NoiseSchedule
 from model.text_encoder import build_text_encoder
 from training.grounding import resolve_readout_columns, resolve_readout_layers
 from utils.cli import (
-    add_data_args, add_mask_args, add_model_args, parse_group_mask, per_edit_lookup,
-    resolve_device,
+    add_data_args, add_mask_args, add_model_args, add_render_args, parse_group_mask,
+    per_edit_lookup, render_vertices, resolve_device,
 )
 # recover_joints dispatches the feature_mode-correct decode: RIC for humanml3d (263-d),
 # SMPL-H forward kinematics for smplh (135-d).
@@ -105,8 +106,24 @@ def parse_args():
                         "(sink-dominated). 'renorm' = semantic share of it "
                         "(Attend-and-Excite). 'spatial' = per-token spatial profile "
                         "(DAAM). 'renorm_spatial' = both.")
+    p.add_argument("--neighbour_groups", nargs="+", default=None,
+                   help="Body-part groups released from hard inpainting in every frame the "
+                        "mask edits, e.g. 'spine head' for an arm edit, so the model can "
+                        "adapt them to the edit instead of freezing them to the source. "
+                        "Groups the mask already selects are left as they are. Off by default.")
+    p.add_argument("--neighbour_weight", type=float, default=0.0,
+                   help="--neighbour_groups: share of the edit's guidance scale those groups "
+                        "receive. 0 = released only, no guidance.")
+    p.add_argument("--neighbour_release", type=float, default=1.0,
+                   help="--neighbour_groups: how free those groups are. 1 = fully released, "
+                        "r in (0, 1) = pulled back towards the source by 1 - r at every step.")
+    p.add_argument("--mask_blur", type=float, default=None,
+                   help="Release the groups the mask selects from inpainting in every frame "
+                        "and blur its frame gating with a Gaussian of this sigma (frames) into "
+                        "a guidance weight. 0 = release only, 0/1 weight. Off by default.")
     p.add_argument("--smooth_sigma", type=float, default=1.5)
     p.add_argument("--out_dir", default="eval_results/edit_demo")
+    add_render_args(p)
     add_logging_args(p)
     return configure_logging(p.parse_args())
 
@@ -146,6 +163,7 @@ def main():
     x0 = torch.from_numpy((raw_feat - mean) / std).float().unsqueeze(0).to(device)
     valid_frames = torch.ones(F, dtype=torch.bool, device=device)
     joints_src = decode(raw_feat, feature_mode, args.smooth_sigma)   # shared by all jobs
+    verts_src = render_vertices(raw_feat, feature_mode, args)         # None unless --render mesh
     log.info(f"Source: {clip_id}  ({F} frames)  original prompt: {src_caption!r}")
 
     # ── invert ONCE (inversion depends only on the source, not the instruction) ──
@@ -230,14 +248,26 @@ def main():
             m1_select=args.m1_select, m1_rank_ratio=args.m1_rank_ratio,
             m1_rank_max=args.m1_rank_max,
         )
+        if args.mask_blur is not None:
+            masks = [blur_mask(m, args.mask_blur, is_group, editor, valid_frames)
+                     for m in masks]
+            log.info(f"  selected groups released in every frame, gating blurred over "
+                     f"sigma {args.mask_blur:g} frames")
+        if args.neighbour_groups:
+            masks = [add_neighbours(m, args.neighbour_groups, args.neighbour_weight,
+                                    list(gnames), is_group, editor, args.neighbour_release)
+                     for m in masks]
+            log.info(f"  neighbours {args.neighbour_groups} released, guidance weight "
+                     f"{args.neighbour_weight:g}")
         x_edit = editor.edit(state, ctxs, masks, scales=scales,
                              guidance_alpha_floor=args.guidance_alpha_floor)  # (1,F,D)
         for i, m in enumerate(masks):
             log.info(f"  mask[{i}] {job[i]!r}: {int(m['edited'].sum())}/{F} frames, "
                   f"{int(m['m_group'].sum())} active (frame,group) cells")
 
-        joints_edit = decode(x_edit[0].cpu().numpy() * std + mean, feature_mode,
-                             args.smooth_sigma)
+        raw_edit = x_edit[0].cpu().numpy() * std + mean
+        joints_edit = decode(raw_edit, feature_mode, args.smooth_sigma)
+        verts_edit = render_vertices(raw_edit, feature_mode, args)
         per_frame = np.sqrt(((joints_edit - joints_src) ** 2).sum(-1)).mean(-1)   # (F,)
         # A frame is "edited" if ANY of the job's edits touches it.
         edit_mask = np.logical_or.reduce(
@@ -253,6 +283,8 @@ def main():
             gen_label=f"EDIT: {edit_text}",
             gt_label=f"SOURCE: {src_caption}" if src_caption else f"SOURCE [{clip_id}]",
             edit_mask=edit_mask,
+            vertices_gen=verts_edit, vertices_gt=verts_src,
+            skeleton_overlay=args.mesh_overlay, mesh_size=args.mesh_size,
         )
         save_mask_heatmap(masks, job, gnames if is_group else ["all"],
                           os.path.join(args.out_dir, f"{base}_mask.png"))
