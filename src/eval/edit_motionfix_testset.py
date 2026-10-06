@@ -61,7 +61,8 @@ from data.smplh_features import (features_to_smpl, resample_motion, smpl_to_gen_
                                  smplh_to_features)
 from editing import MotionEditor, derive_seed
 from editing.masking import mask_mode_components
-from model.body_groups import resolve_group_context
+from editing.masking.release import add_neighbours, blur_mask
+from model.body_groups import group_names, resolve_group_context
 from model.schedule import NoiseSchedule
 from model.text_encoder import build_text_encoder
 from training.grounding import resolve_readout_columns, resolve_readout_layers
@@ -105,6 +106,21 @@ def parse_args():
                         "caption parser (no LLM) — the correct-by-construction control. "
                         "Clips whose instruction names no body part are SKIPPED and "
                         "listed in the manifest, since a group mask has no answer there.")
+    p.add_argument("--mask_blur", type=float, default=None,
+                   help="Release the groups the mask selects from inpainting in every frame and "
+                        "blur its frame gating with a Gaussian of this sigma (frames) into a "
+                        "guidance weight (thesis eq:softgate). 0 = release only, 0/1 weight. "
+                        "Off by default (hard M1 n M2 inpainting).")
+    p.add_argument("--neighbour_groups", nargs="+", default=None,
+                   help="Body-part groups released from hard inpainting in every frame the "
+                        "mask edits, e.g. 'spine', so the body can follow the edited limb. "
+                        "Groups the mask already selects are left as they are. Off by default.")
+    p.add_argument("--neighbour_weight", type=float, default=0.0,
+                   help="--neighbour_groups: share of the edit's guidance scale those groups "
+                        "receive. 0 = released only, no guidance.")
+    p.add_argument("--neighbour_release", type=float, default=1.0,
+                   help="--neighbour_groups: how free those groups are. 1 = fully released, "
+                        "r in (0, 1) = pulled back towards the source by 1 - r every step.")
     p.add_argument("--src_fps", type=float, default=30.0, help="MotionFix native fps.")
     p.add_argument("--edit_fps", type=float, default=20.0, help="Editor (HumanML3D) fps.")
     p.add_argument("--max_frames", type=int, default=196)
@@ -183,6 +199,12 @@ def main():
     log.info(f"{len(keyids)} clips{limit_note} × {len(args.scales)} scales -> {args.out_root}")
 
     need_attn = mask_mode_components(args.mask_mode)[0] == "attn"
+    gnames = list(group_names(group_mode))
+    if args.neighbour_groups:
+        unknown = [n for n in args.neighbour_groups if n not in gnames]
+        if unknown:                       # fail before hours of editing, not on the first clip
+            raise SystemExit(f"--neighbour_groups: unknown group(s) {unknown}, "
+                             f"expected {gnames}")
     skipped = {}
     routed, col_modes, col_fallback = {}, {}, []
     n_done = 0
@@ -244,6 +266,13 @@ def main():
             m1_select=args.m1_select, m1_rank_ratio=args.m1_rank_ratio,
             m1_rank_max=args.m1_rank_max,
         )
+        # Optional soft variants (thesis eq:softgate): applied in the same order as
+        # edit_motion.py, so a MotionFix edit and a single-clip edit with the same flags agree.
+        if args.mask_blur is not None:
+            masks = [blur_mask(m, args.mask_blur, is_group, editor, valid) for m in masks]
+        if args.neighbour_groups:
+            masks = [add_neighbours(m, args.neighbour_groups, args.neighbour_weight, gnames,
+                                    is_group, editor, args.neighbour_release) for m in masks]
 
         for s in todo:
             x_edit = editor.edit(state, [ctx], masks, scales=[s], show_progress=False,
@@ -281,6 +310,9 @@ def main():
         "m1_columns": args.m1_columns, "m1_columns_resolved": col_modes,
         "m1_columns_fallback": col_fallback,
         "psi_readout": editor.psi_readout,
+        "mask_blur": args.mask_blur, "neighbour_groups": args.neighbour_groups,
+        "neighbour_weight": args.neighbour_weight,
+        "neighbour_release": args.neighbour_release,
         "seed": args.seed, "seed_mode": "per-clip (seed*1000003 + crc32(keyid))",
         "routed_groups": routed,
         "out_dirs": {f"{s:g}": out_dirs[s] for s in args.scales},

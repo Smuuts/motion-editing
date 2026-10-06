@@ -286,6 +286,18 @@ class MotionEditor:
         edit_cells = torch.zeros_like(m_channels[0])                     # (F, 263)
         for m_ch in m_channels:
             edit_cells = torch.maximum(edit_cells, m_ch)
+        # Optional cells a caller releases from inpainting without full guidance (e.g. the
+        # body parts next to an edited one, so the model can adapt them to the edit). The
+        # value is the release strength: 1 = free, r in (0, 1) = pulled back towards the source
+        # by 1 - r at every step. Masks without the key behave exactly as before.
+        release = torch.zeros_like(edit_cells)
+        for m in masks:
+            if m.get("m_release") is not None:
+                release = torch.maximum(release, m["m_release"].to(self.device))
+        free = torch.maximum((edit_cells > 0).to(edit_cells.dtype), release)
+        edit_cells = torch.maximum(edit_cells, release)
+        partial = ((free > 0) & (free < 1))[None]                       # (1, F, 263) bool
+        src_weight = (1.0 - free)[None]
         # Hard inpainting is done at the (frame, channel) CELL level, not per frame:
         # every non-edited cell is pinned to the exact source value at each step, so
         # unedited body-part groups inside an otherwise-edited frame stay put. A purely
@@ -310,5 +322,8 @@ class MotionEditor:
 
             # hard inpainting: every non-edited cell ← exact source noised to t-1
             x = torch.where(keep_cell, state.xs[t - 1], x)
+            # partially released cells: blend towards the source by their remaining weight
+            if partial.any():
+                x = torch.where(partial, src_weight * state.xs[t - 1] + (1 - src_weight) * x, x)
 
         return x

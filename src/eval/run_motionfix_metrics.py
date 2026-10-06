@@ -282,6 +282,18 @@ def main():
     mfix = os.path.abspath(args.motionfix_dir or os.path.join(here, "data", "motionfix"))
     smpl_dirs = [os.path.abspath(d) for d in args.smpl_dirs]
     out_path = os.path.abspath(args.out) if args.out else None
+    # EVERY output path must become absolute HERE, before the os.chdir(mfix) below: the
+    # evaluator only runs from the MotionFix repo root, so a relative path resolved after the
+    # chdir silently lands under data/motionfix/ instead of the repo. That is not a crash — the
+    # run succeeds and the files are simply somewhere nobody looks. It cost one round trip
+    # already; if you add another output, resolve it in this block.
+    per_clip_dir = None
+    if args.per_clip:
+        per_clip_dir = os.path.abspath(
+            args.per_clip_dir
+            or (os.path.join(os.path.dirname(out_path), "per_clip") if out_path
+                else os.path.join(here, "eval_results", "motionfix", "per_clip")))
+        os.makedirs(per_clip_dir, exist_ok=True)
 
     # Keyid sets first: whether the galleries match decides whether the numbers below can be
     # compared at all, and it is free to check before loading a GPU model.
@@ -328,13 +340,6 @@ def main():
     import numpy as np
     import torch
 
-    per_clip_dir = None
-    if args.per_clip:
-        per_clip_dir = os.path.abspath(
-            args.per_clip_dir
-            or (os.path.join(os.path.dirname(out_path), "per_clip") if out_path
-                else os.path.join(here, "eval_results", "motionfix", "per_clip")))
-        os.makedirs(per_clip_dir, exist_ok=True)
 
     results = {}
     for d in smpl_dirs:

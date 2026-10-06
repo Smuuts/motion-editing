@@ -57,6 +57,15 @@ def mask_fingerprint(args, editor, config) -> dict:
                    "lambda_noise": args.lambda_noise,
                    "m2_window": args.m2_window,
                    "per_step_norm": args.per_step_norm})
+    # The soft variants (editing.masking.release) change every edited file. Recorded only when
+    # set, so the fingerprint of a run made before these flags existed is unchanged and that
+    # run still resumes.
+    if getattr(args, "mask_blur", None) is not None:
+        fp["mask_blur"] = args.mask_blur
+    if getattr(args, "neighbour_groups", None):
+        fp.update({"neighbour_groups": list(args.neighbour_groups),
+                   "neighbour_weight": args.neighbour_weight,
+                   "neighbour_release": args.neighbour_release})
     return fp
 
 
